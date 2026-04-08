@@ -1,3 +1,5 @@
+<div align="center">
+
 # SDP Maze Pocket
 
 ### Privacy-Enhanced Wallet Funding on Solana
@@ -5,13 +7,16 @@
 [![Solana](https://img.shields.io/badge/Solana-Mainnet-9945FF?style=for-the-badge&logo=solana)](https://solana.com)
 [![Rust](https://img.shields.io/badge/Rust-1.75+-orange?style=for-the-badge&logo=rust)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=for-the-badge)](LICENSE)
+[![KausaLayer](https://img.shields.io/badge/KausaLayer-Protocol-green?style=for-the-badge)](https://kausalayer.com)
+[![Twitter](https://img.shields.io/badge/Twitter-@kausalayer-1DA1F2?style=for-the-badge&logo=twitter)](https://x.com/kausalayer)
 
 **Fund wallets privately through maze-based transaction routing**
 
-[Live Demo](https://kausalayer.com/pocket) · [Documentation](#how-it-works) · [Getting Started](#quick-start)
+[Try It](https://kausalayer.com/pocket) · [Documentation](#how-it-works) · [Getting Started](#quick-start)
+
+</div>
 
 ---
-
 ## What is Maze Pocket?
 
 Maze Pocket is a privacy-preserving wallet funding system that routes your SOL through a dynamically generated maze of intermediate wallets before reaching your destination. Unlike traditional transfers that create a direct link between source and destination, Maze Pocket obscures the transaction trail through mathematical patterns inspired by the golden ratio and Fibonacci sequences.
