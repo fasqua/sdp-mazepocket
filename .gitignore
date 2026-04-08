@@ -1,0 +1,15 @@
+/target/
+Cargo.lock
+.env
+*.db
+*.db-journal
+node_modules/
+*.log
+.DS_Store
+.idea/
+.vscode/
+recover*.js
+recover*.rs
+package*.json
+/data/
+*.bak
