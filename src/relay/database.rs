@@ -78,6 +78,13 @@ pub struct FundingRequest {
     pub error_message: Option<String>,
 }
 
+/// Protocol statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolStats {
+    pub total_nodes_alltime: i64,
+    pub total_hops_alltime: i64,
+    pub nodes_24h: i64,
+}
 /// Database wrapper with Argon2id + AES-256-GCM encryption
 pub struct PocketDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -925,6 +932,64 @@ impl PocketDatabase {
             params![owner_meta_hash, slot],
         )?;
         Ok(rows > 0)
+    }
+
+    /// Get protocol statistics (no autopurge, so direct query)
+    pub fn get_protocol_stats(&self) -> Result<ProtocolStats> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let cutoff_24h = now - 86400;
+
+        // Total nodes (maze_nodes + sweep_maze_nodes)
+        let maze_nodes: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM maze_nodes",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let sweep_nodes: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sweep_maze_nodes",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let total_nodes = maze_nodes + sweep_nodes;
+
+        // Total hops (from funding_requests + sweep_requests)
+        let funding_hops: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(json_extract(maze_graph_json, '$.total_transactions')), 0) FROM funding_requests WHERE maze_graph_json IS NOT NULL",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let sweep_hops: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(json_extract(maze_graph_json, '$.total_transactions')), 0) FROM sweep_requests WHERE maze_graph_json IS NOT NULL",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let total_hops = funding_hops + sweep_hops;
+
+        // Nodes in last 24h
+        let nodes_24h_maze: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM maze_nodes mn JOIN funding_requests fr ON mn.request_id = fr.id WHERE fr.created_at > ?1",
+            params![cutoff_24h],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let nodes_24h_sweep: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sweep_maze_nodes smn JOIN sweep_requests sr ON smn.sweep_id = sr.id WHERE sr.created_at > ?1",
+            params![cutoff_24h],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let nodes_24h = nodes_24h_maze + nodes_24h_sweep;
+
+        Ok(ProtocolStats {
+            total_nodes_alltime: total_nodes,
+            total_hops_alltime: total_hops,
+            nodes_24h,
+        })
     }
 }
 impl Drop for PocketDatabase {

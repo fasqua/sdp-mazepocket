@@ -217,6 +217,13 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Debug, Serialize)]
+struct StatsResponse {
+    total_nodes_alltime: i64,
+    total_hops_alltime: i64,
+    nodes_24h: i64,
+}
+
 // ============ UTILITY FUNCTIONS ============
 
 fn hash_meta_address(meta: &str) -> String {
@@ -280,6 +287,18 @@ async fn health_check() -> Json<serde_json::Value> {
     }))
 }
 
+
+/// Protocol stats endpoint
+async fn stats_handler(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<StatsResponse>, AppError> {
+    let stats = state.db.get_protocol_stats()?;
+    Ok(Json(StatsResponse {
+        total_nodes_alltime: stats.total_nodes_alltime,
+        total_hops_alltime: stats.total_hops_alltime,
+        nodes_24h: stats.nodes_24h,
+    }))
+}
 /// Create a new Maze Pocket
 async fn create_pocket(
     State(state): State<Arc<AppState>>,
@@ -615,35 +634,66 @@ async fn sweep_pocket(
     let first_node_pubkey = Pubkey::from_str(&first_node.address)
         .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
 
-    let blockhash = state.rpc.get_latest_blockhash()
-        .map_err(|e| MazeError::RpcError(e.to_string()))?;
-
-    let ix = system_instruction::transfer(
-        &pocket_keypair.pubkey(),
-        &first_node_pubkey,
-        sweep_amount,
-    );
-
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&pocket_keypair.pubkey()),
-        &[&pocket_keypair],
-        blockhash,
-    );
-
-    let config = RpcSendTransactionConfig {
-        skip_preflight: true,
-        preflight_commitment: None,
-        encoding: None,
-        max_retries: Some(3),
-        min_context_slot: None,
+    let sig = {
+        let mut last_err = String::new();
+        let mut result_sig = None;
+        for attempt in 1..=5u8 {
+            let blockhash = match state.rpc.get_latest_blockhash() {
+                Ok(bh) => bh,
+                Err(e) => {
+                    warn!("Sweep initial attempt {}/5: Failed to get blockhash: {}", attempt, e);
+                    last_err = e.to_string();
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let ix = system_instruction::transfer(
+                &pocket_keypair.pubkey(),
+                &first_node_pubkey,
+                sweep_amount,
+            );
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&pocket_keypair.pubkey()),
+                &[&pocket_keypair],
+                blockhash,
+            );
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: None,
+                encoding: None,
+                max_retries: Some(3),
+                min_context_slot: None,
+            };
+            match state.rpc.send_transaction_with_config(&tx, config) {
+                Ok(s) => {
+                    if attempt > 1 {
+                        info!("Sweep initial TX succeeded on attempt {}/5", attempt);
+                    }
+                    result_sig = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                        warn!("Sweep initial attempt {}/5: {}", attempt, err_str);
+                        last_err = err_str;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    let _ = state.db.update_pocket_status(&pocket_id, PocketStatus::Active);
+                    return Err(AppError(MazeError::TransactionError(format!("TX failed: {}", e))));
+                }
+            }
+        }
+        match result_sig {
+            Some(s) => s,
+            None => {
+                let _ = state.db.update_pocket_status(&pocket_id, PocketStatus::Active);
+                return Err(AppError(MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err))));
+            }
+        }
     };
-
-    let sig = state.rpc.send_transaction_with_config(&tx, config)
-        .map_err(|e| {
-            let _ = state.db.update_pocket_status(&pocket_id, PocketStatus::Active);
-            MazeError::TransactionError(e.to_string())
-        })?;
 
     // Wait for confirmation before spawning background task
     let mut confirmed = false;
@@ -945,24 +995,55 @@ async fn execute_node(
                 let transfer_amount = balance.saturating_sub(TX_FEE_LAMPORTS);
 
                 if transfer_amount > 0 {
-                    let blockhash = state.rpc.get_latest_blockhash()?;
-                    let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
-                    let tx = Transaction::new_signed_with_payer(
-                        &[ix],
-                        Some(&keypair.pubkey()),
-                        &[&keypair],
-                        blockhash,
-                    );
-
-                    let config = RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        preflight_commitment: None,
-                        encoding: None,
-                        max_retries: Some(3),
-                        min_context_slot: None,
+                    let sig = {
+                        let mut last_err = String::new();
+                        let mut result_sig = None;
+                        for attempt in 1..=5u8 {
+                            let blockhash = match state.rpc.get_latest_blockhash() {
+                                Ok(bh) => bh,
+                                Err(e) => {
+                                    warn!("Final to pocket attempt {}/5: Failed to get blockhash: {}", attempt, e);
+                                    last_err = e.to_string();
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                    continue;
+                                }
+                            };
+                            let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
+                            let tx = Transaction::new_signed_with_payer(
+                                &[ix],
+                                Some(&keypair.pubkey()),
+                                &[&keypair],
+                                blockhash,
+                            );
+                            let config = RpcSendTransactionConfig {
+                                skip_preflight: true,
+                                preflight_commitment: None,
+                                encoding: None,
+                                max_retries: Some(3),
+                                min_context_slot: None,
+                            };
+                            match state.rpc.send_transaction_with_config(&tx, config) {
+                                Ok(s) => {
+                                    if attempt > 1 {
+                                        info!("Final to pocket TX succeeded on attempt {}/5", attempt);
+                                    }
+                                    result_sig = Some(s);
+                                    break;
+                                }
+                                Err(e) => {
+                                    let err_str = e.to_string();
+                                    if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                                        warn!("Final to pocket attempt {}/5: {}", attempt, err_str);
+                                        last_err = err_str;
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                        continue;
+                                    }
+                                    return Err(MazeError::TransactionError(format!("TX failed: {}", e)));
+                                }
+                            }
+                        }
+                        result_sig.ok_or_else(|| MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err)))?
                     };
-
-                    let sig = state.rpc.send_transaction_with_config(&tx, config)?;
                     info!("Final transfer to pocket: {} lamports ({})", transfer_amount, sig);
                 }
             }
@@ -1035,24 +1116,55 @@ async fn execute_node(
                 continue;
             }
 
-            let blockhash = state.rpc.get_latest_blockhash()?;
-            let ix = system_instruction::transfer(&keypair.pubkey(), &output_pubkey, transfer_amount);
-            let tx = Transaction::new_signed_with_payer(
-                &[ix],
-                Some(&keypair.pubkey()),
-                &[&keypair],
-                blockhash,
-            );
-
-            let config = RpcSendTransactionConfig {
-                skip_preflight: true,
-                preflight_commitment: None,
-                encoding: None,
-                max_retries: Some(3),
-                min_context_slot: None,
+            let sig = {
+                let mut last_err = String::new();
+                let mut result_sig = None;
+                for attempt in 1..=5u8 {
+                    let blockhash = match state.rpc.get_latest_blockhash() {
+                        Ok(bh) => bh,
+                        Err(e) => {
+                            warn!("Node {} attempt {}/5: Failed to get blockhash: {}", node.index, attempt, e);
+                            last_err = e.to_string();
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    let ix = system_instruction::transfer(&keypair.pubkey(), &output_pubkey, transfer_amount);
+                    let tx = Transaction::new_signed_with_payer(
+                        &[ix],
+                        Some(&keypair.pubkey()),
+                        &[&keypair],
+                        blockhash,
+                    );
+                    let config = RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: None,
+                        max_retries: Some(3),
+                        min_context_slot: None,
+                    };
+                    match state.rpc.send_transaction_with_config(&tx, config) {
+                        Ok(s) => {
+                            if attempt > 1 {
+                                info!("Node {} TX succeeded on attempt {}/5", node.index, attempt);
+                            }
+                            result_sig = Some(s);
+                            break;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                                warn!("Node {} attempt {}/5: {}", node.index, attempt, err_str);
+                                last_err = err_str;
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
+                            return Err(MazeError::TransactionError(format!("TX failed: {}", e)));
+                        }
+                    }
+                }
+                result_sig.ok_or_else(|| MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err)))?
             };
-
-            let sig = state.rpc.send_transaction_with_config(&tx, config)?;
 
             // Wait for confirmation
             let mut confirmed = false;
@@ -1178,24 +1290,55 @@ async fn execute_sweep_node(
         let transfer_amount = balance.saturating_sub(TX_FEE_LAMPORTS);
         
         if transfer_amount > 0 {
-            let blockhash = state.rpc.get_latest_blockhash()?;
-            let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
-            let tx = Transaction::new_signed_with_payer(
-                &[ix],
-                Some(&keypair.pubkey()),
-                &[&keypair],
-                blockhash,
-            );
-            
-            let config = RpcSendTransactionConfig {
-                skip_preflight: true,
-                preflight_commitment: None,
-                encoding: None,
-                max_retries: Some(3),
-                min_context_slot: None,
+            let sig = {
+                let mut last_err = String::new();
+                let mut result_sig = None;
+                for attempt in 1..=5u8 {
+                    let blockhash = match state.rpc.get_latest_blockhash() {
+                        Ok(bh) => bh,
+                        Err(e) => {
+                            warn!("Final sweep attempt {}/5: Failed to get blockhash: {}", attempt, e);
+                            last_err = e.to_string();
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
+                    let tx = Transaction::new_signed_with_payer(
+                        &[ix],
+                        Some(&keypair.pubkey()),
+                        &[&keypair],
+                        blockhash,
+                    );
+                    let config = RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: None,
+                        max_retries: Some(3),
+                        min_context_slot: None,
+                    };
+                    match state.rpc.send_transaction_with_config(&tx, config) {
+                        Ok(s) => {
+                            if attempt > 1 {
+                                info!("Final sweep TX succeeded on attempt {}/5", attempt);
+                            }
+                            result_sig = Some(s);
+                            break;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                                warn!("Final sweep attempt {}/5: {}", attempt, err_str);
+                                last_err = err_str;
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
+                            return Err(MazeError::TransactionError(format!("TX failed: {}", e)));
+                        }
+                    }
+                }
+                result_sig.ok_or_else(|| MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err)))?
             };
-            
-            let sig = state.rpc.send_transaction_with_config(&tx, config)?;
             info!("Final sweep transfer: {} lamports to {} ({})", transfer_amount, final_destination, sig);
             
             // Wait for confirmation
@@ -1274,24 +1417,55 @@ async fn execute_sweep_node(
                 continue;
             }
             
-            let blockhash = state.rpc.get_latest_blockhash()?;
-            let ix = system_instruction::transfer(&keypair.pubkey(), &output_pubkey, transfer_amount);
-            let tx = Transaction::new_signed_with_payer(
-                &[ix],
-                Some(&keypair.pubkey()),
-                &[&keypair],
-                blockhash,
-            );
-            
-            let config = RpcSendTransactionConfig {
-                skip_preflight: true,
-                preflight_commitment: None,
-                encoding: None,
-                max_retries: Some(3),
-                min_context_slot: None,
+            let sig = {
+                let mut last_err = String::new();
+                let mut result_sig = None;
+                for attempt in 1..=5u8 {
+                    let blockhash = match state.rpc.get_latest_blockhash() {
+                        Ok(bh) => bh,
+                        Err(e) => {
+                            warn!("Sweep node {} attempt {}/5: Failed to get blockhash: {}", node.index, attempt, e);
+                            last_err = e.to_string();
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    let ix = system_instruction::transfer(&keypair.pubkey(), &output_pubkey, transfer_amount);
+                    let tx = Transaction::new_signed_with_payer(
+                        &[ix],
+                        Some(&keypair.pubkey()),
+                        &[&keypair],
+                        blockhash,
+                    );
+                    let config = RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: None,
+                        max_retries: Some(3),
+                        min_context_slot: None,
+                    };
+                    match state.rpc.send_transaction_with_config(&tx, config) {
+                        Ok(s) => {
+                            if attempt > 1 {
+                                info!("Sweep node {} TX succeeded on attempt {}/5", node.index, attempt);
+                            }
+                            result_sig = Some(s);
+                            break;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                                warn!("Sweep node {} attempt {}/5: {}", node.index, attempt, err_str);
+                                last_err = err_str;
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
+                            return Err(MazeError::TransactionError(format!("TX failed: {}", e)));
+                        }
+                    }
+                }
+                result_sig.ok_or_else(|| MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err)))?
             };
-            
-            let sig = state.rpc.send_transaction_with_config(&tx, config)?;
             
             // Wait for confirmation
             let mut confirmed = false;
@@ -1399,24 +1573,60 @@ async fn resume_sweep(
     
     let transfer_amount = start_balance.saturating_sub(TX_FEE_LAMPORTS);
     
-    let blockhash = state.rpc.get_latest_blockhash().map_err(|e| MazeError::RpcError(e.to_string()))?;
-    let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&keypair.pubkey()),
-        &[&keypair],
-        blockhash,
-    );
-    
-    let config = RpcSendTransactionConfig {
-        skip_preflight: true,
-        preflight_commitment: None,
-        encoding: None,
-        max_retries: Some(3),
-        min_context_slot: None,
+    let sig = {
+        let mut last_err = String::new();
+        let mut result_sig = None;
+        for attempt in 1..=5u8 {
+            let blockhash = match state.rpc.get_latest_blockhash() {
+                Ok(bh) => bh,
+                Err(e) => {
+                    warn!("Recovery attempt {}/5: Failed to get blockhash: {}", attempt, e);
+                    last_err = e.to_string();
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&keypair.pubkey()),
+                &[&keypair],
+                blockhash,
+            );
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: None,
+                encoding: None,
+                max_retries: Some(3),
+                min_context_slot: None,
+            };
+            match state.rpc.send_transaction_with_config(&tx, config) {
+                Ok(s) => {
+                    if attempt > 1 {
+                        info!("Recovery TX succeeded on attempt {}/5", attempt);
+                    }
+                    result_sig = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                        warn!("Recovery attempt {}/5: {}", attempt, err_str);
+                        last_err = err_str;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    return Err(AppError(MazeError::TransactionError(format!("TX failed: {}", e))));
+                }
+            }
+        }
+        match result_sig {
+            Some(s) => s,
+            None => {
+                return Err(AppError(MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err))));
+            }
+        }
     };
-    
-    let sig = state.rpc.send_transaction_with_config(&tx, config).map_err(|e| MazeError::TransactionError(e.to_string()))?;
     
     // Wait for confirmation
     let mut confirmed = false;
@@ -1556,34 +1766,58 @@ async fn recover_funding(
             let transfer_amount = balance.saturating_sub(TX_FEE_LAMPORTS);
             
             if transfer_amount > 0 {
-                let blockhash = state.rpc.get_latest_blockhash()
-                    .map_err(|e| MazeError::RpcError(e.to_string()))?;
-                
-                let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
-                let tx = Transaction::new_signed_with_payer(
-                    &[ix],
-                    Some(&keypair.pubkey()),
-                    &[&keypair],
-                    blockhash,
-                );
-                
-                let config = RpcSendTransactionConfig {
-                    skip_preflight: true,
-                    preflight_commitment: None,
-                    encoding: None,
-                    max_retries: Some(3),
-                    min_context_slot: None,
-                };
-                
-                match state.rpc.send_transaction_with_config(&tx, config) {
-                    Ok(sig) => {
+                let mut tx_success = false;
+                let mut last_sig = None;
+                for attempt in 1..=5u8 {
+                    let blockhash = match state.rpc.get_latest_blockhash() {
+                        Ok(bh) => bh,
+                        Err(e) => {
+                            warn!("Recover node {} attempt {}/5: Failed to get blockhash: {}", node.index, attempt, e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
+                    let tx = Transaction::new_signed_with_payer(
+                        &[ix],
+                        Some(&keypair.pubkey()),
+                        &[&keypair],
+                        blockhash,
+                    );
+                    let config = RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: None,
+                        max_retries: Some(3),
+                        min_context_slot: None,
+                    };
+                    match state.rpc.send_transaction_with_config(&tx, config) {
+                        Ok(sig) => {
+                            if attempt > 1 {
+                                info!("Recover node {} TX succeeded on attempt {}/5", node.index, attempt);
+                            }
+                            last_sig = Some(sig);
+                            tx_success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                                warn!("Recover node {} attempt {}/5: {}", node.index, attempt, err_str);
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
+                            warn!("Failed to recover from node {}: {}", node.index, e);
+                            break;
+                        }
+                    }
+                }
+                if tx_success {
+                    if let Some(sig) = last_sig {
                         info!("Recovered {} lamports from node {} ({})", transfer_amount, node.index, sig);
                         total_recovered += transfer_amount;
                         tx_sigs.push(sig.to_string());
                         let _ = state.db.update_node_status(&fund_id, node.index, "completed", Some(&sig.to_string()));
-                    }
-                    Err(e) => {
-                        warn!("Failed to recover from node {}: {}", node.index, e);
                     }
                 }
             }
@@ -1668,34 +1902,58 @@ async fn recover_sweep(
             let transfer_amount = balance.saturating_sub(TX_FEE_LAMPORTS);
             
             if transfer_amount > 0 {
-                let blockhash = state.rpc.get_latest_blockhash()
-                    .map_err(|e| MazeError::RpcError(e.to_string()))?;
-                
-                let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
-                let tx = Transaction::new_signed_with_payer(
-                    &[ix],
-                    Some(&keypair.pubkey()),
-                    &[&keypair],
-                    blockhash,
-                );
-                
-                let config = RpcSendTransactionConfig {
-                    skip_preflight: true,
-                    preflight_commitment: None,
-                    encoding: None,
-                    max_retries: Some(3),
-                    min_context_slot: None,
-                };
-                
-                match state.rpc.send_transaction_with_config(&tx, config) {
-                    Ok(sig) => {
+                let mut tx_success = false;
+                let mut last_sig = None;
+                for attempt in 1..=5u8 {
+                    let blockhash = match state.rpc.get_latest_blockhash() {
+                        Ok(bh) => bh,
+                        Err(e) => {
+                            warn!("Recover sweep node {} attempt {}/5: Failed to get blockhash: {}", node.index, attempt, e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
+                    let tx = Transaction::new_signed_with_payer(
+                        &[ix],
+                        Some(&keypair.pubkey()),
+                        &[&keypair],
+                        blockhash,
+                    );
+                    let config = RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: None,
+                        max_retries: Some(3),
+                        min_context_slot: None,
+                    };
+                    match state.rpc.send_transaction_with_config(&tx, config) {
+                        Ok(sig) => {
+                            if attempt > 1 {
+                                info!("Recover sweep node {} TX succeeded on attempt {}/5", node.index, attempt);
+                            }
+                            last_sig = Some(sig);
+                            tx_success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                                warn!("Recover sweep node {} attempt {}/5: {}", node.index, attempt, err_str);
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
+                            warn!("Failed to recover from sweep node {}: {}", node.index, e);
+                            break;
+                        }
+                    }
+                }
+                if tx_success {
+                    if let Some(sig) = last_sig {
                         info!("Recovered {} lamports from sweep node {} ({})", transfer_amount, node.index, sig);
                         total_recovered += transfer_amount;
                         tx_sigs.push(sig.to_string());
                         let _ = state.db.update_sweep_node_status(&sweep_id, node.index, "completed", Some(&sig.to_string()));
-                    }
-                    Err(e) => {
-                        warn!("Failed to recover from sweep node {}: {}", node.index, e);
                     }
                 }
             }
@@ -1821,6 +2079,7 @@ async fn main() {
     // Build router
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/stats", get(stats_handler))
         .route("/pocket", post(create_pocket))
         .route("/pockets", get(list_pockets))
         .route("/pocket/:pocket_id", get(get_pocket))
