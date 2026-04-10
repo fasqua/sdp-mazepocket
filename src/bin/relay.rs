@@ -41,6 +41,15 @@ use sdp_mazepocket::{
 
 // ============ APP ERROR ============
 
+fn sanitize_error(msg: &str) -> String {
+    if msg.contains("api-key=") || msg.contains("api_key=") || msg.contains("helius") {
+        "RPC connection error. Please try again.".to_string()
+    } else {
+        msg.to_string()
+    }
+}
+
+
 struct AppError(MazeError);
 
 impl From<MazeError> for AppError {
@@ -63,7 +72,7 @@ impl IntoResponse for AppError {
         
         let body = Json(ErrorResponse {
             success: false,
-            error: self.0.to_string(),
+            error: sanitize_error(&self.0.to_string()),
         });
         
         (status, body).into_response()
