@@ -208,6 +208,37 @@ Sweeping reverses the process:
 
 ---
 
+## Privacy Mathematics
+
+The maze routing provides quantifiable privacy guarantees based on information-theoretic principles:
+
+![Privacy Mathematics](docs/privacy-math.png)
+
+### Formulas
+
+| Metric | Formula | Description |
+|--------|---------|-------------|
+| Anonymity Set | A = φʰ | Number of possible paths through maze |
+| Spatial Entropy | Hₛ = h × log₂(φ) | Bits of uncertainty from routing structure |
+| Temporal Entropy | Hₜ = log₂(1 + τ/1000) × δ | Bits of uncertainty from timing variance |
+| Unlinkability | P = 1 - (1/A)^(1+H/10) | Probability that source ≠ destination |
+
+### Variables
+
+| Symbol | Description | Range |
+|--------|-------------|-------|
+| h | Hop count | 5-10 |
+| φ | Split ratio | 1.1-3.0 (default: 1.618) |
+| τ | Delay milliseconds | 0-5000 |
+| δ | Delay pattern factor | lin=1, fib=1.5, exp=2 |
+| Hₛ | Spatial entropy | bits |
+| Hₜ | Temporal entropy | bits |
+| A | Anonymity set size | paths |
+| P | Unlinkability | percentage |
+
+
+---
+
 ## Architecture
 
 ```
