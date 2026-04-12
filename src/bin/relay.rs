@@ -737,9 +737,9 @@ async fn sweep_pocket(
                 info!("Sweep maze completed for {}", pocket_id_clone);
             }
             Err(e) => {
-                error!("Sweep maze failed for {}: {}", pocket_id_clone, e);
+                error!("Sweep maze failed for {}: {}", pocket_id_clone, sanitize_error(&e.to_string()));
                 let _ = state_clone.db.update_pocket_status(&pocket_id_clone, PocketStatus::Active);
-                let _ = state_clone.db.update_sweep_status(&sweep_id_clone, "failed", None, Some(&e.to_string()));
+                let _ = state_clone.db.update_sweep_status(&sweep_id_clone, "failed", None, Some(&sanitize_error(&e.to_string())));
             }
         }
     });
@@ -2032,8 +2032,14 @@ async fn deposit_monitor(state: Arc<AppState>) {
                 let state_clone = state.clone();
                 let req_id = request_id.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = execute_maze(state_clone, &req_id).await {
-                        error!("Maze execution failed for {}: {}", req_id, e);
+                    match execute_maze(state_clone.clone(), &req_id).await {
+                        Ok(_) => {
+                            info!("Maze execution completed for {}", req_id);
+                        }
+                        Err(e) => {
+                            error!("Maze execution failed for {}: {}", req_id, sanitize_error(&e.to_string()));
+                            let _ = state_clone.db.update_funding_status(&req_id, "failed", Some(&sanitize_error(&e.to_string())));
+                        }
                     }
                 });
             }
