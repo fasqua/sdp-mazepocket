@@ -76,6 +76,8 @@ pub struct FundingRequest {
     pub expires_at: i64,
     pub completed_at: Option<i64>,
     pub error_message: Option<String>,
+    pub destination_address: Option<String>,
+    pub tx_signature: Option<String>,
 }
 
 /// Protocol statistics
@@ -179,6 +181,7 @@ impl PocketDatabase {
                 expires_at INTEGER NOT NULL,
                 completed_at INTEGER,
                 error_message TEXT,
+                destination_address TEXT,
                 FOREIGN KEY (pocket_id) REFERENCES maze_pockets(id)
             )"#,
             [],
@@ -217,6 +220,7 @@ impl PocketDatabase {
                 completed_at INTEGER,
                 tx_signature TEXT,
                 error_message TEXT,
+                destination_address TEXT,
                 FOREIGN KEY (pocket_id) REFERENCES maze_pockets(id)
             )"#,
             [],
@@ -389,7 +393,7 @@ impl PocketDatabase {
                       funding_maze_id, funding_amount_lamports, created_at,
                       last_sweep_at, status
                FROM maze_pockets 
-               WHERE owner_meta_hash = ?1 AND status != 'deleted'
+               WHERE owner_meta_hash = ?1 AND status != 'deleted' AND id NOT LIKE 'route_%'
                ORDER BY created_at DESC"#
         )?;
 
@@ -454,8 +458,8 @@ impl PocketDatabase {
             r#"INSERT INTO funding_requests 
                (id, pocket_id, owner_meta_hash, deposit_address, deposit_keypair_encrypted,
                 amount_lamports, fee_lamports, maze_config_json, maze_graph_json,
-                status, created_at, expires_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                status, created_at, expires_at, destination_address)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
             params![
                 request.id,
                 request.pocket_id,
@@ -469,6 +473,7 @@ impl PocketDatabase {
                 request.status,
                 request.created_at,
                 request.expires_at,
+                request.destination_address,
             ],
         )?;
         Ok(())
@@ -480,7 +485,7 @@ impl PocketDatabase {
         let mut stmt = conn.prepare(
             r#"SELECT id, pocket_id, owner_meta_hash, deposit_address, deposit_keypair_encrypted,
                       amount_lamports, fee_lamports, maze_config_json, status,
-                      created_at, expires_at, completed_at, error_message
+                      created_at, expires_at, completed_at, error_message, destination_address, tx_signature
                FROM funding_requests WHERE deposit_address = ?1"#
         )?;
 
@@ -499,6 +504,8 @@ impl PocketDatabase {
                 expires_at: row.get(10)?,
                 completed_at: row.get(11)?,
                 error_message: row.get(12)?,
+                destination_address: row.get(13)?,
+                tx_signature: row.get(14)?,
             })
         });
 
@@ -524,6 +531,17 @@ impl PocketDatabase {
                 params![status, error, request_id],
             )?;
         }
+        Ok(())
+    }
+
+    /// Update funding request as completed with tx_signature
+    pub fn update_funding_completed(&self, request_id: &str, tx_signature: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE funding_requests SET status = 'completed', completed_at = ?1, tx_signature = ?2 WHERE id = ?3",
+            params![now, tx_signature, request_id],
+        )?;
         Ok(())
     }
 
@@ -622,7 +640,7 @@ impl PocketDatabase {
         let mut stmt = conn.prepare(
             r#"SELECT id, pocket_id, owner_meta_hash, deposit_address, deposit_keypair_encrypted,
                       amount_lamports, fee_lamports, maze_config_json, status,
-                      created_at, expires_at, completed_at, error_message
+                      created_at, expires_at, completed_at, error_message, destination_address, tx_signature
                FROM funding_requests WHERE id = ?1"#
         )?;
 
@@ -641,6 +659,8 @@ impl PocketDatabase {
                 expires_at: row.get(10)?,
                 completed_at: row.get(11)?,
                 error_message: row.get(12)?,
+                destination_address: row.get(13)?,
+                tx_signature: row.get(14)?,
             })
         });
 
@@ -990,6 +1010,20 @@ impl PocketDatabase {
             total_hops_alltime: total_hops,
             nodes_24h,
         })
+    }
+
+    /// Get final node tx_signature for a funding request
+    pub fn get_final_tx_signature(&self, request_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tx_signature FROM maze_nodes WHERE request_id = ?1 AND tx_signature IS NOT NULL ORDER BY node_index DESC LIMIT 1"
+        )?;
+        let result = stmt.query_row(params![request_id], |row| row.get(0));
+        match result {
+            Ok(sig) => Ok(Some(sig)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
     }
 }
 impl Drop for PocketDatabase {

@@ -125,6 +125,29 @@ struct MazeInfo {
     estimated_time_seconds: u32,
 }
 
+
+// ============ DIRECT ROUTE ============
+
+#[derive(Debug, Deserialize)]
+struct RouteRequest {
+    meta_address: String,
+    amount_sol: f64,
+    destination: String,
+    maze_config: Option<CustomMazeConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteResponse {
+    success: bool,
+    route_id: String,
+    deposit_address: String,
+    destination: String,
+    amount_lamports: u64,
+    fee_lamports: u64,
+    total_deposit: u64,
+    expires_at: i64,
+    maze_info: MazeInfo,
+}
 #[derive(Debug, Deserialize)]
 struct ListPocketsQuery {
     meta_address: String,
@@ -204,6 +227,7 @@ struct DeletePocketResponse {
 
 #[derive(Debug, Serialize)]
 struct StatusResponse {
+    tx_signature: Option<String>,
     success: bool,
     request_id: String,
     status: String,
@@ -386,6 +410,8 @@ async fn create_pocket(
         expires_at: now + EXPIRY_SECONDS,
         completed_at: None,
         error_message: None,
+        tx_signature: None,
+        destination_address: None,
     };
 
     state.db.create_funding_request(&funding_request, &maze_json)
@@ -417,6 +443,112 @@ async fn create_pocket(
     }))
 }
 
+
+/// Create a direct route (A -> maze -> B without pocket)
+async fn create_route(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RouteRequest>,
+) -> std::result::Result<Json<RouteResponse>, AppError> {
+    info!("Create route request: {} SOL to {}", req.amount_sol, &req.destination[..20.min(req.destination.len())]);
+
+    // Validate amount
+    if req.amount_sol < MIN_AMOUNT_SOL {
+        return Err(MazeError::InvalidParameters(format!("Minimum amount is {} SOL", MIN_AMOUNT_SOL)).into());
+    }
+
+    // Validate destination address
+    let _destination_pubkey = Pubkey::from_str(&req.destination)
+        .map_err(|_| MazeError::InvalidParameters("Invalid destination address".into()))?;
+
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+    let amount_lamports = sol_to_lamports(req.amount_sol);
+    let fee_lamports = (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64;
+
+    // Parse maze config
+    let maze_params = parse_maze_config(req.maze_config);
+
+    // Generate route ID (no pocket needed)
+    let route_id = format!("route_{}", &generate_pocket_id()[7..]);
+
+    // Generate maze for routing
+    let generator = MazeGenerator::new(maze_params);
+    let total_with_fees = amount_lamports + fee_lamports + (TX_FEE_LAMPORTS * 50);
+
+    let encrypt_fn = |data: &[u8]| state.db.encrypt(data);
+    let maze = generator.generate(total_with_fees, encrypt_fn)?;
+
+    let deposit_node = maze.get_deposit_node()
+        .ok_or(MazeError::InvalidParameters("Deposit node not found".into()))?;
+
+    let deposit_address = deposit_node.address.clone();
+    let now = chrono::Utc::now().timestamp();
+
+
+    // Create virtual pocket entry for FOREIGN KEY constraint
+    let virtual_keypair = Keypair::new();
+    let keypair_encrypted = state.db.encrypt(&virtual_keypair.to_bytes())?;
+    let pocket = MazePocket {
+        id: route_id.clone(),
+        owner_meta_hash: owner_meta_hash.clone(),
+        stealth_pubkey: req.destination.clone(), // Use destination as stealth_pubkey
+        keypair_encrypted,
+        funding_maze_id: None,
+        funding_amount_lamports: amount_lamports,
+        created_at: now,
+        last_sweep_at: None,
+        status: PocketStatus::Active,
+    };
+    state.db.create_pocket(&pocket)?;
+    // Create funding request with destination (direct route)
+    let request_id = format!("fund_{}", &route_id[6..]); // fund_xxxxxxxx
+    let maze_json = serde_json::to_string(&maze).unwrap_or_default();
+    let deposit_keypair_encrypted = deposit_node.keypair_encrypted.clone();
+
+    let funding_request = FundingRequest {
+        id: request_id.clone(),
+        pocket_id: route_id.clone(), // Use route_id as pocket_id for tracking
+        owner_meta_hash,
+        deposit_address: deposit_address.clone(),
+        deposit_keypair_encrypted,
+        amount_lamports,
+        fee_lamports,
+        maze_config_json: None,
+        status: "pending".to_string(),
+        created_at: now,
+        expires_at: now + EXPIRY_SECONDS,
+        completed_at: None,
+        error_message: None,
+        destination_address: Some(req.destination.clone()),
+        tx_signature: None,
+    };
+
+    state.db.create_funding_request(&funding_request, &maze_json)?;
+
+    // Store maze nodes
+    for node in &maze.nodes {
+        state.db.store_maze_node(&request_id, node)?;
+    }
+
+    let total_deposit = amount_lamports + fee_lamports + (TX_FEE_LAMPORTS * maze.total_transactions as u64);
+
+    info!("Route {} created with deposit address {}, destination {}", route_id, deposit_address, req.destination);
+
+    Ok(Json(RouteResponse {
+        success: true,
+        route_id,
+        deposit_address,
+        destination: req.destination,
+        amount_lamports,
+        fee_lamports,
+        total_deposit,
+        expires_at: now + EXPIRY_SECONDS,
+        maze_info: MazeInfo {
+            nodes: maze.nodes.len(),
+            levels: maze.total_levels,
+            estimated_time_seconds: (maze.nodes.len() as u32) * 2,
+        },
+    }))
+}
 /// List all pockets for a user
 async fn list_pockets(
     State(state): State<Arc<AppState>>,
@@ -805,7 +937,9 @@ async fn get_funding_status(
     Path(request_id): Path<String>,
 ) -> std::result::Result<Json<StatusResponse>, AppError> {
     // Convert pocket_id to fund_id if needed
-    let fund_id = if request_id.starts_with("pocket_") {
+    let fund_id = if request_id.starts_with("route_") {
+        format!("fund_{}", &request_id[6..])
+    } else if request_id.starts_with("pocket_") {
         format!("fund_{}", &request_id[7..])
     } else if request_id.starts_with("fund_") {
         request_id.clone()
@@ -841,6 +975,7 @@ async fn get_funding_status(
                 request_id,
                 status: req.status,
                 progress,
+                tx_signature: req.tx_signature,
                 error: req.error_message,
             }))
         }
@@ -849,6 +984,7 @@ async fn get_funding_status(
             request_id: fund_id,
             status: "not_found".to_string(),
             progress: None,
+            tx_signature: None,
             error: Some("Funding request not found".to_string()),
         })),
     }
@@ -966,8 +1102,13 @@ async fn execute_maze(state: Arc<AppState>, request_id: &str) -> Result<()> {
         }
     }
 
-    // Update funding request status
-    state.db.update_funding_status(request_id, "completed", None)?;
+    // Get final tx_signature and update funding request
+    let final_tx_sig = state.db.get_final_tx_signature(request_id)?;
+    if let Some(sig) = final_tx_sig {
+        state.db.update_funding_completed(request_id, &sig)?;
+    } else {
+        state.db.update_funding_status(request_id, "completed", None)?;
+    }
 
     // Get pocket_id and update pocket with funding_maze_id
     if let Some(funding_req) = state.db.get_funding_request(request_id)? {
@@ -994,6 +1135,7 @@ async fn execute_node(
 
     // If no outputs, this is the final node - transfer to pocket
     if outputs.is_empty() {
+        let mut final_sig: Option<String> = None;
         // Get the pocket pubkey from funding request
         if let Some(funding_req) = state.db.get_funding_request(request_id)? {
             if let Some(pocket) = state.db.get_pocket(&funding_req.pocket_id)? {
@@ -1053,12 +1195,13 @@ async fn execute_node(
                         }
                         result_sig.ok_or_else(|| MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err)))?
                     };
+                    final_sig = Some(sig.to_string());
                     info!("Final transfer to pocket: {} lamports ({})", transfer_amount, sig);
                 }
             }
         }
 
-        state.db.update_node_status(request_id, node.index, "completed", None)?;
+        state.db.update_node_status(request_id, node.index, "completed", final_sig.as_deref())?;
         return Ok(());
     }
 
@@ -2096,6 +2239,7 @@ async fn main() {
         .route("/health", get(health_check))
         .route("/stats", get(stats_handler))
         .route("/pocket", post(create_pocket))
+        .route("/route", post(create_route))
         .route("/pockets", get(list_pockets))
         .route("/pocket/:pocket_id", get(get_pocket))
         .route("/pocket/:pocket_id/sweep", post(sweep_pocket))
