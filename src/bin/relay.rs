@@ -1105,6 +1105,32 @@ async fn get_sweep_status(
 
 
 
+/// Get balance with retry for connection errors
+async fn get_balance_with_retry(
+    rpc: &RpcClient,
+    pubkey: &Pubkey,
+    max_retries: u8,
+) -> Result<u64> {
+    let mut last_err = String::new();
+    for attempt in 1..=max_retries {
+        match rpc.get_balance(pubkey) {
+            Ok(balance) => return Ok(balance),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                    warn!("get_balance attempt {}/{}: {}", attempt, max_retries, err_str);
+                    last_err = err_str;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                return Err(MazeError::RpcError(err_str));
+            }
+        }
+    }
+    Err(MazeError::RpcError(format!("get_balance failed after {} attempts: {}", max_retries, last_err)))
+}
+
+
 // ============ MAZE EXECUTION (Copied from sdp-maze with fixes) ============
 
 async fn execute_maze(state: Arc<AppState>, request_id: &str) -> Result<()> {
@@ -1186,7 +1212,7 @@ async fn execute_node(
                 let dest_pubkey = Pubkey::from_str(&pocket.stealth_pubkey)
                     .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
 
-                let balance = state.rpc.get_balance(&keypair.pubkey())?;
+                let balance = get_balance_with_retry(&state.rpc, &keypair.pubkey(), 5).await?;
                 let transfer_amount = balance.saturating_sub(TX_FEE_LAMPORTS);
 
                 if transfer_amount > 0 {
@@ -1252,7 +1278,10 @@ async fn execute_node(
     // Wait for incoming funds (level 0 already has deposit from user)
     let mut attempts = 0;
     let balance = loop {
-        let bal = state.rpc.get_balance(&keypair.pubkey())?;
+        let bal = match get_balance_with_retry(&state.rpc, &keypair.pubkey(), 5).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
         if bal > TX_FEE_LAMPORTS {
             info!("Node {} has balance: {} lamports", node.index, bal);
             break bal;
@@ -1470,7 +1499,10 @@ async fn execute_sweep_node(
         // Wait for incoming funds
         let mut attempts = 0;
         let balance = loop {
-            let bal = state.rpc.get_balance(&keypair.pubkey())?;
+            let bal = match get_balance_with_retry(&state.rpc, &keypair.pubkey(), 5).await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
             if bal > TX_FEE_LAMPORTS {
                 info!("Final sweep node {} has balance: {} lamports", node.index, bal);
                 break bal;
@@ -1555,7 +1587,10 @@ async fn execute_sweep_node(
     // Wait for incoming funds from previous level
     let mut attempts = 0;
     let balance = loop {
-        let bal = state.rpc.get_balance(&keypair.pubkey())?;
+        let bal = match get_balance_with_retry(&state.rpc, &keypair.pubkey(), 5).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
         if bal > TX_FEE_LAMPORTS {
             info!("Sweep node {} has balance: {} lamports", node.index, bal);
             break bal;
