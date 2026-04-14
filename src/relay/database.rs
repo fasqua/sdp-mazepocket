@@ -58,6 +58,8 @@ pub struct MazePocket {
     pub created_at: i64,
     pub last_sweep_at: Option<i64>,
     pub status: PocketStatus,
+    pub label: Option<String>,
+    pub archived: bool,
 }
 
 /// Funding request for creating a pocket
@@ -87,6 +89,29 @@ pub struct ProtocolStats {
     pub total_hops_alltime: i64,
     pub nodes_24h: i64,
 }
+/// Route history entry for Phase 2
+#[derive(Debug, Clone)]
+pub struct RouteHistoryEntry {
+    pub id: String,
+    pub route_type: String,  // "funding" or "sweep"
+    pub amount_lamports: u64,
+    pub fee_lamports: u64,
+    pub status: String,
+    pub destination: Option<String>,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
+    pub tx_signature: Option<String>,
+}
+
+/// Usage statistics for a user
+#[derive(Debug, Clone)]
+pub struct UsageStats {
+    pub routes_today: i64,
+    pub routes_this_week: i64,
+    pub routes_this_month: i64,
+    pub total_volume_lamports: u64,
+}
+
 /// Database wrapper with Argon2id + AES-256-GCM encryption
 pub struct PocketDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -159,10 +184,16 @@ impl PocketDatabase {
                 funding_amount_lamports INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
                 last_sweep_at INTEGER,
-                status TEXT DEFAULT 'active'
+                status TEXT DEFAULT 'active',
+                label TEXT,
+                archived INTEGER DEFAULT 0
             )"#,
             [],
         )?;
+
+        // Migration: add label and archived columns if not exist
+        let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN label TEXT", []);
+        let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN archived INTEGER DEFAULT 0", []);
 
         // Funding requests table (for tracking maze routing to pocket)
         conn.execute(
@@ -328,10 +359,10 @@ impl PocketDatabase {
     pub fn create_pocket(&self, pocket: &MazePocket) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            r#"INSERT INTO maze_pockets 
-               (id, owner_meta_hash, stealth_pubkey, keypair_encrypted, 
-                funding_maze_id, funding_amount_lamports, created_at, status)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            r#"INSERT INTO maze_pockets
+               (id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
+                funding_maze_id, funding_amount_lamports, created_at, status, label, archived)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
             params![
                 pocket.id,
                 pocket.owner_meta_hash,
@@ -341,6 +372,8 @@ impl PocketDatabase {
                 pocket.funding_amount_lamports,
                 pocket.created_at,
                 pocket.status.as_str(),
+                pocket.label,
+                pocket.archived as i32,
             ],
         )?;
         Ok(())
@@ -352,7 +385,7 @@ impl PocketDatabase {
         let mut stmt = conn.prepare(
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
-                      last_sweep_at, status
+                      last_sweep_at, status, label, archived
                FROM maze_pockets WHERE id = ?1"#
         )?;
 
@@ -367,6 +400,8 @@ impl PocketDatabase {
                 created_at: row.get(6)?,
                 last_sweep_at: row.get(7)?,
                 status: PocketStatus::from_str(&row.get::<_, String>(8)?),
+                label: row.get(9)?,
+                archived: row.get::<_, i32>(10)? != 0,
             })
         });
 
@@ -383,8 +418,8 @@ impl PocketDatabase {
         let mut stmt = conn.prepare(
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
-                      last_sweep_at, status
-               FROM maze_pockets 
+                      last_sweep_at, status, label, archived
+               FROM maze_pockets
                WHERE id = ?1 AND owner_meta_hash = ?2"#
         )?;
 
@@ -399,6 +434,8 @@ impl PocketDatabase {
                 created_at: row.get(6)?,
                 last_sweep_at: row.get(7)?,
                 status: PocketStatus::from_str(&row.get::<_, String>(8)?),
+                label: row.get(9)?,
+                archived: row.get::<_, i32>(10)? != 0,
             })
         });
 
@@ -409,15 +446,15 @@ impl PocketDatabase {
         }
     }
 
-    /// List all pockets for an owner
+    /// List all pockets for an owner (excludes archived by default)
     pub fn list_pockets(&self, owner_meta_hash: &str) -> Result<Vec<MazePocket>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
-                      last_sweep_at, status
-               FROM maze_pockets 
-               WHERE owner_meta_hash = ?1 AND status != 'deleted' AND id NOT LIKE 'route_%'
+                      last_sweep_at, status, label, archived
+               FROM maze_pockets
+               WHERE owner_meta_hash = ?1 AND status != 'deleted' AND id NOT LIKE 'route_%' AND (archived = 0 OR archived IS NULL)
                ORDER BY created_at DESC"#
         )?;
 
@@ -432,6 +469,8 @@ impl PocketDatabase {
                 created_at: row.get(6)?,
                 last_sweep_at: row.get(7)?,
                 status: PocketStatus::from_str(&row.get::<_, String>(8)?),
+                label: row.get(9)?,
+                archived: row.get::<_, Option<i32>>(10)?.unwrap_or(0) != 0,
             })
         })?;
 
@@ -471,6 +510,61 @@ impl PocketDatabase {
             params![pocket_id, owner_meta_hash],
         )?;
         Ok(rows > 0)
+    }
+
+    /// Rename/label a pocket
+    pub fn rename_pocket(&self, pocket_id: &str, owner_meta_hash: &str, label: Option<&str>) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE maze_pockets SET label = ?1 WHERE id = ?2 AND owner_meta_hash = ?3",
+            params![label, pocket_id, owner_meta_hash],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Archive a pocket (hide from default list)
+    pub fn archive_pocket(&self, pocket_id: &str, owner_meta_hash: &str, archived: bool) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE maze_pockets SET archived = ?1 WHERE id = ?2 AND owner_meta_hash = ?3",
+            params![archived as i32, pocket_id, owner_meta_hash],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// List archived pockets for an owner
+    pub fn list_archived_pockets(&self, owner_meta_hash: &str) -> Result<Vec<MazePocket>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
+                      funding_maze_id, funding_amount_lamports, created_at,
+                      last_sweep_at, status, label, archived
+               FROM maze_pockets
+               WHERE owner_meta_hash = ?1 AND status != 'deleted' AND id NOT LIKE 'route_%' AND archived = 1
+               ORDER BY created_at DESC"#
+        )?;
+
+        let pockets = stmt.query_map(params![owner_meta_hash], |row| {
+            Ok(MazePocket {
+                id: row.get(0)?,
+                owner_meta_hash: row.get(1)?,
+                stealth_pubkey: row.get(2)?,
+                keypair_encrypted: row.get(3)?,
+                funding_maze_id: row.get(4)?,
+                funding_amount_lamports: row.get(5)?,
+                created_at: row.get(6)?,
+                last_sweep_at: row.get(7)?,
+                status: PocketStatus::from_str(&row.get::<_, String>(8)?),
+                label: row.get(9)?,
+                archived: row.get::<_, Option<i32>>(10)?.unwrap_or(0) != 0,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for pocket in pockets {
+            result.push(pocket.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
+        }
+        Ok(result)
     }
 
     // ============ FUNDING REQUEST OPERATIONS ============
@@ -1060,6 +1154,121 @@ impl PocketDatabase {
         )?;
         Ok(())
     }
+
+    // ============ PHASE 2: ROUTE HISTORY & STATS ============
+
+    /// Get route history for a user (funding + sweep requests)
+    pub fn get_route_history(&self, owner_meta_hash: &str, limit: u32) -> Result<Vec<RouteHistoryEntry>> {
+        let conn = self.conn.lock().unwrap();
+        
+        // Get funding requests (routes in)
+        let mut stmt = conn.prepare(
+            r#"SELECT id, amount_lamports, fee_lamports, status, destination_address, 
+                      created_at, completed_at, tx_signature
+               FROM funding_requests 
+               WHERE owner_meta_hash = ?1
+               ORDER BY created_at DESC
+               LIMIT ?2"#
+        )?;
+        
+        let funding_rows = stmt.query_map(params![owner_meta_hash, limit], |row| {
+            Ok(RouteHistoryEntry {
+                id: row.get(0)?,
+                route_type: "funding".to_string(),
+                amount_lamports: row.get::<_, i64>(1)? as u64,
+                fee_lamports: row.get::<_, i64>(2)? as u64,
+                status: row.get(3)?,
+                destination: row.get(4)?,
+                created_at: row.get(5)?,
+                completed_at: row.get(6)?,
+                tx_signature: row.get(7)?,
+            })
+        })?;
+        
+        let mut entries: Vec<RouteHistoryEntry> = Vec::new();
+        for row in funding_rows {
+            entries.push(row.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
+        }
+        
+        // Get sweep requests (routes out) - need to join with maze_pockets to get owner
+        let mut stmt2 = conn.prepare(
+            r#"SELECT sr.id, sr.amount_lamports, sr.destination_address, sr.status,
+                      sr.created_at, sr.completed_at, sr.tx_signature
+               FROM sweep_requests sr
+               JOIN maze_pockets mp ON sr.pocket_id = mp.id
+               WHERE mp.owner_meta_hash = ?1
+               ORDER BY sr.created_at DESC
+               LIMIT ?2"#
+        )?;
+        
+        let sweep_rows = stmt2.query_map(params![owner_meta_hash, limit], |row| {
+            Ok(RouteHistoryEntry {
+                id: row.get(0)?,
+                route_type: "sweep".to_string(),
+                amount_lamports: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                fee_lamports: 0, // Sweep doesn't have separate fee field
+                status: row.get(3)?,
+                destination: row.get(2)?,
+                created_at: row.get(4)?,
+                completed_at: row.get(5)?,
+                tx_signature: row.get(6)?,
+            })
+        })?;
+        
+        for row in sweep_rows {
+            entries.push(row.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
+        }
+        
+        // Sort by created_at desc
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        entries.truncate(limit as usize);
+        
+        Ok(entries)
+    }
+
+    /// Get usage stats for a user
+    pub fn get_usage_stats(&self, owner_meta_hash: &str) -> Result<UsageStats> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let today_start = now - (now % 86400); // Start of today UTC
+        let week_start = now - (7 * 86400);
+        let month_start = now - (30 * 86400);
+
+        // Routes today
+        let routes_today: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM funding_requests WHERE owner_meta_hash = ?1 AND created_at >= ?2",
+            params![owner_meta_hash, today_start],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        // Routes this week
+        let routes_this_week: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM funding_requests WHERE owner_meta_hash = ?1 AND created_at >= ?2",
+            params![owner_meta_hash, week_start],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        // Routes this month
+        let routes_this_month: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM funding_requests WHERE owner_meta_hash = ?1 AND created_at >= ?2",
+            params![owner_meta_hash, month_start],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        // Total volume
+        let total_volume: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_lamports), 0) FROM funding_requests WHERE owner_meta_hash = ?1 AND status = 'completed'",
+            params![owner_meta_hash],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        Ok(UsageStats {
+            routes_today,
+            routes_this_week,
+            routes_this_month,
+            total_volume_lamports: total_volume as u64,
+        })
+    }
 }
 impl Drop for PocketDatabase {
     fn drop(&mut self) {
@@ -1096,6 +1305,8 @@ mod tests {
             created_at: chrono::Utc::now().timestamp(),
             last_sweep_at: None,
             status: PocketStatus::Active,
+            label: None,
+            archived: false,
         };
 
         db.create_pocket(&pocket).unwrap();

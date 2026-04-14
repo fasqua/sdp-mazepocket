@@ -33,7 +33,7 @@ use sdp_mazepocket::{
     core::{lamports_to_sol, sol_to_lamports, generate_pocket_id},
     relay::{
         PocketDatabase, MazeGenerator, MazeGraph, MazeNode,
-        database::{MazePocket, PocketStatus, FundingRequest},
+        database::{MazePocket, PocketStatus, FundingRequest, RouteHistoryEntry, UsageStats},
     },
     error::{MazeError, Result},
 };
@@ -429,6 +429,8 @@ async fn create_pocket(
         created_at: now,
         last_sweep_at: None,
         status: PocketStatus::Active,
+        label: None,
+        archived: false,
     };
 
     state.db.create_pocket(&pocket)
@@ -541,6 +543,8 @@ async fn create_route(
         created_at: now,
         last_sweep_at: None,
         status: PocketStatus::Active,
+        label: None,
+        archived: false,
     };
     state.db.create_pocket(&pocket)?;
     // Create funding request with destination (direct route)
@@ -2322,6 +2326,8 @@ async fn main() {
         .route("/pockets", get(list_pockets))
         .route("/pocket/:pocket_id", get(get_pocket))
         .route("/pocket/:pocket_id/sweep", post(sweep_pocket))
+        .route("/pocket/:pocket_id/rename", post(rename_pocket_handler))
+        .route("/pocket/:pocket_id/archive", post(archive_pocket_handler))
         .route("/pocket/:pocket_id", axum::routing::delete(delete_pocket_handler))
         .route("/status/:request_id", get(get_funding_status))
         .route("/wallets", get(list_wallets))
@@ -2333,6 +2339,9 @@ async fn main() {
         .route("/wallet/:slot", axum::routing::delete(delete_wallet))
         .route("/mcp/register", post(mcp_register))
         .route("/tier-config", get(tier_config))
+        .route("/route-history", get(get_route_history))
+        .route("/usage-stats", get(get_usage_stats))
+        .route("/pocket/:pocket_id/transactions", get(get_pocket_transactions))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -2456,6 +2465,247 @@ async fn delete_wallet(
         deleted,
     }))
 }
+
+
+// ============ POCKET MANAGEMENT (Phase 1) ============
+
+#[derive(Debug, Deserialize)]
+struct RenamePocketRequest {
+    meta_address: String,
+    label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RenamePocketResponse {
+    success: bool,
+    pocket_id: String,
+    label: Option<String>,
+}
+
+async fn rename_pocket_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<RenamePocketRequest>,
+) -> std::result::Result<Json<RenamePocketResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+    
+    let updated = state.db.rename_pocket(&pocket_id, &owner_meta_hash, req.label.as_deref())?;
+    
+    if !updated {
+        return Err(MazeError::PocketNotFound(pocket_id.clone()).into());
+    }
+    
+    info!("Pocket {} renamed to {:?}", pocket_id, req.label);
+    
+    Ok(Json(RenamePocketResponse {
+        success: true,
+        pocket_id,
+        label: req.label,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchivePocketRequest {
+    meta_address: String,
+    archived: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchivePocketResponse {
+    success: bool,
+    pocket_id: String,
+    archived: bool,
+}
+
+async fn archive_pocket_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<ArchivePocketRequest>,
+) -> std::result::Result<Json<ArchivePocketResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+    
+    let updated = state.db.archive_pocket(&pocket_id, &owner_meta_hash, req.archived)?;
+    
+    if !updated {
+        return Err(MazeError::PocketNotFound(pocket_id.clone()).into());
+    }
+    
+    info!("Pocket {} archived={}", pocket_id, req.archived);
+    
+    Ok(Json(ArchivePocketResponse {
+        success: true,
+        pocket_id,
+        archived: req.archived,
+    }))
+}
+
+
+// ============ PHASE 2: ROUTE HISTORY & STATS ============
+
+#[derive(Debug, Deserialize)]
+struct RouteHistoryQuery {
+    meta_address: String,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteHistoryEntryResponse {
+    id: String,
+    route_type: String,
+    amount_lamports: u64,
+    amount_sol: f64,
+    fee_lamports: u64,
+    status: String,
+    destination: Option<String>,
+    created_at: i64,
+    completed_at: Option<i64>,
+    tx_signature: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteHistoryResponse {
+    success: bool,
+    routes: Vec<RouteHistoryEntryResponse>,
+    count: usize,
+}
+
+async fn get_route_history(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RouteHistoryQuery>,
+) -> std::result::Result<Json<RouteHistoryResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+    let limit = query.limit.unwrap_or(50).min(100);
+    
+    let history = state.db.get_route_history(&owner_meta_hash, limit)?;
+    
+    let routes: Vec<RouteHistoryEntryResponse> = history.into_iter().map(|h| RouteHistoryEntryResponse {
+        id: h.id,
+        route_type: h.route_type,
+        amount_lamports: h.amount_lamports,
+        amount_sol: lamports_to_sol(h.amount_lamports),
+        fee_lamports: h.fee_lamports,
+        status: h.status,
+        destination: h.destination,
+        created_at: h.created_at,
+        completed_at: h.completed_at,
+        tx_signature: h.tx_signature,
+    }).collect();
+    
+    let count = routes.len();
+    
+    Ok(Json(RouteHistoryResponse {
+        success: true,
+        routes,
+        count,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageStatsQuery {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UsageStatsResponse {
+    success: bool,
+    routes_today: i64,
+    routes_this_week: i64,
+    routes_this_month: i64,
+    total_volume_lamports: u64,
+    total_volume_sol: f64,
+}
+
+async fn get_usage_stats(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UsageStatsQuery>,
+) -> std::result::Result<Json<UsageStatsResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+    
+    let stats = state.db.get_usage_stats(&owner_meta_hash)?;
+    
+    Ok(Json(UsageStatsResponse {
+        success: true,
+        routes_today: stats.routes_today,
+        routes_this_week: stats.routes_this_week,
+        routes_this_month: stats.routes_this_month,
+        total_volume_lamports: stats.total_volume_lamports,
+        total_volume_sol: lamports_to_sol(stats.total_volume_lamports),
+    }))
+}
+
+
+// ============ TOOL #22: GET POCKET TRANSACTIONS (Simple) ============
+
+#[derive(Debug, Deserialize)]
+struct PocketTransactionsQuery {
+    meta_address: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct TransactionInfo {
+    signature: String,
+    slot: u64,
+    block_time: Option<i64>,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PocketTransactionsResponse {
+    success: bool,
+    pocket_id: String,
+    address: String,
+    transactions: Vec<TransactionInfo>,
+    count: usize,
+}
+
+async fn get_pocket_transactions(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Query(query): Query<PocketTransactionsQuery>,
+) -> std::result::Result<Json<PocketTransactionsResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+    let limit = query.limit.unwrap_or(20).min(50);
+    
+    // Get pocket and verify ownership
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+    
+    let pocket_pubkey = Pubkey::from_str(&pocket.stealth_pubkey)
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+    
+    // Get signatures from Solana RPC (simple version - 1 RPC call)
+    use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+    
+    let config = GetConfirmedSignaturesForAddress2Config {
+        limit: Some(limit),
+        ..Default::default()
+    };
+    
+    let signatures = state.rpc
+        .get_signatures_for_address_with_config(&pocket_pubkey, config)
+        .unwrap_or_default();
+    
+    let transactions: Vec<TransactionInfo> = signatures.into_iter().map(|sig| {
+        TransactionInfo {
+            signature: sig.signature,
+            slot: sig.slot,
+            block_time: sig.block_time,
+            status: if sig.err.is_none() { "success".to_string() } else { "failed".to_string() },
+        }
+    }).collect();
+    
+    let count = transactions.len();
+    
+    Ok(Json(PocketTransactionsResponse {
+        success: true,
+        pocket_id,
+        address: pocket.stealth_pubkey,
+        transactions,
+        count,
+    }))
+}
+
 
 
 // ============ MCP API KEY ============
