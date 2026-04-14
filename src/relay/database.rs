@@ -246,6 +246,30 @@ impl PocketDatabase {
             [],
         )?;
 
+        // MCP API Keys table
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS mcp_api_keys (
+                api_key_hash TEXT PRIMARY KEY,
+                wallet_address TEXT NOT NULL,
+                owner_meta_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER
+            )"#,
+            [],
+        )?;
+
+        // Destination wallets table (saved withdrawal addresses)
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS destination_wallets (
+                owner_meta_hash TEXT NOT NULL,
+                slot INTEGER NOT NULL,
+                wallet_address TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (owner_meta_hash, slot)
+            )"#,
+            [],
+        )?;
+
         // Indexes
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pockets_owner ON maze_pockets(owner_meta_hash)",
@@ -1024,6 +1048,17 @@ impl PocketDatabase {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(MazeError::DatabaseError(e.to_string())),
         }
+    }
+
+    /// Store MCP API key
+    pub fn store_mcp_api_key(&self, api_key_hash: &str, wallet_address: &str, owner_meta_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR REPLACE INTO mcp_api_keys (api_key_hash, wallet_address, owner_meta_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![api_key_hash, wallet_address, owner_meta_hash, now],
+        )?;
+        Ok(())
     }
 }
 impl Drop for PocketDatabase {

@@ -321,6 +321,50 @@ async fn health_check() -> Json<serde_json::Value> {
 }
 
 
+/// Tier config endpoint for MCP
+async fn tier_config() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "tokens": [
+            {
+                "symbol": "KAUSA",
+                "mint": "BWXSNRBKMviG68MqavyssnzDq4qSArcN7eNYjqEfpump",
+                "thresholds": {
+                    "BASIC": 1000,
+                    "PRO": 10000,
+                    "ENTERPRISE": 100000
+                }
+            }
+        ],
+        "limits": {
+            "FREE": {
+                "fee_percent": 1.0,
+                "max_complexity": "medium",
+                "max_amount_sol": 1,
+                "daily_routes": 10
+            },
+            "BASIC": {
+                "fee_percent": 0.5,
+                "max_complexity": "high",
+                "max_amount_sol": 10,
+                "daily_routes": 50
+            },
+            "PRO": {
+                "fee_percent": 0.25,
+                "max_complexity": "high",
+                "max_amount_sol": 100,
+                "daily_routes": 200
+            },
+            "ENTERPRISE": {
+                "fee_percent": 0.1,
+                "max_complexity": "high",
+                "max_amount_sol": 1000000,
+                "daily_routes": 1000000
+            }
+        }
+    }))
+}
+
+
 /// Protocol stats endpoint
 async fn stats_handler(
     State(state): State<Arc<AppState>>,
@@ -2252,6 +2296,8 @@ async fn main() {
         .route("/sweep/:sweep_id/recover", post(recover_sweep))
         .route("/wallet", post(add_wallet))
         .route("/wallet/:slot", axum::routing::delete(delete_wallet))
+        .route("/mcp/register", post(mcp_register))
+        .route("/tier-config", get(tier_config))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -2376,3 +2422,78 @@ async fn delete_wallet(
     }))
 }
 
+
+// ============ MCP API KEY ============
+
+#[derive(Debug, Deserialize)]
+struct McpRegisterRequest {
+    wallet_address: String,
+    signature: String,
+    message: String,
+    timestamp: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct McpRegisterResponse {
+    success: bool,
+    api_key: Option<String>,
+    tier: Option<String>,
+    error: Option<String>,
+}
+
+
+async fn mcp_register(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<McpRegisterRequest>,
+) -> std::result::Result<Json<McpRegisterResponse>, AppError> {
+    use sha2::{Sha256, Digest};
+    
+    info!("MCP register request for wallet: {}", &req.wallet_address);
+    
+    // Validate timestamp (within 5 minutes)
+    let now = chrono::Utc::now().timestamp_millis();
+    if (now - req.timestamp).abs() > 300_000 {
+        return Ok(Json(McpRegisterResponse {
+            success: false,
+            api_key: None,
+            tier: None,
+            error: Some("Request expired".into()),
+        }));
+    }
+    
+    // Validate wallet address
+    let _pubkey = Pubkey::from_str(&req.wallet_address)
+        .map_err(|_| MazeError::InvalidParameters("Invalid wallet address".into()))?;
+    
+    // Verify signature exists (basic check - frontend signs with wallet)
+    if req.signature.is_empty() || req.message.is_empty() {
+        return Ok(Json(McpRegisterResponse {
+            success: false,
+            api_key: None,
+            tier: None,
+            error: Some("Missing signature or message".into()),
+        }));
+    }
+    
+    // Generate API key
+    let random_bytes: [u8; 16] = rand::random();
+    let api_key = format!("kl_{}", hex::encode(random_bytes));
+    
+    // Hash API key for storage
+    let mut hasher = Sha256::new();
+    hasher.update(api_key.as_bytes());
+    let api_key_hash = hex::encode(hasher.finalize());
+    
+    // Store in database
+    let owner_meta_hash = hash_meta_address(&req.wallet_address);
+    state.db.store_mcp_api_key(&api_key_hash, &req.wallet_address, &owner_meta_hash)?;
+    
+    info!("MCP API key generated for wallet: {}", &req.wallet_address);
+    
+    Ok(Json(McpRegisterResponse {
+        success: true,
+        api_key: Some(api_key),
+        tier: None,
+        error: None,
+    }))
+}
