@@ -2338,6 +2338,7 @@ async fn main() {
         .route("/wallet", post(add_wallet))
         .route("/wallet/:slot", axum::routing::delete(delete_wallet))
         .route("/mcp/register", post(mcp_register))
+        .route("/mcp/validate-key", post(mcp_validate_key))
         .route("/tier-config", get(tier_config))
         .route("/route-history", get(get_route_history))
         .route("/usage-stats", get(get_usage_stats))
@@ -2781,4 +2782,41 @@ async fn mcp_register(
         tier: None,
         error: None,
     }))
+}
+
+// ============ MCP VALIDATE API KEY ============
+
+#[derive(Debug, Deserialize)]
+struct McpValidateKeyRequest {
+    api_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct McpValidateKeyResponse {
+    valid: bool,
+    wallet_address: Option<String>,
+}
+
+async fn mcp_validate_key(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<McpValidateKeyRequest>,
+) -> Json<McpValidateKeyResponse> {
+    use sha2::{Sha256, Digest};
+    
+    // Hash the API key
+    let mut hasher = Sha256::new();
+    hasher.update(req.api_key.as_bytes());
+    let api_key_hash = hex::encode(hasher.finalize());
+    
+    // Lookup in database
+    match state.db.validate_mcp_api_key(&api_key_hash) {
+        Ok(Some(wallet_address)) => Json(McpValidateKeyResponse {
+            valid: true,
+            wallet_address: Some(wallet_address),
+        }),
+        _ => Json(McpValidateKeyResponse {
+            valid: false,
+            wallet_address: None,
+        }),
+    }
 }

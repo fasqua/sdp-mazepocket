@@ -1155,6 +1155,20 @@ impl PocketDatabase {
         Ok(())
     }
 
+    /// Validate MCP API key and return wallet address
+    pub fn validate_mcp_api_key(&self, api_key_hash: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT wallet_address FROM mcp_api_keys WHERE api_key_hash = ?1"
+        )?;
+        let mut rows = stmt.query(params![api_key_hash])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     // ============ PHASE 2: ROUTE HISTORY & STATS ============
 
     /// Get route history for a user (funding + sweep requests)
