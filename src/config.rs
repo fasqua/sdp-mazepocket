@@ -148,6 +148,7 @@ pub struct Config {
     pub database_path: String,
     pub master_key: String,
     pub port: u16,
+    pub admin_api_key: Option<String>,
 }
 
 impl Config {
@@ -163,6 +164,7 @@ impl Config {
                 .unwrap_or_else(|_| "3033".to_string())
                 .parse()
                 .unwrap_or(3033),
+            admin_api_key: std::env::var("ADMIN_API_KEY").ok(),
         }
     }
 }

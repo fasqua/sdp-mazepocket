@@ -2845,6 +2845,25 @@ async fn mcp_validate_key(
 
 // ============ ADMIN PARTNER MANAGEMENT ============
 
+// Admin auth helper
+fn verify_admin_key(state: &AppState, headers: &axum::http::HeaderMap) -> std::result::Result<(), AppError> {
+    let admin_key = match &state.config.admin_api_key {
+        Some(key) => key,
+        None => return Err(MazeError::InvalidParameters("Admin API not configured".into()).into()),
+    };
+    
+    let provided_key = headers
+        .get("X-Admin-Key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    
+    if provided_key != admin_key {
+        return Err(MazeError::InvalidParameters("Invalid admin key".into()).into());
+    }
+    
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct AddPartnerRequest {
     token_symbol: String,
@@ -2884,11 +2903,13 @@ struct DeletePartnerResponse {
     success: bool,
     message: String,
 }
-
 async fn add_partner_handler(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<AddPartnerRequest>,
+
 ) -> std::result::Result<Json<AddPartnerResponse>, AppError> {
+    verify_admin_key(&state, &headers)?;
     use sdp_mazepocket::relay::database::Partner;
     
     let now = chrono::Utc::now().timestamp();
@@ -2919,7 +2940,9 @@ async fn add_partner_handler(
 
 async fn list_partners_handler(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> std::result::Result<Json<ListPartnersResponse>, AppError> {
+    verify_admin_key(&state, &headers)?;
     let partners = state.db.list_partners()?;
     
     let partner_infos: Vec<PartnerInfo> = partners.iter().map(|p| PartnerInfo {
@@ -2943,8 +2966,10 @@ async fn list_partners_handler(
 
 async fn delete_partner_handler(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Path(partner_id): Path<String>,
 ) -> std::result::Result<Json<DeletePartnerResponse>, AppError> {
+    verify_admin_key(&state, &headers)?;
     let deleted = state.db.delete_partner(&partner_id)?;
     
     if deleted {
