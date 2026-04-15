@@ -132,7 +132,8 @@ struct MazeInfo {
 struct RouteRequest {
     meta_address: String,
     amount_sol: f64,
-    destination: String,
+    destination_slot: Option<u8>,
+    destination: Option<String>,
     maze_config: Option<CustomMazeConfig>,
 }
 
@@ -255,6 +256,36 @@ struct StatsResponse {
     total_nodes_alltime: i64,
     total_hops_alltime: i64,
     nodes_24h: i64,
+}
+
+// ============ SWEEP ALL POCKETS (Phase 3) ============
+
+#[derive(Debug, Deserialize)]
+struct SweepAllPocketsRequest {
+    meta_address: String,
+    destination_slot: Option<u8>,
+    destination: Option<String>,
+    maze_config: Option<CustomMazeConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct SweepAllPocketResult {
+    pocket_id: String,
+    success: bool,
+    sweep_id: Option<String>,
+    amount_swept: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SweepAllPocketsResponse {
+    success: bool,
+    total_pockets: usize,
+    successful_sweeps: usize,
+    failed_sweeps: usize,
+    total_amount_swept: u64,
+    destination: String,
+    results: Vec<SweepAllPocketResult>,
 }
 
 // ============ UTILITY FUNCTIONS ============
@@ -514,18 +545,33 @@ async fn create_route(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RouteRequest>,
 ) -> std::result::Result<Json<RouteResponse>, AppError> {
-    info!("Create route request: {} SOL to {}", req.amount_sol, &req.destination[..20.min(req.destination.len())]);
 
     // Validate amount
     if req.amount_sol < MIN_AMOUNT_SOL {
         return Err(MazeError::InvalidParameters(format!("Minimum amount is {} SOL", MIN_AMOUNT_SOL)).into());
     }
-
-    // Validate destination address
-    let _destination_pubkey = Pubkey::from_str(&req.destination)
-        .map_err(|_| MazeError::InvalidParameters("Invalid destination address".into()))?;
-
     let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Determine destination - prefer slot, then direct address
+    let destination = if let Some(slot) = req.destination_slot {
+        if slot < 1 || slot > 5 {
+            return Err(MazeError::InvalidParameters("Invalid slot. Must be 1-5".into()).into());
+        }
+        match state.db.get_destination_wallet(&owner_meta_hash, slot)? {
+            Some(addr) => addr,
+            None => return Err(MazeError::InvalidParameters(format!("No wallet saved in slot {}", slot)).into()),
+        }
+    } else if let Some(ref addr) = req.destination {
+        addr.clone()
+    } else {
+        return Err(MazeError::InvalidParameters("Must specify destination_slot (1-5) or destination address".into()).into());
+    };
+
+    info!("Create route request: {} SOL to {}", req.amount_sol, &destination[..20.min(destination.len())]);
+
+    // Validate destination is valid Solana address
+    let _destination_pubkey = Pubkey::from_str(&destination)
+        .map_err(|_| MazeError::InvalidParameters("Invalid destination address".into()))?;
     let amount_lamports = sol_to_lamports(req.amount_sol);
     let fee_lamports = (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64;
 
@@ -555,7 +601,7 @@ async fn create_route(
     let pocket = MazePocket {
         id: route_id.clone(),
         owner_meta_hash: owner_meta_hash.clone(),
-        stealth_pubkey: req.destination.clone(), // Use destination as stealth_pubkey
+        stealth_pubkey: destination.clone(), // Use destination as stealth_pubkey
         keypair_encrypted,
         funding_maze_id: None,
         funding_amount_lamports: amount_lamports,
@@ -585,7 +631,7 @@ async fn create_route(
         expires_at: now + EXPIRY_SECONDS,
         completed_at: None,
         error_message: None,
-        destination_address: Some(req.destination.clone()),
+        destination_address: Some(destination.clone()),
         tx_signature: None,
     };
 
@@ -598,13 +644,13 @@ async fn create_route(
 
     let total_deposit = amount_lamports + fee_lamports + (TX_FEE_LAMPORTS * maze.total_transactions as u64);
 
-    info!("Route {} created with deposit address {}, destination {}", route_id, deposit_address, req.destination);
+    info!("Route {} created with deposit address {}, destination {}", route_id, deposit_address, destination);
 
     Ok(Json(RouteResponse {
         success: true,
         route_id,
         deposit_address,
-        destination: req.destination,
+        destination: destination,
         amount_lamports,
         fee_lamports,
         total_deposit,
@@ -2292,6 +2338,414 @@ async fn deposit_monitor(state: Arc<AppState>) {
     }
 }
 
+
+// ============ SWEEP ALL POCKETS HANDLER (Phase 3) ============
+
+/// Sweep all pockets to a single destination
+async fn sweep_all_pockets(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SweepAllPocketsRequest>,
+) -> std::result::Result<Json<SweepAllPocketsResponse>, AppError> {
+    // Determine destination - prefer slot, then direct address
+    let destination = if let Some(slot) = req.destination_slot {
+        if slot < 1 || slot > 5 {
+            return Ok(Json(SweepAllPocketsResponse {
+                success: false,
+                total_pockets: 0,
+                successful_sweeps: 0,
+                failed_sweeps: 0,
+                total_amount_swept: 0,
+                destination: "".to_string(),
+                results: vec![SweepAllPocketResult {
+                    pocket_id: "".to_string(),
+                    success: false,
+                    sweep_id: None,
+                    amount_swept: None,
+                    error: Some("Invalid slot. Must be 1-5".to_string()),
+                }],
+            }));
+        }
+        let owner_hash_temp = hash_meta_address(&req.meta_address);
+        match state.db.get_destination_wallet(&owner_hash_temp, slot)? {
+            Some(addr) => addr,
+            None => return Ok(Json(SweepAllPocketsResponse {
+                success: false,
+                total_pockets: 0,
+                successful_sweeps: 0,
+                failed_sweeps: 0,
+                total_amount_swept: 0,
+                destination: "".to_string(),
+                results: vec![SweepAllPocketResult {
+                    pocket_id: "".to_string(),
+                    success: false,
+                    sweep_id: None,
+                    amount_swept: None,
+                    error: Some(format!("No wallet saved in slot {}", slot)),
+                }],
+            })),
+        }
+    } else if let Some(ref addr) = req.destination {
+        addr.clone()
+    } else {
+        return Ok(Json(SweepAllPocketsResponse {
+            success: false,
+            total_pockets: 0,
+            successful_sweeps: 0,
+            failed_sweeps: 0,
+            total_amount_swept: 0,
+            destination: "".to_string(),
+            results: vec![SweepAllPocketResult {
+                pocket_id: "".to_string(),
+                success: false,
+                sweep_id: None,
+                amount_swept: None,
+                error: Some("Must specify destination_slot (1-5) or destination address".to_string()),
+            }],
+        }));
+    };
+
+    info!("Sweep all pockets request to {}", &destination[..20.min(destination.len())]);
+
+    // Validate destination is valid Solana address
+    Pubkey::from_str(&destination)
+        .map_err(|_| MazeError::InvalidParameters("Invalid destination address".into()))?;
+
+
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Get all active pockets for this user
+    let pockets = state.db.list_pockets(&owner_meta_hash)?;
+
+    if pockets.is_empty() {
+        return Ok(Json(SweepAllPocketsResponse {
+            success: true,
+            total_pockets: 0,
+            successful_sweeps: 0,
+            failed_sweeps: 0,
+            total_amount_swept: 0,
+            destination: destination.clone(),
+            results: vec![],
+        }));
+    }
+
+    let maze_params = parse_maze_config(req.maze_config);
+    let mut results: Vec<SweepAllPocketResult> = Vec::new();
+    let mut successful_sweeps = 0usize;
+    let mut failed_sweeps = 0usize;
+    let mut total_amount_swept = 0u64;
+
+    for pocket in &pockets {
+        // Skip non-active pockets
+        if pocket.status != PocketStatus::Active {
+            results.push(SweepAllPocketResult {
+                pocket_id: pocket.id.clone(),
+                success: false,
+                sweep_id: None,
+                amount_swept: None,
+                error: Some(format!("Pocket status is {}", pocket.status.as_str())),
+            });
+            failed_sweeps += 1;
+            continue;
+        }
+
+        // Get pocket keypair
+        let keypair_bytes = match state.db.decrypt(&pocket.keypair_encrypted) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                results.push(SweepAllPocketResult {
+                    pocket_id: pocket.id.clone(),
+                    success: false,
+                    sweep_id: None,
+                    amount_swept: None,
+                    error: Some(format!("Decrypt error: {}", e)),
+                });
+                failed_sweeps += 1;
+                continue;
+            }
+        };
+
+        let pocket_keypair = match Keypair::from_bytes(&keypair_bytes) {
+            Ok(kp) => kp,
+            Err(e) => {
+                results.push(SweepAllPocketResult {
+                    pocket_id: pocket.id.clone(),
+                    success: false,
+                    sweep_id: None,
+                    amount_swept: None,
+                    error: Some(format!("Keypair error: {}", e)),
+                });
+                failed_sweeps += 1;
+                continue;
+            }
+        };
+
+        // Check balance
+        let balance = match state.rpc.get_balance(&pocket_keypair.pubkey()) {
+            Ok(b) => b,
+            Err(e) => {
+                results.push(SweepAllPocketResult {
+                    pocket_id: pocket.id.clone(),
+                    success: false,
+                    sweep_id: None,
+                    amount_swept: None,
+                    error: Some(format!("RPC error: {}", e)),
+                });
+                failed_sweeps += 1;
+                continue;
+            }
+        };
+
+        // Skip if insufficient balance
+        if balance <= TX_FEE_LAMPORTS * 20 {
+            results.push(SweepAllPocketResult {
+                pocket_id: pocket.id.clone(),
+                success: false,
+                sweep_id: None,
+                amount_swept: None,
+                error: Some("Insufficient balance for sweep".to_string()),
+            });
+            failed_sweeps += 1;
+            continue;
+        }
+
+        // Mark as sweeping
+        if let Err(e) = state.db.update_pocket_status(&pocket.id, PocketStatus::Sweeping) {
+            results.push(SweepAllPocketResult {
+                pocket_id: pocket.id.clone(),
+                success: false,
+                sweep_id: None,
+                amount_swept: None,
+                error: Some(format!("Status update error: {}", e)),
+            });
+            failed_sweeps += 1;
+            continue;
+        }
+
+        // Generate sweep maze
+        let generator = MazeGenerator::new(maze_params.clone());
+        let sweep_amount = balance.saturating_sub(TX_FEE_LAMPORTS);
+        let encrypt_fn = |data: &[u8]| state.db.encrypt(data);
+
+        let maze = match generator.generate(sweep_amount, encrypt_fn) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = state.db.update_pocket_status(&pocket.id, PocketStatus::Active);
+                results.push(SweepAllPocketResult {
+                    pocket_id: pocket.id.clone(),
+                    success: false,
+                    sweep_id: None,
+                    amount_swept: None,
+                    error: Some(format!("Maze generation error: {}", e)),
+                });
+                failed_sweeps += 1;
+                continue;
+            }
+        };
+
+        let sweep_id = format!("sweep_{}", &pocket.id[7..]);
+        let maze_json = serde_json::to_string(&maze).unwrap_or_default();
+
+        // Save sweep request
+        if let Err(e) = state.db.create_sweep_request(&sweep_id, &pocket.id, &destination, sweep_amount, &maze_json) {
+            let _ = state.db.update_pocket_status(&pocket.id, PocketStatus::Active);
+            results.push(SweepAllPocketResult {
+                pocket_id: pocket.id.clone(),
+                success: false,
+                sweep_id: None,
+                amount_swept: None,
+                error: Some(format!("DB error: {}", e)),
+            });
+            failed_sweeps += 1;
+            continue;
+        }
+
+        // Store maze nodes
+        let mut store_failed = false;
+        for node in &maze.nodes {
+            if let Err(e) = state.db.store_sweep_node(&sweep_id, node) {
+                let _ = state.db.update_pocket_status(&pocket.id, PocketStatus::Active);
+                results.push(SweepAllPocketResult {
+                    pocket_id: pocket.id.clone(),
+                    success: false,
+                    sweep_id: None,
+                    amount_swept: None,
+                    error: Some(format!("Failed to store maze node: {}", e)),
+                });
+                failed_sweeps += 1;
+                store_failed = true;
+                break;
+            }
+        }
+        if store_failed {
+            continue;
+        }
+        // Transfer from pocket to first maze node
+        let first_node = &maze.nodes[0];
+        let first_node_pubkey = match Pubkey::from_str(&first_node.address) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = state.db.update_pocket_status(&pocket.id, PocketStatus::Active);
+                results.push(SweepAllPocketResult {
+                    pocket_id: pocket.id.clone(),
+                    success: false,
+                    sweep_id: Some(sweep_id),
+                    amount_swept: None,
+                    error: Some(format!("Invalid node address: {}", e)),
+                });
+                failed_sweeps += 1;
+                continue;
+            }
+        };
+
+        // Send initial transaction with retry
+        let (sig, last_err) = {
+            let mut last_err = String::new();
+            let mut result_sig = None;
+            for attempt in 1..=5u8 {
+                let blockhash = match state.rpc.get_latest_blockhash() {
+                    Ok(bh) => bh,
+                    Err(e) => {
+                        warn!("Sweep all attempt {}/5 for {}: Failed to get blockhash: {}", attempt, pocket.id, e);
+                        last_err = e.to_string();
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+                let ix = system_instruction::transfer(
+                    &pocket_keypair.pubkey(),
+                    &first_node_pubkey,
+                    sweep_amount,
+                );
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&pocket_keypair.pubkey()),
+                    &[&pocket_keypair],
+                    blockhash,
+                );
+                let config = RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    preflight_commitment: None,
+                    encoding: None,
+                    max_retries: Some(3),
+                    min_context_slot: None,
+                };
+                match state.rpc.send_transaction_with_config(&tx, config) {
+                    Ok(s) => {
+                        if attempt > 1 {
+                            info!("Sweep all TX succeeded on attempt {}/5 for {}", attempt, pocket.id);
+                        }
+                        result_sig = Some(s);
+                        break;
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                            warn!("Sweep all attempt {}/5 for {}: {}", attempt, pocket.id, err_str);
+                            last_err = err_str;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        last_err = err_str;
+                        break;
+                    }
+                }
+            }
+            (result_sig, last_err)
+        };
+
+        let sig = match sig {
+            Some(s) => s,
+            None => {
+                let _ = state.db.update_pocket_status(&pocket.id, PocketStatus::Active);
+                results.push(SweepAllPocketResult {
+                    pocket_id: pocket.id.clone(),
+                    success: false,
+                    sweep_id: Some(sweep_id),
+                    amount_swept: None,
+                    error: Some(format!("TX failed: {}", last_err)),
+                });
+                failed_sweeps += 1;
+                continue;
+            }
+        };
+
+        // Wait for confirmation
+        let mut confirmed = false;
+        for _ in 0..30 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+                if result.is_ok() {
+                    confirmed = true;
+                    break;
+                } else if let Err(e) = result {
+                    let _ = state.db.update_pocket_status(&pocket.id, PocketStatus::Active);
+                    results.push(SweepAllPocketResult {
+                        pocket_id: pocket.id.clone(),
+                        success: false,
+                        sweep_id: Some(sweep_id.clone()),
+                        amount_swept: None,
+                        error: Some(format!("TX failed: {:?}", e)),
+                    });
+                    failed_sweeps += 1;
+                    continue;
+                }
+            }
+        }
+
+        if !confirmed {
+            let _ = state.db.update_pocket_status(&pocket.id, PocketStatus::Active);
+            results.push(SweepAllPocketResult {
+                pocket_id: pocket.id.clone(),
+                success: false,
+                sweep_id: Some(sweep_id),
+                amount_swept: None,
+                error: Some("TX confirmation timeout".to_string()),
+            });
+            failed_sweeps += 1;
+            continue;
+        }
+
+        // Spawn background task for maze execution
+        let state_clone = state.clone();
+        let sweep_id_clone = sweep_id.clone();
+        let pocket_id_clone = pocket.id.clone();
+        tokio::spawn(async move {
+            match execute_sweep_maze(state_clone.clone(), &sweep_id_clone).await {
+                Ok(_) => {
+                    let _ = state_clone.db.mark_pocket_swept(&pocket_id_clone);
+                    info!("Sweep all: maze completed for {}", pocket_id_clone);
+                }
+                Err(e) => {
+                    error!("Sweep all: maze failed for {}: {}", pocket_id_clone, sanitize_error(&e.to_string()));
+                    let _ = state_clone.db.update_pocket_status(&pocket_id_clone, PocketStatus::Active);
+                    let _ = state_clone.db.update_sweep_status(&sweep_id_clone, "failed", None, Some(&sanitize_error(&e.to_string())));
+                }
+            }
+        });
+
+        results.push(SweepAllPocketResult {
+            pocket_id: pocket.id.clone(),
+            success: true,
+            sweep_id: Some(sweep_id),
+            amount_swept: Some(sweep_amount),
+            error: None,
+        });
+        successful_sweeps += 1;
+        total_amount_swept += sweep_amount;
+
+        info!("Sweep all: initiated for pocket {} ({} lamports)", pocket.id, sweep_amount);
+    }
+
+    Ok(Json(SweepAllPocketsResponse {
+        success: successful_sweeps > 0 || pockets.is_empty(),
+        total_pockets: pockets.len(),
+        successful_sweeps,
+        failed_sweeps,
+        total_amount_swept,
+        destination: destination,
+        results,
+    }))
+}
 // ============ MAIN ============
 
 #[tokio::main]
@@ -2343,6 +2797,7 @@ async fn main() {
         .route("/pocket", post(create_pocket))
         .route("/route", post(create_route))
         .route("/pockets", get(list_pockets))
+        .route("/pockets/sweep-all", post(sweep_all_pockets))
         .route("/pocket/:pocket_id", get(get_pocket))
         .route("/pocket/:pocket_id/sweep", post(sweep_pocket))
         .route("/pocket/:pocket_id/rename", post(rename_pocket_handler))
