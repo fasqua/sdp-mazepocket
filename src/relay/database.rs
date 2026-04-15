@@ -112,6 +112,19 @@ pub struct UsageStats {
     pub total_volume_lamports: u64,
 }
 
+/// Partner token for multi-token tier system
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Partner {
+    pub id: String,
+    pub token_symbol: String,
+    pub token_mint: String,
+    pub tier_basic: i64,
+    pub tier_pro: i64,
+    pub is_official_partner: bool,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
 /// Database wrapper with Argon2id + AES-256-GCM encryption
 pub struct PocketDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -315,6 +328,32 @@ impl PocketDatabase {
             [],
         )?;
 
+
+        // Partners table (for multi-token tier system)
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS partners (
+                id TEXT PRIMARY KEY,
+                token_symbol TEXT NOT NULL,
+                token_mint TEXT NOT NULL,
+                tier_basic INTEGER NOT NULL,
+                tier_pro INTEGER NOT NULL,
+                is_official_partner INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )"#,
+            [],
+        )?;
+
+        // Partner indexes
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_partners_status ON partners(status)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_partners_mint ON partners(token_mint)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -1282,6 +1321,121 @@ impl PocketDatabase {
             routes_this_month,
             total_volume_lamports: total_volume as u64,
         })
+    }
+
+    // ============ PARTNER OPERATIONS ============
+
+    /// Create a new partner
+    pub fn create_partner(&self, partner: &Partner) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO partners
+               (id, token_symbol, token_mint, tier_basic, tier_pro,
+                is_official_partner, status, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            params![
+                partner.id,
+                partner.token_symbol,
+                partner.token_mint,
+                partner.tier_basic,
+                partner.tier_pro,
+                partner.is_official_partner as i32,
+                partner.status,
+                partner.created_at,
+                partner.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all active partners
+    pub fn list_partners(&self) -> Result<Vec<Partner>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, token_symbol, token_mint, tier_basic, tier_pro,
+                      is_official_partner, status, created_at, updated_at
+               FROM partners WHERE status = 'active'
+               ORDER BY token_symbol"#
+        )?;
+
+        let partners = stmt.query_map([], |row| {
+            Ok(Partner {
+                id: row.get(0)?,
+                token_symbol: row.get(1)?,
+                token_mint: row.get(2)?,
+                tier_basic: row.get(3)?,
+                tier_pro: row.get(4)?,
+                is_official_partner: row.get::<_, i32>(5)? != 0,
+                status: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+            })
+        })?.filter_map(|r| r.ok()).collect();
+
+        Ok(partners)
+    }
+
+    /// Get partner by ID
+    pub fn get_partner(&self, partner_id: &str) -> Result<Option<Partner>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, token_symbol, token_mint, tier_basic, tier_pro,
+                      is_official_partner, status, created_at, updated_at
+               FROM partners WHERE id = ?1"#
+        )?;
+
+        let result = stmt.query_row(params![partner_id], |row| {
+            Ok(Partner {
+                id: row.get(0)?,
+                token_symbol: row.get(1)?,
+                token_mint: row.get(2)?,
+                tier_basic: row.get(3)?,
+                tier_pro: row.get(4)?,
+                is_official_partner: row.get::<_, i32>(5)? != 0,
+                status: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+            })
+        });
+
+        match result {
+            Ok(partner) => Ok(Some(partner)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
+    }
+
+    /// Update partner
+    pub fn update_partner(&self, partner: &Partner) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            r#"UPDATE partners SET
+               token_symbol = ?2, token_mint = ?3, tier_basic = ?4, tier_pro = ?5,
+               is_official_partner = ?6, status = ?7, updated_at = ?8
+               WHERE id = ?1"#,
+            params![
+                partner.id,
+                partner.token_symbol,
+                partner.token_mint,
+                partner.tier_basic,
+                partner.tier_pro,
+                partner.is_official_partner as i32,
+                partner.status,
+                partner.updated_at,
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Delete partner (soft delete - set status to inactive)
+    pub fn delete_partner(&self, partner_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let rows = conn.execute(
+            "UPDATE partners SET status = 'inactive', updated_at = ?2 WHERE id = ?1",
+            params![partner_id, now],
+        )?;
+        Ok(rows > 0)
     }
 }
 impl Drop for PocketDatabase {

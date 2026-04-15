@@ -322,43 +322,62 @@ async fn health_check() -> Json<serde_json::Value> {
 
 
 /// Tier config endpoint for MCP
-async fn tier_config() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "tokens": [
-            {
-                "symbol": "KAUSA",
-                "mint": "BWXSNRBKMviG68MqavyssnzDq4qSArcN7eNYjqEfpump",
+async fn tier_config(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    // Get active partners from database
+    let partner_tokens: Vec<serde_json::Value> = match state.db.list_partners() {
+        Ok(partners) => partners.iter().map(|p| {
+            serde_json::json!({
+                "symbol": p.token_symbol,
+                "mint": p.token_mint,
                 "thresholds": {
-                    "BASIC": 1000,
-                    "PRO": 10000,
-                    "ENTERPRISE": 100000
-                }
-            }
-        ],
+                    "BASIC": p.tier_basic,
+                    "PRO": p.tier_pro
+                },
+                "max_tier": "PRO",
+                "is_official": p.is_official_partner
+            })
+        }).collect(),
+        Err(_) => vec![],
+    };
+
+    Json(serde_json::json!({
+        "master_token": {
+            "symbol": "KAUSA",
+            "mint": "BWXSNRBKMviG68MqavyssnzDq4qSArcN7eNYjqEfpump",
+            "thresholds": {
+                "BASIC": 1000,
+                "PRO": 10000,
+                "ENTERPRISE": 100000
+            },
+            "minimum_for_partner_unlock": 100
+        },
+        "partner_tokens": partner_tokens,
         "limits": {
             "FREE": {
-                "fee_percent": 1.0,
+                "fee_percent": 2.0,
                 "max_complexity": "medium",
-                "max_amount_sol": 1,
-                "daily_routes": 10
+                "max_amount_sol": 0.1,
+                "daily_routes": 1
             },
             "BASIC": {
+                "fee_percent": 1.0,
+                "max_complexity": "high",
+                "max_amount_sol": 1,
+                "daily_routes": 5
+            },
+            "PRO": {
                 "fee_percent": 0.5,
                 "max_complexity": "high",
                 "max_amount_sol": 10,
-                "daily_routes": 50
+                "daily_routes": 20
             },
-            "PRO": {
+            "ENTERPRISE": {
                 "fee_percent": 0.25,
                 "max_complexity": "high",
                 "max_amount_sol": 100,
-                "daily_routes": 200
-            },
-            "ENTERPRISE": {
-                "fee_percent": 0.1,
-                "max_complexity": "high",
-                "max_amount_sol": 1000000,
-                "daily_routes": 1000000
+                "daily_routes": 100
             }
         }
     }))
@@ -2343,6 +2362,9 @@ async fn main() {
         .route("/route-history", get(get_route_history))
         .route("/usage-stats", get(get_usage_stats))
         .route("/pocket/:pocket_id/transactions", get(get_pocket_transactions))
+        .route("/admin/partners", get(list_partners_handler))
+        .route("/admin/partners", post(add_partner_handler))
+        .route("/admin/partners/:id", axum::routing::delete(delete_partner_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -2818,5 +2840,123 @@ async fn mcp_validate_key(
             valid: false,
             wallet_address: None,
         }),
+    }
+}
+
+// ============ ADMIN PARTNER MANAGEMENT ============
+
+#[derive(Debug, Deserialize)]
+struct AddPartnerRequest {
+    token_symbol: String,
+    token_mint: String,
+    tier_basic: i64,
+    tier_pro: i64,
+    is_official: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct AddPartnerResponse {
+    success: bool,
+    partner_id: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ListPartnersResponse {
+    success: bool,
+    partners: Vec<PartnerInfo>,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct PartnerInfo {
+    id: String,
+    token_symbol: String,
+    token_mint: String,
+    tier_basic: i64,
+    tier_pro: i64,
+    is_official_partner: bool,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeletePartnerResponse {
+    success: bool,
+    message: String,
+}
+
+async fn add_partner_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddPartnerRequest>,
+) -> std::result::Result<Json<AddPartnerResponse>, AppError> {
+    use sdp_mazepocket::relay::database::Partner;
+    
+    let now = chrono::Utc::now().timestamp();
+    let partner_id = format!("partner_{}", &generate_pocket_id()[7..]);
+    
+    let partner = Partner {
+        id: partner_id.clone(),
+        token_symbol: req.token_symbol.clone(),
+        token_mint: req.token_mint.clone(),
+        tier_basic: req.tier_basic,
+        tier_pro: req.tier_pro,
+        is_official_partner: req.is_official.unwrap_or(false),
+        status: "active".to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+    
+    state.db.create_partner(&partner)?;
+    
+    info!("Partner {} added: {} ({})", partner_id, req.token_symbol, req.token_mint);
+    
+    Ok(Json(AddPartnerResponse {
+        success: true,
+        partner_id,
+        message: format!("Partner {} added successfully", req.token_symbol),
+    }))
+}
+
+async fn list_partners_handler(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<ListPartnersResponse>, AppError> {
+    let partners = state.db.list_partners()?;
+    
+    let partner_infos: Vec<PartnerInfo> = partners.iter().map(|p| PartnerInfo {
+        id: p.id.clone(),
+        token_symbol: p.token_symbol.clone(),
+        token_mint: p.token_mint.clone(),
+        tier_basic: p.tier_basic,
+        tier_pro: p.tier_pro,
+        is_official_partner: p.is_official_partner,
+        status: p.status.clone(),
+    }).collect();
+    
+    let count = partner_infos.len();
+    
+    Ok(Json(ListPartnersResponse {
+        success: true,
+        partners: partner_infos,
+        count,
+    }))
+}
+
+async fn delete_partner_handler(
+    State(state): State<Arc<AppState>>,
+    Path(partner_id): Path<String>,
+) -> std::result::Result<Json<DeletePartnerResponse>, AppError> {
+    let deleted = state.db.delete_partner(&partner_id)?;
+    
+    if deleted {
+        info!("Partner {} deleted", partner_id);
+        Ok(Json(DeletePartnerResponse {
+            success: true,
+            message: format!("Partner {} deleted", partner_id),
+        }))
+    } else {
+        Ok(Json(DeletePartnerResponse {
+            success: false,
+            message: "Partner not found".to_string(),
+        }))
     }
 }
