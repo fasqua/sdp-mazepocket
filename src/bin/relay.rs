@@ -33,7 +33,7 @@ use sdp_mazepocket::{
     core::{lamports_to_sol, sol_to_lamports, generate_pocket_id},
     relay::{
         PocketDatabase, MazeGenerator, MazeGraph, MazeNode,
-        database::{MazePocket, PocketStatus, FundingRequest, RouteHistoryEntry, UsageStats},
+        database::{MazePocket, PocketStatus, FundingRequest, RouteHistoryEntry, UsageStats, P2pTransfer, Contact},
     },
     error::{MazeError, Result},
 };
@@ -163,6 +163,7 @@ struct PocketInfo {
     status: String,
     created_at: i64,
     funding_amount_lamports: u64,
+    label: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -286,6 +287,35 @@ struct SweepAllPocketsResponse {
     total_amount_swept: u64,
     destination: String,
     results: Vec<SweepAllPocketResult>,
+}
+
+// ============ P2P TRANSFER TYPES ============
+
+#[derive(Debug, Deserialize)]
+struct SendToPocketRequest {
+    meta_address: String,
+    recipient_pocket_id: String,
+    amount_sol: f64,
+    maze_config: Option<CustomMazeConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct SendToPocketResponse {
+    success: bool,
+    transfer_id: String,
+    amount_lamports: u64,
+    fee_lamports: u64,
+    status: String,
+    maze_info: MazeInfo,
+}
+
+#[derive(Debug, Serialize)]
+struct P2pStatusResponse {
+    success: bool,
+    transfer_id: String,
+    status: String,
+    progress: Option<MazeProgress>,
+    error: Option<String>,
 }
 
 // ============ UTILITY FUNCTIONS ============
@@ -689,6 +719,7 @@ async fn list_pockets(
             status: pocket.status.as_str().to_string(),
             created_at: pocket.created_at,
             funding_amount_lamports: pocket.funding_amount_lamports,
+            label: pocket.label.clone(),
         });
     }
 
@@ -1994,6 +2025,707 @@ fn calculate_delay(params: &MazeParameters, level: u8) -> u64 {
     }
 }
 
+// ============ P2P TRANSFER HANDLERS ============
+
+/// Send SOL from one pocket to another via maze routing
+async fn send_to_pocket(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<SendToPocketRequest>,
+) -> std::result::Result<Json<SendToPocketResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Validate amount
+    if req.amount_sol < MIN_AMOUNT_SOL {
+        return Err(MazeError::InvalidParameters(format!("Minimum amount is {} SOL", MIN_AMOUNT_SOL)).into());
+    }
+
+    // Get sender pocket and verify ownership
+    let sender_pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?;
+    let sender_pocket = match sender_pocket {
+        Some(p) => p,
+        None => return Err(MazeError::PocketNotFound(format!("Sender pocket not found or access denied: {}", pocket_id)).into()),
+    };
+
+    if sender_pocket.status != PocketStatus::Active {
+        return Err(MazeError::InvalidParameters(format!("Sender pocket status is {}, must be active", sender_pocket.status.as_str())).into());
+    }
+
+    // Get receiver pocket (no ownership check - anyone can receive)
+    let receiver_pocket = state.db.get_pocket(&req.recipient_pocket_id)?;
+    let receiver_pocket = match receiver_pocket {
+        Some(p) => p,
+        None => return Err(MazeError::PocketNotFound(format!("Receiver pocket not found: {}", req.recipient_pocket_id)).into()),
+    };
+
+    if receiver_pocket.status != PocketStatus::Active {
+        return Err(MazeError::InvalidParameters("Receiver pocket is not active".into()).into());
+    }
+
+    // Prevent sending to same pocket
+    if pocket_id == req.recipient_pocket_id {
+        return Err(MazeError::InvalidParameters("Cannot send to same pocket".into()).into());
+    }
+
+    // Get sender keypair and check balance
+    let keypair_bytes = state.db.decrypt(&sender_pocket.keypair_encrypted)?;
+    let sender_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let balance = state.rpc.get_balance(&sender_keypair.pubkey())
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+
+    let amount_lamports = sol_to_lamports(req.amount_sol);
+    let fee_lamports = (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64;
+    let total_needed = amount_lamports + fee_lamports + (TX_FEE_LAMPORTS * 50);
+
+    if balance < total_needed {
+        return Err(MazeError::InsufficientFunds {
+            required: total_needed,
+            available: balance,
+        }.into());
+    }
+
+    info!("P2P transfer: {} SOL from {} to {}", req.amount_sol, pocket_id, req.recipient_pocket_id);
+
+    // Generate maze
+    let maze_params = parse_maze_config(req.maze_config);
+    let generator = MazeGenerator::new(maze_params);
+    let encrypt_fn = |data: &[u8]| state.db.encrypt(data);
+
+    let maze = match generator.generate(total_needed, encrypt_fn) {
+        Ok(m) => m,
+        Err(e) => return Err(MazeError::MazeGenerationError(format!("Failed to generate maze: {}", e)).into()),
+    };
+
+    let transfer_id = format!("p2p_{}", &generate_pocket_id()[7..]);
+    let maze_json = serde_json::to_string(&maze).unwrap_or_default();
+    let now = chrono::Utc::now().timestamp();
+
+    // Create P2P transfer record
+    let transfer = P2pTransfer {
+        id: transfer_id.clone(),
+        sender_pocket_id: pocket_id.clone(),
+        receiver_pocket_id: req.recipient_pocket_id.clone(),
+        sender_meta_hash: owner_meta_hash.clone(),
+        amount_lamports,
+        fee_lamports,
+        maze_graph_json: Some(maze_json.clone()),
+        status: "pending".to_string(),
+        created_at: now,
+        completed_at: None,
+        error_message: None,
+    };
+
+    state.db.create_p2p_transfer(&transfer)?;
+
+    // Store maze nodes for progress tracking
+    for node in &maze.nodes {
+        state.db.store_p2p_node(&transfer_id, node)?;
+    }
+
+    // Transfer from sender pocket to first maze node
+    let first_node = &maze.nodes[0];
+    let first_node_pubkey = Pubkey::from_str(&first_node.address)
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+
+    let transfer_to_maze = amount_lamports + fee_lamports + (TX_FEE_LAMPORTS * maze.total_transactions as u64);
+
+    let sig = {
+        let mut last_err = String::new();
+        let mut result_sig = None;
+        for attempt in 1..=5u8 {
+            let blockhash = match state.rpc.get_latest_blockhash() {
+                Ok(bh) => bh,
+                Err(e) => {
+                    warn!("P2P initial attempt {}/5: Failed to get blockhash: {}", attempt, e);
+                    last_err = e.to_string();
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let ix = system_instruction::transfer(
+                &sender_keypair.pubkey(),
+                &first_node_pubkey,
+                transfer_to_maze,
+            );
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&sender_keypair.pubkey()),
+                &[&sender_keypair],
+                blockhash,
+            );
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: None,
+                encoding: None,
+                max_retries: Some(3),
+                min_context_slot: None,
+            };
+            match state.rpc.send_transaction_with_config(&tx, config) {
+                Ok(s) => {
+                    if attempt > 1 {
+                        info!("P2P initial TX succeeded on attempt {}/5", attempt);
+                    }
+                    result_sig = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                        warn!("P2P initial attempt {}/5: {}", attempt, err_str);
+                        last_err = err_str;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&sanitize_error(&e.to_string())));
+                    return Err(AppError(MazeError::TransactionError(format!("TX failed: {}", e))));
+                }
+            }
+        }
+        match result_sig {
+            Some(s) => s,
+            None => {
+                let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&sanitize_error(&last_err)));
+                return Err(AppError(MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err))));
+            }
+        }
+    };
+
+    // Wait for confirmation
+    let mut confirmed = false;
+    for _ in 0..30 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+            if result.is_ok() {
+                confirmed = true;
+                break;
+            } else if let Err(e) = result {
+                let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&format!("Initial transfer failed: {:?}", e)));
+                return Err(AppError(MazeError::TransactionError(format!("Initial transfer failed: {:?}", e))));
+            }
+        }
+    }
+
+    if !confirmed {
+        let _ = state.db.update_p2p_status(&transfer_id, "failed", Some("Initial transfer confirmation timeout"));
+        return Err(AppError(MazeError::TransactionError("Initial transfer confirmation timeout".into())));
+    }
+
+    info!("P2P transfer {} initiated: {} lamports via maze", transfer_id, amount_lamports);
+
+    // Execute P2P maze in background
+    let state_clone = state.clone();
+    let transfer_id_clone = transfer_id.clone();
+    let receiver_address = receiver_pocket.stealth_pubkey.clone();
+    tokio::spawn(async move {
+        match execute_p2p_maze(state_clone.clone(), &transfer_id_clone, &receiver_address).await {
+            Ok(_) => {
+                info!("P2P maze completed for {}", transfer_id_clone);
+            }
+            Err(e) => {
+                error!("P2P maze failed for {}: {}", transfer_id_clone, sanitize_error(&e.to_string()));
+                let _ = state_clone.db.update_p2p_status(&transfer_id_clone, "failed", Some(&sanitize_error(&e.to_string())));
+            }
+        }
+    });
+
+    Ok(Json(SendToPocketResponse {
+        success: true,
+        transfer_id,
+        amount_lamports,
+        fee_lamports,
+        status: "processing".to_string(),
+        maze_info: MazeInfo {
+            nodes: maze.nodes.len(),
+            levels: maze.total_levels,
+            estimated_time_seconds: (maze.nodes.len() as u32) * 2,
+        },
+    }))
+}
+
+/// Execute P2P maze routing (called from background task)
+async fn execute_p2p_maze(
+    state: Arc<AppState>,
+    transfer_id: &str,
+    receiver_address: &str,
+) -> Result<()> {
+    info!("Executing P2P maze for {}", transfer_id);
+
+    // Update status to processing
+    state.db.update_p2p_status(transfer_id, "processing", None)?;
+
+    // Get maze graph
+    let maze_json = state.db.get_p2p_maze_graph(transfer_id)?;
+    let maze: MazeGraph = serde_json::from_str(&maze_json)
+        .map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+
+    // Execute maze level by level
+    for level in 0..=maze.total_levels {
+        let nodes_at_level: Vec<&MazeNode> = maze.nodes.iter()
+            .filter(|n| n.level == level)
+            .collect();
+
+        info!("P2P level {} with {} nodes", level, nodes_at_level.len());
+
+        for node in nodes_at_level {
+            if let Some(status) = state.db.get_p2p_node_status(transfer_id, node.index)? {
+                if status == "completed" {
+                    continue;
+                }
+            }
+
+            execute_p2p_node(state.clone(), transfer_id, node, &maze, receiver_address).await?;
+
+            let delay_ms = calculate_delay(&maze.parameters, node.level);
+            if delay_ms > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+
+    // Mark P2P transfer as completed
+    state.db.update_p2p_status(transfer_id, "completed", None)?;
+
+    info!("P2P maze completed for {}", transfer_id);
+    Ok(())
+}
+
+async fn execute_p2p_node(
+    state: Arc<AppState>,
+    transfer_id: &str,
+    node: &MazeNode,
+    maze: &MazeGraph,
+    receiver_address: &str,
+) -> Result<()> {
+    // Decrypt node keypair
+    let keypair_bytes = state.db.decrypt(&node.keypair_encrypted)?;
+    let keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::CryptoError(e.to_string()))?;
+
+    let outputs = &node.outputs;
+
+    // If no outputs, this is the final node - transfer to receiver pocket
+    if outputs.is_empty() {
+        let dest_pubkey = Pubkey::from_str(receiver_address)
+            .map_err(|e| MazeError::ParseError(e.to_string()))?;
+
+        // Wait for incoming funds
+        let mut attempts = 0;
+        let balance = loop {
+            let bal = match get_balance_with_retry(&state.rpc, &keypair.pubkey(), 5).await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if bal > TX_FEE_LAMPORTS {
+                info!("P2P final node {} has balance: {} lamports", node.index, bal);
+                break bal;
+            }
+            attempts += 1;
+            if attempts > 120 {
+                return Err(MazeError::TransactionError(
+                    format!("Timeout waiting for funds at P2P final node {}", node.index)
+                ));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        };
+        let transfer_amount = balance.saturating_sub(TX_FEE_LAMPORTS);
+
+        if transfer_amount > 0 {
+            let sig = {
+                let mut last_err = String::new();
+                let mut result_sig = None;
+                for attempt in 1..=5u8 {
+                    let blockhash = match state.rpc.get_latest_blockhash() {
+                        Ok(bh) => bh,
+                        Err(e) => {
+                            warn!("P2P final attempt {}/5: Failed to get blockhash: {}", attempt, e);
+                            last_err = e.to_string();
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
+                    let tx = Transaction::new_signed_with_payer(
+                        &[ix],
+                        Some(&keypair.pubkey()),
+                        &[&keypair],
+                        blockhash,
+                    );
+                    let config = RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: None,
+                        max_retries: Some(3),
+                        min_context_slot: None,
+                    };
+                    match state.rpc.send_transaction_with_config(&tx, config) {
+                        Ok(s) => {
+                            if attempt > 1 {
+                                info!("P2P final TX succeeded on attempt {}/5", attempt);
+                            }
+                            result_sig = Some(s);
+                            break;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                                warn!("P2P final attempt {}/5: {}", attempt, err_str);
+                                last_err = err_str;
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
+                            return Err(MazeError::TransactionError(format!("TX failed: {}", e)));
+                        }
+                    }
+                }
+                result_sig.ok_or_else(|| MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err)))?
+            };
+            info!("P2P final transfer: {} lamports to {} ({})", transfer_amount, receiver_address, sig);
+
+            // Wait for confirmation
+            for _ in 0..30 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+                    if result.is_ok() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        state.db.update_p2p_node_status(transfer_id, node.index, "completed", None)?;
+        return Ok(());
+    }
+
+    // Wait for incoming funds from previous level
+    let mut attempts = 0;
+    let balance = loop {
+        let bal = match get_balance_with_retry(&state.rpc, &keypair.pubkey(), 5).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if bal > TX_FEE_LAMPORTS {
+            info!("P2P node {} has balance: {} lamports", node.index, bal);
+            break bal;
+        }
+        attempts += 1;
+        if attempts > 120 {
+            return Err(MazeError::TransactionError(
+                format!("Timeout waiting for funds at P2P node {}", node.index)
+            ));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    };
+
+    let num_outputs = outputs.len();
+    let total_fees = TX_FEE_LAMPORTS * num_outputs as u64;
+    let distributable = balance.saturating_sub(total_fees);
+
+    if distributable == 0 {
+        return Err(MazeError::InsufficientFunds {
+            required: total_fees + 1,
+            available: balance,
+        });
+    }
+
+    // Calculate all transfer amounts DETERMINISTICALLY upfront
+    let base_amount = distributable / num_outputs as u64;
+    let remainder = distributable % num_outputs as u64;
+
+    let mut amounts: Vec<u64> = Vec::with_capacity(num_outputs);
+    for i in 0..num_outputs {
+        if i == num_outputs - 1 {
+            amounts.push(base_amount + remainder);
+        } else {
+            amounts.push(base_amount);
+        }
+    }
+
+    // Verify math
+    let total_to_send: u64 = amounts.iter().sum();
+    if total_to_send + total_fees != balance {
+        error!("P2P amount calculation mismatch: {} + {} != {}", total_to_send, total_fees, balance);
+        return Err(MazeError::InsufficientFunds {
+            required: total_to_send + total_fees,
+            available: balance,
+        });
+    }
+
+    // Sequential transfers with pre-calculated amounts
+    let mut last_sig = String::new();
+    for (i, &output_idx) in outputs.iter().enumerate() {
+        if let Some(output_node) = maze.nodes.get(output_idx as usize) {
+            let output_pubkey = Pubkey::from_str(&output_node.address)
+                .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+
+            let transfer_amount = amounts[i];
+            if transfer_amount == 0 {
+                continue;
+            }
+
+            let sig = {
+                let mut last_err = String::new();
+                let mut result_sig = None;
+                for attempt in 1..=5u8 {
+                    let blockhash = match state.rpc.get_latest_blockhash() {
+                        Ok(bh) => bh,
+                        Err(e) => {
+                            warn!("P2P node {} attempt {}/5: Failed to get blockhash: {}", node.index, attempt, e);
+                            last_err = e.to_string();
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    let ix = system_instruction::transfer(&keypair.pubkey(), &output_pubkey, transfer_amount);
+                    let tx = Transaction::new_signed_with_payer(
+                        &[ix],
+                        Some(&keypair.pubkey()),
+                        &[&keypair],
+                        blockhash,
+                    );
+                    let config = RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: None,
+                        max_retries: Some(3),
+                        min_context_slot: None,
+                    };
+                    match state.rpc.send_transaction_with_config(&tx, config) {
+                        Ok(s) => {
+                            if attempt > 1 {
+                                info!("P2P node {} TX succeeded on attempt {}/5", node.index, attempt);
+                            }
+                            result_sig = Some(s);
+                            break;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                                warn!("P2P node {} attempt {}/5: {}", node.index, attempt, err_str);
+                                last_err = err_str;
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
+                            return Err(MazeError::TransactionError(format!("TX failed: {}", e)));
+                        }
+                    }
+                }
+                result_sig.ok_or_else(|| MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err)))?
+            };
+
+            // Wait for confirmation
+            let mut confirmed = false;
+            for _ in 0..30 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+                    if result.is_ok() {
+                        confirmed = true;
+                        break;
+                    } else if let Err(e) = result {
+                        return Err(MazeError::TransactionError(format!("TX failed: {:?}", e)));
+                    }
+                }
+            }
+
+            if !confirmed {
+                return Err(MazeError::TransactionError("P2P TX confirmation timeout".into()));
+            }
+
+            last_sig = sig.to_string();
+            info!("P2P node {} transfer {}/{}: {} lamports to {} ({})",
+                node.index, i + 1, num_outputs, transfer_amount, output_idx, last_sig);
+        }
+    }
+
+    state.db.update_p2p_node_status(transfer_id, node.index, "completed", Some(&last_sig))?;
+    info!("P2P node {} completed all {} transfers", node.index, num_outputs);
+
+    Ok(())
+}
+
+/// Get P2P transfer status
+async fn get_p2p_status(
+    State(state): State<Arc<AppState>>,
+    Path(transfer_id): Path<String>,
+) -> std::result::Result<Json<P2pStatusResponse>, AppError> {
+    let transfer = state.db.get_p2p_transfer(&transfer_id)?;
+
+    match transfer {
+        Some(t) => {
+            let progress = if t.status == "processing" {
+                if let Ok((completed, total, current_level, total_levels)) = state.db.get_p2p_maze_progress(&transfer_id) {
+                    let percentage = if total > 0 { (completed * 100 / total) as u8 } else { 0 };
+                    Some(MazeProgress {
+                        completed_nodes: completed,
+                        total_nodes: total,
+                        current_level,
+                        total_levels,
+                        percentage,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            Ok(Json(P2pStatusResponse {
+                success: true,
+                transfer_id,
+                status: t.status,
+                progress,
+                error: t.error_message,
+            }))
+        }
+        None => Ok(Json(P2pStatusResponse {
+            success: false,
+            transfer_id,
+            status: "not_found".to_string(),
+            progress: None,
+            error: Some("P2P transfer not found".to_string()),
+        })),
+    }
+}
+
+/// Recover a failed P2P transfer
+async fn recover_p2p_transfer(
+    State(state): State<Arc<AppState>>,
+    Path(transfer_id): Path<String>,
+    Json(req): Json<RecoverRequest>,
+) -> std::result::Result<Json<RecoverResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Get P2P transfer
+    let transfer = state.db.get_p2p_transfer(&transfer_id)?
+        .ok_or(MazeError::RequestNotFound(transfer_id.clone()))?;
+
+    // Verify ownership (sender owns the transfer)
+    if transfer.sender_meta_hash != owner_meta_hash {
+        return Err(MazeError::PocketNotFound("Access denied".into()).into());
+    }
+
+    if transfer.status == "completed" {
+        return Ok(Json(RecoverResponse {
+            success: false,
+            message: "P2P transfer already completed".to_string(),
+            recovered_lamports: None,
+            recovered_sol: None,
+            tx_signatures: vec![],
+        }));
+    }
+
+    // Get receiver pocket address
+    let receiver_pocket = state.db.get_pocket(&transfer.receiver_pocket_id)?
+        .ok_or(MazeError::PocketNotFound(transfer.receiver_pocket_id.clone()))?;
+
+    let dest_pubkey = Pubkey::from_str(&receiver_pocket.stealth_pubkey)
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+
+    // Get maze graph
+    let maze_json = state.db.get_p2p_maze_graph(&transfer_id)?;
+    let maze: MazeGraph = serde_json::from_str(&maze_json)
+        .map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+
+    info!("Recovering P2P transfer {} with {} nodes", transfer_id, maze.nodes.len());
+
+    let mut total_recovered: u64 = 0;
+    let mut tx_sigs: Vec<String> = vec![];
+
+    // Find and recover funds from all nodes with balance
+    for node in &maze.nodes {
+        let node_pubkey = Pubkey::from_str(&node.address)
+            .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+
+        let balance = state.rpc.get_balance(&node_pubkey).unwrap_or(0);
+
+        if balance > TX_FEE_LAMPORTS {
+            // Decrypt keypair
+            let keypair_bytes = state.db.decrypt(&node.keypair_encrypted)?;
+            let keypair = Keypair::from_bytes(&keypair_bytes)
+                .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+            let transfer_amount = balance.saturating_sub(TX_FEE_LAMPORTS);
+
+            if transfer_amount > 0 {
+                let mut tx_success = false;
+                let mut last_sig = None;
+                for attempt in 1..=5u8 {
+                    let blockhash = match state.rpc.get_latest_blockhash() {
+                        Ok(bh) => bh,
+                        Err(e) => {
+                            warn!("P2P recover node {} attempt {}/5: Failed to get blockhash: {}", node.index, attempt, e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
+                    let tx = Transaction::new_signed_with_payer(
+                        &[ix],
+                        Some(&keypair.pubkey()),
+                        &[&keypair],
+                        blockhash,
+                    );
+                    let config = RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: None,
+                        max_retries: Some(3),
+                        min_context_slot: None,
+                    };
+                    match state.rpc.send_transaction_with_config(&tx, config) {
+                        Ok(sig) => {
+                            if attempt > 1 {
+                                info!("P2P recover node {} TX succeeded on attempt {}/5", node.index, attempt);
+                            }
+                            last_sig = Some(sig);
+                            tx_success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                                warn!("P2P recover node {} attempt {}/5: {}", node.index, attempt, err_str);
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
+                            warn!("Failed to recover from P2P node {}: {}", node.index, e);
+                            break;
+                        }
+                    }
+                }
+                if tx_success {
+                    if let Some(sig) = last_sig {
+                        info!("P2P recovered {} lamports from node {} ({})", transfer_amount, node.index, sig);
+                        total_recovered += transfer_amount;
+                        tx_sigs.push(sig.to_string());
+                        let _ = state.db.update_p2p_node_status(&transfer_id, node.index, "completed", Some(&sig.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Update P2P status if recovered
+    if total_recovered > 0 {
+        let _ = state.db.update_p2p_status(&transfer_id, "completed", None);
+        info!("P2P transfer {} recovered: {} lamports", transfer_id, total_recovered);
+    }
+
+    Ok(Json(RecoverResponse {
+        success: total_recovered > 0,
+        message: if total_recovered > 0 {
+            format!("Recovered {} lamports from {} transactions", total_recovered, tx_sigs.len())
+        } else {
+            "No funds to recover".to_string()
+        },
+        recovered_lamports: Some(total_recovered),
+        recovered_sol: Some(total_recovered as f64 / 1_000_000_000.0),
+        tx_signatures: tx_sigs,
+    }))
+}
+
+
 // ============ RECOVERY HANDLERS ============
 
 #[derive(Debug, Deserialize)]
@@ -2809,8 +3541,14 @@ async fn main() {
         .route("/sweep/:sweep_id/resume", post(resume_sweep))
         .route("/pocket/:pocket_id/recover", post(recover_funding))
         .route("/sweep/:sweep_id/recover", post(recover_sweep))
+        .route("/pocket/:pocket_id/send", post(send_to_pocket))
+        .route("/p2p/:transfer_id/status", get(get_p2p_status))
+        .route("/p2p/:transfer_id/recover", post(recover_p2p_transfer))
         .route("/wallet", post(add_wallet))
         .route("/wallet/:slot", axum::routing::delete(delete_wallet))
+        .route("/contact", post(add_contact))
+        .route("/contacts", get(list_contacts))
+        .route("/contact/:alias", axum::routing::delete(delete_contact))
         .route("/mcp/register", post(mcp_register))
         .route("/mcp/validate-key", post(mcp_validate_key))
         .route("/tier-config", get(tier_config))
@@ -3296,6 +4034,137 @@ async fn mcp_validate_key(
             wallet_address: None,
         }),
     }
+}
+
+// ============ CONTACT BOOK ============
+
+#[derive(Debug, Deserialize)]
+struct AddContactRequest {
+    meta_address: String,
+    alias: String,
+    pocket_id: String,
+    label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AddContactResponse {
+    success: bool,
+    alias: String,
+    pocket_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListContactsQuery {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ContactInfo {
+    alias: String,
+    pocket_id: String,
+    label: Option<String>,
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ListContactsResponse {
+    success: bool,
+    contacts: Vec<ContactInfo>,
+    count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteContactQuery {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteContactResponse {
+    success: bool,
+    deleted: bool,
+}
+
+async fn add_contact(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddContactRequest>,
+) -> std::result::Result<Json<AddContactResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Validate alias format (must start with @)
+    let alias = if req.alias.starts_with('@') {
+        req.alias.clone()
+    } else {
+        format!("@{}", req.alias)
+    };
+
+    // Validate pocket_id format
+    if !req.pocket_id.starts_with("pocket_") {
+        return Err(MazeError::InvalidParameters("Invalid pocket ID format".into()).into());
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let contact = Contact {
+        owner_meta_hash,
+        alias: alias.clone(),
+        pocket_id: req.pocket_id.clone(),
+        label: req.label,
+        created_at: now,
+    };
+
+    state.db.add_contact(&contact)?;
+
+    info!("Contact {} added: {}", alias, req.pocket_id);
+
+    Ok(Json(AddContactResponse {
+        success: true,
+        alias,
+        pocket_id: req.pocket_id,
+    }))
+}
+
+async fn list_contacts(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListContactsQuery>,
+) -> std::result::Result<Json<ListContactsResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+    let contacts = state.db.list_contacts(&owner_meta_hash)?;
+
+    let contact_infos: Vec<ContactInfo> = contacts.iter().map(|c| ContactInfo {
+        alias: c.alias.clone(),
+        pocket_id: c.pocket_id.clone(),
+        label: c.label.clone(),
+        created_at: c.created_at,
+    }).collect();
+
+    let count = contact_infos.len();
+
+    Ok(Json(ListContactsResponse {
+        success: true,
+        contacts: contact_infos,
+        count,
+    }))
+}
+
+async fn delete_contact(
+    State(state): State<Arc<AppState>>,
+    Path(alias): Path<String>,
+    Query(query): Query<DeleteContactQuery>,
+) -> std::result::Result<Json<DeleteContactResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    // Normalize alias
+    let alias = if alias.starts_with('@') {
+        alias
+    } else {
+        format!("@{}", alias)
+    };
+
+    let deleted = state.db.delete_contact(&owner_meta_hash, &alias)?;
+
+    Ok(Json(DeleteContactResponse {
+        success: true,
+        deleted,
+    }))
 }
 
 // ============ ADMIN PARTNER MANAGEMENT ============

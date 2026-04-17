@@ -112,6 +112,32 @@ pub struct UsageStats {
     pub total_volume_lamports: u64,
 }
 
+
+/// Contact book entry (alias for pocket IDs)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Contact {
+    pub owner_meta_hash: String,
+    pub alias: String,
+    pub pocket_id: String,
+    pub label: Option<String>,
+    pub created_at: i64,
+}
+
+/// P2P Transfer record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2pTransfer {
+    pub id: String,
+    pub sender_pocket_id: String,
+    pub receiver_pocket_id: String,
+    pub sender_meta_hash: String,
+    pub amount_lamports: u64,
+    pub fee_lamports: u64,
+    pub maze_graph_json: Option<String>,
+    pub status: String,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
+    pub error_message: Option<String>,
+}
 /// Partner token for multi-token tier system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Partner {
@@ -328,6 +354,76 @@ impl PocketDatabase {
             [],
         )?;
 
+
+
+        // P2P Transfers table (for pocket-to-pocket transfers)
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS p2p_transfers (
+                id TEXT PRIMARY KEY,
+                sender_pocket_id TEXT NOT NULL,
+                receiver_pocket_id TEXT NOT NULL,
+                sender_meta_hash TEXT NOT NULL,
+                amount_lamports INTEGER NOT NULL,
+                fee_lamports INTEGER NOT NULL,
+                maze_graph_json TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                error_message TEXT,
+                FOREIGN KEY (sender_pocket_id) REFERENCES maze_pockets(id),
+                FOREIGN KEY (receiver_pocket_id) REFERENCES maze_pockets(id)
+            )"#,
+            [],
+        )?;
+
+        // P2P Maze nodes table (for tracking P2P routing progress)
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS p2p_maze_nodes (
+                transfer_id TEXT NOT NULL,
+                node_index INTEGER NOT NULL,
+                level INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                keypair_encrypted BLOB NOT NULL,
+                inputs TEXT NOT NULL,
+                outputs TEXT NOT NULL,
+                amount_in INTEGER NOT NULL,
+                amount_out INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                tx_signature TEXT,
+                PRIMARY KEY (transfer_id, node_index),
+                FOREIGN KEY (transfer_id) REFERENCES p2p_transfers(id)
+            )"#,
+            [],
+        )?;
+
+        // P2P indexes
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_p2p_sender ON p2p_transfers(sender_meta_hash)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_p2p_status ON p2p_transfers(status)",
+            [],
+        )?;
+
+        // Contacts table (alias for pocket IDs)
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS contacts (
+                owner_meta_hash TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                pocket_id TEXT NOT NULL,
+                label TEXT,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (owner_meta_hash, alias)
+            )"#,
+            [],
+        )?;
+
+        // Contact indexes
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_meta_hash)",
+            [],
+        )?;
 
         // Partners table (for multi-token tier system)
         conn.execute(
@@ -1130,9 +1226,15 @@ impl PocketDatabase {
             |row| row.get(0)
         ).unwrap_or(0);
 
-        let total_nodes = maze_nodes + sweep_nodes;
+        let p2p_nodes: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM p2p_maze_nodes",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
 
-        // Total hops (from funding_requests + sweep_requests)
+        let total_nodes = maze_nodes + sweep_nodes + p2p_nodes;
+
+        // Total hops (from funding_requests + sweep_requests + p2p_transfers)
         let funding_hops: i64 = conn.query_row(
             "SELECT COALESCE(SUM(json_extract(maze_graph_json, '$.total_transactions')), 0) FROM funding_requests WHERE maze_graph_json IS NOT NULL",
             [],
@@ -1145,7 +1247,13 @@ impl PocketDatabase {
             |row| row.get(0)
         ).unwrap_or(0);
 
-        let total_hops = funding_hops + sweep_hops;
+        let p2p_hops: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(json_extract(maze_graph_json, '$.total_transactions')), 0) FROM p2p_transfers WHERE maze_graph_json IS NOT NULL",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let total_hops = funding_hops + sweep_hops + p2p_hops;
 
         // Nodes in last 24h
         let nodes_24h_maze: i64 = conn.query_row(
@@ -1160,7 +1268,13 @@ impl PocketDatabase {
             |row| row.get(0)
         ).unwrap_or(0);
 
-        let nodes_24h = nodes_24h_maze + nodes_24h_sweep;
+        let nodes_24h_p2p: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM p2p_maze_nodes pn JOIN p2p_transfers pt ON pn.transfer_id = pt.id WHERE pt.created_at > ?1",
+            params![cutoff_24h],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let nodes_24h = nodes_24h_maze + nodes_24h_sweep + nodes_24h_p2p;
 
         Ok(ProtocolStats {
             total_nodes_alltime: total_nodes,
@@ -1271,6 +1385,34 @@ impl PocketDatabase {
         for row in sweep_rows {
             entries.push(row.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
         }
+
+        // Get P2P transfers (pocket-to-pocket)
+        let mut stmt3 = conn.prepare(
+            r#"SELECT id, amount_lamports, fee_lamports, status, receiver_pocket_id,
+                      created_at, completed_at
+               FROM p2p_transfers
+               WHERE sender_meta_hash = ?1
+               ORDER BY created_at DESC
+               LIMIT ?2"#
+        )?;
+
+        let p2p_rows = stmt3.query_map(params![owner_meta_hash, limit], |row| {
+            Ok(RouteHistoryEntry {
+                id: row.get(0)?,
+                route_type: "p2p".to_string(),
+                amount_lamports: row.get::<_, i64>(1)? as u64,
+                fee_lamports: row.get::<_, i64>(2)? as u64,
+                status: row.get(3)?,
+                destination: row.get(4)?,
+                created_at: row.get(5)?,
+                completed_at: row.get(6)?,
+                tx_signature: None,
+            })
+        })?;
+
+        for row in p2p_rows {
+            entries.push(row.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
+        }
         
         // Sort by created_at desc
         entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -1321,6 +1463,262 @@ impl PocketDatabase {
             routes_this_month,
             total_volume_lamports: total_volume as u64,
         })
+    }
+
+    // ============ CONTACT OPERATIONS ============
+
+    /// Add or update a contact
+    pub fn add_contact(&self, contact: &Contact) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT OR REPLACE INTO contacts
+               (owner_meta_hash, alias, pocket_id, label, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            params![
+                contact.owner_meta_hash,
+                contact.alias,
+                contact.pocket_id,
+                contact.label,
+                contact.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all contacts for an owner
+    pub fn list_contacts(&self, owner_meta_hash: &str) -> Result<Vec<Contact>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT owner_meta_hash, alias, pocket_id, label, created_at
+               FROM contacts
+               WHERE owner_meta_hash = ?1
+               ORDER BY alias"#
+        )?;
+
+        let contacts = stmt.query_map(params![owner_meta_hash], |row| {
+            Ok(Contact {
+                owner_meta_hash: row.get(0)?,
+                alias: row.get(1)?,
+                pocket_id: row.get(2)?,
+                label: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for contact in contacts {
+            result.push(contact.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
+        }
+        Ok(result)
+    }
+
+    /// Get contact by alias
+    pub fn get_contact_by_alias(&self, owner_meta_hash: &str, alias: &str) -> Result<Option<Contact>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT owner_meta_hash, alias, pocket_id, label, created_at
+               FROM contacts
+               WHERE owner_meta_hash = ?1 AND alias = ?2"#
+        )?;
+
+        let result = stmt.query_row(params![owner_meta_hash, alias], |row| {
+            Ok(Contact {
+                owner_meta_hash: row.get(0)?,
+                alias: row.get(1)?,
+                pocket_id: row.get(2)?,
+                label: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        });
+
+        match result {
+            Ok(contact) => Ok(Some(contact)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
+    }
+
+    /// Delete a contact
+    pub fn delete_contact(&self, owner_meta_hash: &str, alias: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM contacts WHERE owner_meta_hash = ?1 AND alias = ?2",
+            params![owner_meta_hash, alias],
+        )?;
+        Ok(rows > 0)
+    }
+
+    // ============ P2P TRANSFER OPERATIONS ============
+
+    /// Create a P2P transfer record
+    pub fn create_p2p_transfer(&self, transfer: &P2pTransfer) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO p2p_transfers
+               (id, sender_pocket_id, receiver_pocket_id, sender_meta_hash,
+                amount_lamports, fee_lamports, maze_graph_json, status, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            params![
+                transfer.id,
+                transfer.sender_pocket_id,
+                transfer.receiver_pocket_id,
+                transfer.sender_meta_hash,
+                transfer.amount_lamports,
+                transfer.fee_lamports,
+                transfer.maze_graph_json,
+                transfer.status,
+                transfer.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get P2P transfer by ID
+    pub fn get_p2p_transfer(&self, transfer_id: &str) -> Result<Option<P2pTransfer>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, sender_pocket_id, receiver_pocket_id, sender_meta_hash,
+                      amount_lamports, fee_lamports, maze_graph_json, status,
+                      created_at, completed_at, error_message
+               FROM p2p_transfers WHERE id = ?1"#
+        )?;
+
+        let result = stmt.query_row(params![transfer_id], |row| {
+            Ok(P2pTransfer {
+                id: row.get(0)?,
+                sender_pocket_id: row.get(1)?,
+                receiver_pocket_id: row.get(2)?,
+                sender_meta_hash: row.get(3)?,
+                amount_lamports: row.get::<_, i64>(4)? as u64,
+                fee_lamports: row.get::<_, i64>(5)? as u64,
+                maze_graph_json: row.get(6)?,
+                status: row.get(7)?,
+                created_at: row.get(8)?,
+                completed_at: row.get(9)?,
+                error_message: row.get(10)?,
+            })
+        });
+
+        match result {
+            Ok(transfer) => Ok(Some(transfer)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
+    }
+
+    /// Update P2P transfer status
+    pub fn update_p2p_status(&self, transfer_id: &str, status: &str, error: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if status == "completed" {
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "UPDATE p2p_transfers SET status = ?1, completed_at = ?2 WHERE id = ?3",
+                params![status, now, transfer_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE p2p_transfers SET status = ?1, error_message = ?2 WHERE id = ?3",
+                params![status, error, transfer_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Store a P2P maze node
+    pub fn store_p2p_node(&self, transfer_id: &str, node: &crate::relay::maze::MazeNode) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let inputs_json = serde_json::to_string(&node.inputs).unwrap_or_default();
+        let outputs_json = serde_json::to_string(&node.outputs).unwrap_or_default();
+
+        conn.execute(
+            r#"INSERT OR REPLACE INTO p2p_maze_nodes
+               (transfer_id, node_index, level, address, keypair_encrypted,
+                inputs, outputs, amount_in, amount_out, status)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+            params![
+                transfer_id,
+                node.index,
+                node.level,
+                node.address,
+                node.keypair_encrypted,
+                inputs_json,
+                outputs_json,
+                node.amount_in,
+                node.amount_out,
+                node.status,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get P2P node status
+    pub fn get_p2p_node_status(&self, transfer_id: &str, node_index: u16) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT status FROM p2p_maze_nodes WHERE transfer_id = ?1 AND node_index = ?2"
+        )?;
+
+        let result = stmt.query_row(params![transfer_id, node_index], |row| {
+            row.get::<_, String>(0)
+        });
+
+        match result {
+            Ok(status) => Ok(Some(status)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
+    }
+
+    /// Update P2P node status
+    pub fn update_p2p_node_status(&self, transfer_id: &str, node_index: u16, status: &str, tx_sig: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE p2p_maze_nodes SET status = ?1, tx_signature = ?2 WHERE transfer_id = ?3 AND node_index = ?4",
+            params![status, tx_sig, transfer_id, node_index],
+        )?;
+        Ok(())
+    }
+
+    /// Get P2P maze progress
+    pub fn get_p2p_maze_progress(&self, transfer_id: &str) -> Result<(usize, usize, u8, u8)> {
+        let conn = self.conn.lock().unwrap();
+
+        let total: usize = conn.query_row(
+            "SELECT COUNT(*) FROM p2p_maze_nodes WHERE transfer_id = ?1",
+            params![transfer_id],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let completed: usize = conn.query_row(
+            "SELECT COUNT(*) FROM p2p_maze_nodes WHERE transfer_id = ?1 AND status = 'completed'",
+            params![transfer_id],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let total_levels: u8 = conn.query_row(
+            "SELECT MAX(level) FROM p2p_maze_nodes WHERE transfer_id = ?1",
+            params![transfer_id],
+            |row| row.get::<_, Option<u8>>(0)
+        ).unwrap_or(Some(0)).unwrap_or(0);
+
+        let current_level: u8 = conn.query_row(
+            "SELECT MIN(level) FROM p2p_maze_nodes WHERE transfer_id = ?1 AND status != 'completed'",
+            params![transfer_id],
+            |row| row.get::<_, Option<u8>>(0)
+        ).unwrap_or(Some(0)).unwrap_or(0);
+
+        Ok((completed, total, current_level, total_levels))
+    }
+
+    /// Get P2P maze graph JSON
+    pub fn get_p2p_maze_graph(&self, transfer_id: &str) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT maze_graph_json FROM p2p_transfers WHERE id = ?1"
+        )?;
+
+        stmt.query_row(params![transfer_id], |row| row.get::<_, String>(0))
+            .map_err(|e| MazeError::DatabaseError(e.to_string()))
     }
 
     // ============ PARTNER OPERATIONS ============
