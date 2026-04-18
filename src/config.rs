@@ -75,6 +75,12 @@ pub struct MazeParameters {
     pub delay_ms: u64,
     /// Delay scope: per node or per level
     pub delay_scope: DelayScope,
+    /// Pool address for privacy relay (optional)
+    #[serde(default)]
+    pub pool_address: Option<String>,
+    /// Pool private key bytes for signing (optional, not serialized)
+    #[serde(skip)]
+    pub pool_private_key_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -113,6 +119,8 @@ impl Default for MazeParameters {
             amount_noise: AMOUNT_NOISE_PERCENT,
             delay_ms: 500,
             delay_scope: DelayScope::Node,
+            pool_address: None,
+            pool_private_key_bytes: None,
         }
     }
 }
@@ -149,6 +157,8 @@ pub struct Config {
     pub master_key: String,
     pub port: u16,
     pub admin_api_key: Option<String>,
+    pub pool_address: Option<String>,
+    pub pool_private_key: Option<String>,
 }
 
 impl Config {
@@ -165,6 +175,8 @@ impl Config {
                 .parse()
                 .unwrap_or(3033),
             admin_api_key: std::env::var("ADMIN_API_KEY").ok(),
+            pool_address: std::env::var("POOL_ADDRESS").ok(),
+            pool_private_key: std::env::var("POOL_PRIVATE_KEY").ok(),
         }
     }
 }

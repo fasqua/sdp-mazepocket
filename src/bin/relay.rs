@@ -327,7 +327,7 @@ fn hash_meta_address(meta: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn parse_maze_config(config: Option<CustomMazeConfig>) -> MazeParameters {
+fn parse_maze_config(config: Option<CustomMazeConfig>, pool_address: Option<String>, pool_private_key: Option<String>) -> MazeParameters {
     let mut params = MazeParameters::random();
     
     if let Some(cfg) = config {
@@ -366,6 +366,14 @@ fn parse_maze_config(config: Option<CustomMazeConfig>) -> MazeParameters {
         }
     }
     
+
+    // Inject pool config if available
+    params.pool_address = pool_address;
+    if let Some(ref pk_str) = pool_private_key {
+        if let Ok(pk_bytes) = bs58::decode(pk_str).into_vec() {
+            params.pool_private_key_bytes = Some(pk_bytes);
+        }
+    }
     params
 }
 
@@ -473,7 +481,7 @@ async fn create_pocket(
     let fee_lamports = (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64;
 
     // Parse maze config (available to ALL users, no KAUSA check)
-    let maze_params = parse_maze_config(req.maze_config);
+    let maze_params = parse_maze_config(req.maze_config, state.config.pool_address.clone(), state.config.pool_private_key.clone());
 
     // Generate pocket keypair
     let pocket_keypair = Keypair::new();
@@ -606,7 +614,7 @@ async fn create_route(
     let fee_lamports = (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64;
 
     // Parse maze config
-    let maze_params = parse_maze_config(req.maze_config);
+    let maze_params = parse_maze_config(req.maze_config, state.config.pool_address.clone(), state.config.pool_private_key.clone());
 
     // Generate route ID (no pocket needed)
     let route_id = format!("route_{}", &generate_pocket_id()[7..]);
@@ -881,7 +889,7 @@ async fn sweep_pocket(
     state.db.update_pocket_status(&pocket_id, PocketStatus::Sweeping)?;
 
     // Generate sweep maze
-    let maze_params = parse_maze_config(req.maze_config);
+    let maze_params = parse_maze_config(req.maze_config, state.config.pool_address.clone(), state.config.pool_private_key.clone());
     let generator = MazeGenerator::new(maze_params);
     // Sweep entire balance minus just the TX fee for initial transfer
     // Pocket will be drained to 0 (closed by Solana)
@@ -1395,6 +1403,23 @@ async fn execute_node(
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     };
 
+
+    // Cap balance for pool node: only use amount expected for this route
+    let balance = if let Some(ref pool_addr) = state.config.pool_address {
+        if node.address == *pool_addr {
+            let expected = node.amount_in;
+            if balance > expected {
+                info!("Pool node {}: capping balance {} to expected {}", node.index, balance, expected);
+                expected
+            } else {
+                balance
+            }
+        } else {
+            balance
+        }
+    } else {
+        balance
+    };
     let num_outputs = outputs.len();
     let total_fees = TX_FEE_LAMPORTS * num_outputs as u64;
     let distributable = balance.saturating_sub(total_fees);
@@ -1704,6 +1729,23 @@ async fn execute_sweep_node(
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     };
 
+
+    // Cap balance for pool node: only use amount expected for this route
+    let balance = if let Some(ref pool_addr) = state.config.pool_address {
+        if node.address == *pool_addr {
+            let expected = node.amount_in;
+            if balance > expected {
+                info!("Pool sweep node {}: capping balance {} to expected {}", node.index, balance, expected);
+                expected
+            } else {
+                balance
+            }
+        } else {
+            balance
+        }
+    } else {
+        balance
+    };
     let num_outputs = outputs.len();
     let total_fees = TX_FEE_LAMPORTS * num_outputs as u64;
     let distributable = balance.saturating_sub(total_fees);
@@ -2089,7 +2131,7 @@ async fn send_to_pocket(
     info!("P2P transfer: {} SOL from {} to {}", req.amount_sol, pocket_id, req.recipient_pocket_id);
 
     // Generate maze
-    let maze_params = parse_maze_config(req.maze_config);
+    let maze_params = parse_maze_config(req.maze_config, state.config.pool_address.clone(), state.config.pool_private_key.clone());
     let generator = MazeGenerator::new(maze_params);
     let encrypt_fn = |data: &[u8]| state.db.encrypt(data);
 
@@ -2418,6 +2460,23 @@ async fn execute_p2p_node(
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     };
 
+
+    // Cap balance for pool node: only use amount expected for this route
+    let balance = if let Some(ref pool_addr) = state.config.pool_address {
+        if node.address == *pool_addr {
+            let expected = node.amount_in;
+            if balance > expected {
+                info!("Pool P2P node {}: capping balance {} to expected {}", node.index, balance, expected);
+                expected
+            } else {
+                balance
+            }
+        } else {
+            balance
+        }
+    } else {
+        balance
+    };
     let num_outputs = outputs.len();
     let total_fees = TX_FEE_LAMPORTS * num_outputs as u64;
     let distributable = balance.saturating_sub(total_fees);
@@ -3160,7 +3219,7 @@ async fn sweep_all_pockets(
         }));
     }
 
-    let maze_params = parse_maze_config(req.maze_config);
+    let maze_params = parse_maze_config(req.maze_config, state.config.pool_address.clone(), state.config.pool_private_key.clone());
     let mut results: Vec<SweepAllPocketResult> = Vec::new();
     let mut successful_sweeps = 0usize;
     let mut failed_sweeps = 0usize;

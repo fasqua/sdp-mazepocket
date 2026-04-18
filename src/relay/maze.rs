@@ -91,7 +91,7 @@ impl MazeGenerator {
         // Calculate total TX fees needed
         let estimated_txs = self.estimate_transaction_count();
         let total_fees = TX_FEE_LAMPORTS * estimated_txs as u64;
-        
+
         if total_amount <= total_fees {
             return Err(MazeError::InsufficientFunds {
                 required: total_fees + 1,
@@ -109,9 +109,9 @@ impl MazeGenerator {
             address: deposit_keypair.pubkey().to_string(),
             keypair_encrypted: encrypt_fn(&deposit_keypair.to_bytes())?,
             inputs: vec![],
-            outputs: vec![], // Will be filled later
+            outputs: vec![],
             amount_in: total_amount,
-            amount_out: 0, // Will be calculated
+            amount_out: 0,
             tx_in_signature: None,
             tx_out_signatures: vec![],
             status: "pending".to_string(),
@@ -119,65 +119,180 @@ impl MazeGenerator {
         nodes.push(deposit_node);
         node_index += 1;
 
-        // Generate intermediate levels
         let num_levels = self.params.hop_count;
-        let mut current_level_nodes: Vec<u16> = vec![0]; // Start with deposit node
-        let mut current_level_amounts: Vec<u64> = vec![net_amount];
+        let has_pool = self.params.pool_address.is_some()
+            && self.params.pool_private_key_bytes.is_some();
 
-        for level in 1..num_levels {
-            let (new_nodes, new_amounts) = self.generate_level(
-                level,
-                &current_level_nodes,
-                &current_level_amounts,
-                &mut node_index,
-                &encrypt_fn,
-                &mut nodes,
-            )?;
-            current_level_nodes = new_nodes;
-            current_level_amounts = new_amounts;
-        }
+        if has_pool {
+            // === POOL MODE: Pre-pool hops -> Pool -> Post-pool hops ===
+            let pool_address = self.params.pool_address.as_ref().unwrap().clone();
+            let pool_pk_bytes = self.params.pool_private_key_bytes.as_ref().unwrap().clone();
 
-        // Final level: Merge all to single node
-        let final_keypair = Keypair::new();
-        let final_amount: u64 = current_level_amounts.iter().sum();
-        let final_node = MazeNode {
-            index: node_index,
-            level: num_levels,
-            address: final_keypair.pubkey().to_string(),
-            keypair_encrypted: encrypt_fn(&final_keypair.to_bytes())?,
-            inputs: current_level_nodes.clone(),
-            outputs: vec![], // Final node sends to stealth address
-            amount_in: final_amount,
-            amount_out: final_amount.saturating_sub(TX_FEE_LAMPORTS),
-            tx_in_signature: None,
-            tx_out_signatures: vec![],
-            status: "pending".to_string(),
-        };
-        
-        let final_index = node_index;
-        nodes.push(final_node);
+            // Split hop_count: pre-pool gets ~half, post-pool gets the rest
+            let pre_pool_levels = (num_levels / 2).max(2);
+            let post_pool_levels = num_levels.saturating_sub(pre_pool_levels).max(2);
 
-        // Update outputs for previous level nodes
-        for &prev_idx in &current_level_nodes {
-            if let Some(node) = nodes.get_mut(prev_idx as usize) {
-                node.outputs.push(final_index);
+            // --- Pre-pool hops ---
+            let mut current_level_nodes: Vec<u16> = vec![0];
+            let mut current_level_amounts: Vec<u64> = vec![net_amount];
+
+            for level in 1..=pre_pool_levels {
+                let (new_nodes, new_amounts) = self.generate_level(
+                    level,
+                    &current_level_nodes,
+                    &current_level_amounts,
+                    &mut node_index,
+                    &encrypt_fn,
+                    &mut nodes,
+                )?;
+                current_level_nodes = new_nodes;
+                current_level_amounts = new_amounts;
             }
+
+            // --- Pool node: merge all pre-pool paths into pool ---
+            let pool_level = pre_pool_levels + 1;
+            let pool_amount: u64 = current_level_amounts.iter().sum();
+            let pool_node = MazeNode {
+                index: node_index,
+                level: pool_level,
+                address: pool_address,
+                keypair_encrypted: encrypt_fn(&pool_pk_bytes)?,
+                inputs: current_level_nodes.clone(),
+                outputs: vec![],
+                amount_in: pool_amount,
+                amount_out: 0,
+                tx_in_signature: None,
+                tx_out_signatures: vec![],
+                status: "pending".to_string(),
+            };
+
+            let pool_index = node_index;
+            nodes.push(pool_node);
+            node_index += 1;
+
+            // Update pre-pool nodes outputs to point to pool
+            for &prev_idx in &current_level_nodes {
+                if let Some(node) = nodes.get_mut(prev_idx as usize) {
+                    node.outputs.push(pool_index);
+                }
+            }
+
+            // --- Post-pool hops: pool is the new starting point ---
+            let mut current_level_nodes: Vec<u16> = vec![pool_index];
+            let mut current_level_amounts: Vec<u64> = vec![pool_amount];
+
+            for i in 1..=post_pool_levels {
+                let level = pool_level + i;
+                let (new_nodes, new_amounts) = self.generate_level(
+                    level,
+                    &current_level_nodes,
+                    &current_level_amounts,
+                    &mut node_index,
+                    &encrypt_fn,
+                    &mut nodes,
+                )?;
+                current_level_nodes = new_nodes;
+                current_level_amounts = new_amounts;
+            }
+
+            // --- Final node ---
+            let final_level = pool_level + post_pool_levels + 1;
+            let final_keypair = Keypair::new();
+            let final_amount: u64 = current_level_amounts.iter().sum();
+            let final_node = MazeNode {
+                index: node_index,
+                level: final_level,
+                address: final_keypair.pubkey().to_string(),
+                keypair_encrypted: encrypt_fn(&final_keypair.to_bytes())?,
+                inputs: current_level_nodes.clone(),
+                outputs: vec![],
+                amount_in: final_amount,
+                amount_out: final_amount.saturating_sub(TX_FEE_LAMPORTS),
+                tx_in_signature: None,
+                tx_out_signatures: vec![],
+                status: "pending".to_string(),
+            };
+
+            let final_index = node_index;
+            nodes.push(final_node);
+
+            for &prev_idx in &current_level_nodes {
+                if let Some(node) = nodes.get_mut(prev_idx as usize) {
+                    node.outputs.push(final_index);
+                }
+            }
+
+            self.calculate_amounts(&mut nodes)?;
+            let total_transactions = self.count_transactions(&nodes);
+
+            Ok(MazeGraph {
+                nodes,
+                parameters: self.params.clone(),
+                total_levels: final_level + 1,
+                deposit_index: 0,
+                final_index,
+                total_transactions,
+            })
+        } else {
+            // === STANDARD MODE: No pool, original behavior ===
+            let mut current_level_nodes: Vec<u16> = vec![0];
+            let mut current_level_amounts: Vec<u64> = vec![net_amount];
+
+            for level in 1..num_levels {
+                let (new_nodes, new_amounts) = self.generate_level(
+                    level,
+                    &current_level_nodes,
+                    &current_level_amounts,
+                    &mut node_index,
+                    &encrypt_fn,
+                    &mut nodes,
+                )?;
+                current_level_nodes = new_nodes;
+                current_level_amounts = new_amounts;
+            }
+
+            // Final level: Merge all to single node
+            let final_keypair = Keypair::new();
+            let final_amount: u64 = current_level_amounts.iter().sum();
+            let final_node = MazeNode {
+                index: node_index,
+                level: num_levels,
+                address: final_keypair.pubkey().to_string(),
+                keypair_encrypted: encrypt_fn(&final_keypair.to_bytes())?,
+                inputs: current_level_nodes.clone(),
+                outputs: vec![],
+                amount_in: final_amount,
+                amount_out: final_amount.saturating_sub(TX_FEE_LAMPORTS),
+                tx_in_signature: None,
+                tx_out_signatures: vec![],
+                status: "pending".to_string(),
+            };
+
+            let final_index = node_index;
+            nodes.push(final_node);
+
+            // Update outputs for previous level nodes
+            for &prev_idx in &current_level_nodes {
+                if let Some(node) = nodes.get_mut(prev_idx as usize) {
+                    node.outputs.push(final_index);
+                }
+            }
+
+            // Calculate amount_out for all nodes
+            self.calculate_amounts(&mut nodes)?;
+
+            // Count total transactions
+            let total_transactions = self.count_transactions(&nodes);
+
+            Ok(MazeGraph {
+                nodes,
+                parameters: self.params.clone(),
+                total_levels: num_levels + 1,
+                deposit_index: 0,
+                final_index,
+                total_transactions,
+            })
         }
-
-        // Calculate amount_out for all nodes
-        self.calculate_amounts(&mut nodes)?;
-
-        // Count total transactions
-        let total_transactions = self.count_transactions(&nodes);
-
-        Ok(MazeGraph {
-            nodes,
-            parameters: self.params.clone(),
-            total_levels: num_levels + 1,
-            deposit_index: 0,
-            final_index,
-            total_transactions,
-        })
     }
 
     /// Generate nodes for a single level
