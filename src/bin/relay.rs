@@ -33,7 +33,7 @@ use sdp_mazepocket::{
     core::{lamports_to_sol, sol_to_lamports, generate_pocket_id},
     relay::{
         PocketDatabase, MazeGenerator, MazeGraph, MazeNode,
-        database::{MazePocket, PocketStatus, FundingRequest, RouteHistoryEntry, UsageStats, P2pTransfer, Contact},
+        database::{MazePocket, PocketStatus, FundingRequest, RouteHistoryEntry, UsageStats, P2pTransfer, Contact, AirdropStats},
     },
     error::{MazeError, Result},
 };
@@ -85,6 +85,7 @@ struct AppState {
     db: PocketDatabase,
     rpc: RpcClient,
     config: Config,
+    pool_lock: Arc<tokio::sync::Semaphore>,
 }
 
 // ============ API TYPES ============
@@ -1252,8 +1253,41 @@ async fn execute_maze(state: Arc<AppState>, request_id: &str) -> Result<()> {
     let maze: MazeGraph = serde_json::from_str(&maze_json)
         .map_err(|e| MazeError::DatabaseError(e.to_string()))?;
 
-    // Execute level by level (start from 0 - the deposit node)
+    // Detect pool node level (if pool mode is active)
+    let pool_level: Option<u8> = if let Some(ref pool_addr) = state.config.pool_address {
+        maze.nodes.iter()
+            .find(|n| n.address == *pool_addr)
+            .map(|n| n.level)
+    } else {
+        None
+    };
+
+    // Execute level by level with pool queue
+    let mut _pool_guard: Option<tokio::sync::SemaphorePermit<'_>> = None;
+
     for level in 0..=maze.total_levels {
+        // Acquire pool lock before pool level (timeout 180s)
+        if let Some(pl) = pool_level {
+            if level == pl && _pool_guard.is_none() {
+                info!("Waiting for pool lock (request {})", request_id);
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(180),
+                    state.pool_lock.acquire()
+                ).await {
+                    Ok(Ok(permit)) => {
+                        info!("Pool lock acquired (request {})", request_id);
+                        _pool_guard = Some(permit);
+                    }
+                    Ok(Err(_)) => {
+                        return Err(MazeError::TransactionError("Pool semaphore closed".into()));
+                    }
+                    Err(_) => {
+                        return Err(MazeError::TransactionError("Pool busy, timeout after 180s. Please retry.".into()));
+                    }
+                }
+            }
+        }
+
         let nodes_at_level: Vec<&MazeNode> = maze.nodes.iter()
             .filter(|n| n.level == level)
             .collect();
@@ -1279,6 +1313,9 @@ async fn execute_maze(state: Arc<AppState>, request_id: &str) -> Result<()> {
             }
         }
     }
+
+    // Pool lock auto-released when _pool_guard is dropped
+    drop(_pool_guard);
 
     // Get final tx_signature and update funding request
     let final_tx_sig = state.db.get_final_tx_signature(request_id)?;
@@ -1401,24 +1438,6 @@ async fn execute_node(
             ));
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    };
-
-
-    // Cap balance for pool node: only use amount expected for this route
-    let balance = if let Some(ref pool_addr) = state.config.pool_address {
-        if node.address == *pool_addr {
-            let expected = node.amount_in;
-            if balance > expected {
-                info!("Pool node {}: capping balance {} to expected {}", node.index, balance, expected);
-                expected
-            } else {
-                balance
-            }
-        } else {
-            balance
-        }
-    } else {
-        balance
     };
     let num_outputs = outputs.len();
     let total_fees = TX_FEE_LAMPORTS * num_outputs as u64;
@@ -1570,8 +1589,41 @@ async fn execute_sweep_maze(
     let maze: MazeGraph = serde_json::from_str(&maze_json)
         .map_err(|e| MazeError::DatabaseError(e.to_string()))?;
 
-    // Execute maze level by level (start from 0)
+    // Detect pool node level (if pool mode is active)
+    let pool_level: Option<u8> = if let Some(ref pool_addr) = state.config.pool_address {
+        maze.nodes.iter()
+            .find(|n| n.address == *pool_addr)
+            .map(|n| n.level)
+    } else {
+        None
+    };
+
+    // Execute maze level by level with pool queue
+    let mut _pool_guard: Option<tokio::sync::SemaphorePermit<'_>> = None;
+
     for level in 0..=maze.total_levels {
+        // Acquire pool lock before pool level (timeout 180s)
+        if let Some(pl) = pool_level {
+            if level == pl && _pool_guard.is_none() {
+                info!("Sweep waiting for pool lock ({})", sweep_id);
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(180),
+                    state.pool_lock.acquire()
+                ).await {
+                    Ok(Ok(permit)) => {
+                        info!("Sweep pool lock acquired ({})", sweep_id);
+                        _pool_guard = Some(permit);
+                    }
+                    Ok(Err(_)) => {
+                        return Err(MazeError::TransactionError("Pool semaphore closed".into()));
+                    }
+                    Err(_) => {
+                        return Err(MazeError::TransactionError("Pool busy, timeout after 180s. Please retry.".into()));
+                    }
+                }
+            }
+        }
+
         let nodes_at_level: Vec<&MazeNode> = maze.nodes.iter()
             .filter(|n| n.level == level)
             .collect();
@@ -1593,6 +1645,9 @@ async fn execute_sweep_maze(
             }
         }
     }
+
+    // Pool lock auto-released when _pool_guard is dropped
+    drop(_pool_guard);
 
     // Mark sweep as completed
     state.db.update_sweep_status(sweep_id, "completed", None, None)?;
@@ -1727,24 +1782,6 @@ async fn execute_sweep_node(
             ));
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    };
-
-
-    // Cap balance for pool node: only use amount expected for this route
-    let balance = if let Some(ref pool_addr) = state.config.pool_address {
-        if node.address == *pool_addr {
-            let expected = node.amount_in;
-            if balance > expected {
-                info!("Pool sweep node {}: capping balance {} to expected {}", node.index, balance, expected);
-                expected
-            } else {
-                balance
-            }
-        } else {
-            balance
-        }
-    } else {
-        balance
     };
     let num_outputs = outputs.len();
     let total_fees = TX_FEE_LAMPORTS * num_outputs as u64;
@@ -2303,7 +2340,41 @@ async fn execute_p2p_maze(
         .map_err(|e| MazeError::DatabaseError(e.to_string()))?;
 
     // Execute maze level by level
+    // Detect pool node level (if pool mode is active)
+    let pool_level: Option<u8> = if let Some(ref pool_addr) = state.config.pool_address {
+        maze.nodes.iter()
+            .find(|n| n.address == *pool_addr)
+            .map(|n| n.level)
+    } else {
+        None
+    };
+
+    // Execute maze level by level with pool queue
+    let mut _pool_guard: Option<tokio::sync::SemaphorePermit<'_>> = None;
+
     for level in 0..=maze.total_levels {
+        // Acquire pool lock before pool level (timeout 180s)
+        if let Some(pl) = pool_level {
+            if level == pl && _pool_guard.is_none() {
+                info!("P2P waiting for pool lock ({})", transfer_id);
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(180),
+                    state.pool_lock.acquire()
+                ).await {
+                    Ok(Ok(permit)) => {
+                        info!("P2P pool lock acquired ({})", transfer_id);
+                        _pool_guard = Some(permit);
+                    }
+                    Ok(Err(_)) => {
+                        return Err(MazeError::TransactionError("Pool semaphore closed".into()));
+                    }
+                    Err(_) => {
+                        return Err(MazeError::TransactionError("Pool busy, timeout after 180s. Please retry.".into()));
+                    }
+                }
+            }
+        }
+
         let nodes_at_level: Vec<&MazeNode> = maze.nodes.iter()
             .filter(|n| n.level == level)
             .collect();
@@ -2325,6 +2396,9 @@ async fn execute_p2p_maze(
             }
         }
     }
+
+    // Pool lock auto-released when _pool_guard is dropped
+    drop(_pool_guard);
 
     // Mark P2P transfer as completed
     state.db.update_p2p_status(transfer_id, "completed", None)?;
@@ -2458,24 +2532,6 @@ async fn execute_p2p_node(
             ));
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    };
-
-
-    // Cap balance for pool node: only use amount expected for this route
-    let balance = if let Some(ref pool_addr) = state.config.pool_address {
-        if node.address == *pool_addr {
-            let expected = node.amount_in;
-            if balance > expected {
-                info!("Pool P2P node {}: capping balance {} to expected {}", node.index, balance, expected);
-                expected
-            } else {
-                balance
-            }
-        } else {
-            balance
-        }
-    } else {
-        balance
     };
     let num_outputs = outputs.len();
     let total_fees = TX_FEE_LAMPORTS * num_outputs as u64;
@@ -3572,7 +3628,7 @@ async fn main() {
     info!("RPC client connected to {}", rpc_display);
 
     // Create app state
-    let state = Arc::new(AppState { db, rpc, config: config.clone() });
+    let state = Arc::new(AppState { db, rpc, config: config.clone(), pool_lock: Arc::new(tokio::sync::Semaphore::new(1)) });
 
     // Start deposit monitor
     let monitor_state = state.clone();
@@ -3613,6 +3669,7 @@ async fn main() {
         .route("/tier-config", get(tier_config))
         .route("/route-history", get(get_route_history))
         .route("/usage-stats", get(get_usage_stats))
+        .route("/airdrop/verify", get(airdrop_verify))
         .route("/pocket/:pocket_id/transactions", get(get_pocket_transactions))
         .route("/admin/partners", get(list_partners_handler))
         .route("/admin/partners", post(add_partner_handler))
@@ -3905,6 +3962,114 @@ async fn get_usage_stats(
         routes_this_month: stats.routes_this_month,
         total_volume_lamports: stats.total_volume_lamports,
         total_volume_sol: lamports_to_sol(stats.total_volume_lamports),
+    }))
+}
+
+// ============ AIRDROP VERIFICATION ============
+
+#[derive(Debug, Deserialize)]
+struct AirdropVerifyQuery {
+    meta_address: String,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AirdropVerifyResponse {
+    success: bool,
+    pockets_created: i64,
+    routes_completed: i64,
+    funding_volume_lamports: u64,
+    funding_volume_sol: f64,
+    sweeps_completed: i64,
+    unique_destinations: i64,
+    p2p_completed: i64,
+    p2p_volume_lamports: u64,
+    p2p_volume_sol: f64,
+    total_volume_sol: f64,
+    first_activity: Option<i64>,
+    last_activity: Option<i64>,
+    points: AirdropPoints,
+    tier: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AirdropPoints {
+    pocket_creation: i64,
+    maze_routes: i64,
+    sweeps: i64,
+    p2p_transfers: i64,
+    volume_bonus: i64,
+    multi_route_bonus: i64,
+    total: i64,
+}
+
+async fn airdrop_verify(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AirdropVerifyQuery>,
+) -> std::result::Result<Json<AirdropVerifyResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    // Default: all time if no range specified
+    let start_time = query.start_time.unwrap_or(0);
+    let end_time = query.end_time.unwrap_or(i64::MAX);
+
+    let stats = state.db.get_airdrop_stats(&owner_meta_hash, start_time, end_time)?;
+
+    // Calculate points
+    let pocket_points = stats.pockets_created.min(5) * 100; // max 5 pockets = 500 pts
+    let route_points = stats.routes_completed.min(10) * 150; // max 10 routes = 1500 pts
+    let sweep_points = stats.sweeps_completed.min(5) * 100; // max 5 sweeps = 500 pts
+    let p2p_points = stats.p2p_completed.min(5) * 75; // max 5 p2p = 375 pts
+
+    // Volume bonus: 100 pts per 0.5 SOL routed, max 500 pts
+    let total_volume_lamports = stats.funding_volume_lamports + stats.p2p_volume_lamports;
+    let volume_bonus = ((total_volume_lamports as f64 / 500_000_000.0) as i64).min(5) * 100;
+
+    // Multi-route bonus: 200 pts if 3+ distinct routes
+    let multi_route_bonus = if stats.routes_completed >= 3 { 200 } else { 0 };
+
+    let total_points = pocket_points + route_points + sweep_points + p2p_points + volume_bonus + multi_route_bonus;
+
+    // Determine tier
+    let has_on_chain = stats.pockets_created > 0 || stats.routes_completed > 0;
+    let has_builder_potential = stats.routes_completed >= 3 && stats.sweeps_completed >= 1 && stats.p2p_completed >= 1;
+    let tier = if total_points >= 1000 && has_builder_potential {
+        "Pioneer"
+    } else if total_points >= 500 && has_on_chain && stats.routes_completed >= 2 {
+        "Explorer"
+    } else if total_points >= 200 && has_on_chain {
+        "Navigator"
+    } else {
+        "Observer"
+    };
+
+    let total_volume_sol = lamports_to_sol(total_volume_lamports);
+
+    Ok(Json(AirdropVerifyResponse {
+        success: true,
+        pockets_created: stats.pockets_created,
+        routes_completed: stats.routes_completed,
+        funding_volume_lamports: stats.funding_volume_lamports,
+        funding_volume_sol: lamports_to_sol(stats.funding_volume_lamports),
+        sweeps_completed: stats.sweeps_completed,
+        unique_destinations: stats.unique_destinations,
+        p2p_completed: stats.p2p_completed,
+        p2p_volume_lamports: stats.p2p_volume_lamports,
+        p2p_volume_sol: lamports_to_sol(stats.p2p_volume_lamports),
+        total_volume_sol,
+        first_activity: stats.first_activity,
+        last_activity: stats.last_activity,
+        points: AirdropPoints {
+            pocket_creation: pocket_points,
+            maze_routes: route_points,
+            sweeps: sweep_points,
+            p2p_transfers: p2p_points,
+            volume_bonus,
+            multi_route_bonus,
+            total: total_points,
+        },
+        tier: tier.to_string(),
     }))
 }
 

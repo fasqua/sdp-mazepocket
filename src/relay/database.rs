@@ -112,6 +112,20 @@ pub struct UsageStats {
     pub total_volume_lamports: u64,
 }
 
+/// Airdrop verification stats for a user
+#[derive(Debug, Clone)]
+pub struct AirdropStats {
+    pub pockets_created: i64,
+    pub routes_completed: i64,
+    pub funding_volume_lamports: u64,
+    pub sweeps_completed: i64,
+    pub unique_destinations: i64,
+    pub p2p_completed: i64,
+    pub p2p_volume_lamports: u64,
+    pub first_activity: Option<i64>,
+    pub last_activity: Option<i64>,
+}
+
 
 /// Contact book entry (alias for pocket IDs)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1834,6 +1848,99 @@ impl PocketDatabase {
             params![partner_id, now],
         )?;
         Ok(rows > 0)
+    }
+
+    // ============ AIRDROP VERIFICATION ============
+
+    /// Airdrop stats for a user within a date range
+    pub fn get_airdrop_stats(&self, owner_meta_hash: &str, start_time: i64, end_time: i64) -> Result<AirdropStats> {
+        let conn = self.conn.lock().unwrap();
+
+        // 1. Count pockets created in range
+        let pockets_created: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM maze_pockets WHERE owner_meta_hash = ?1 AND created_at >= ?2 AND created_at <= ?3 AND status != 'deleted' AND id NOT LIKE 'route_%'",
+            params![owner_meta_hash, start_time, end_time],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        // 2. Count completed funding routes in range
+        let routes_completed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM funding_requests WHERE owner_meta_hash = ?1 AND status = 'completed' AND created_at >= ?2 AND created_at <= ?3",
+            params![owner_meta_hash, start_time, end_time],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        // 3. Total funding volume in range
+        let funding_volume: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_lamports), 0) FROM funding_requests WHERE owner_meta_hash = ?1 AND status = 'completed' AND created_at >= ?2 AND created_at <= ?3",
+            params![owner_meta_hash, start_time, end_time],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        // 4. Count completed sweeps in range (join via maze_pockets)
+        let sweeps_completed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sweep_requests sr JOIN maze_pockets mp ON sr.pocket_id = mp.id WHERE mp.owner_meta_hash = ?1 AND sr.status = 'completed' AND sr.created_at >= ?2 AND sr.created_at <= ?3",
+            params![owner_meta_hash, start_time, end_time],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        // 5. Count unique sweep destinations (anti-sybil)
+        let unique_destinations: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT sr.destination_address) FROM sweep_requests sr JOIN maze_pockets mp ON sr.pocket_id = mp.id WHERE mp.owner_meta_hash = ?1 AND sr.status = 'completed' AND sr.created_at >= ?2 AND sr.created_at <= ?3",
+            params![owner_meta_hash, start_time, end_time],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        // 6. Count completed p2p transfers in range
+        let p2p_completed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM p2p_transfers WHERE sender_meta_hash = ?1 AND status = 'completed' AND created_at >= ?2 AND created_at <= ?3",
+            params![owner_meta_hash, start_time, end_time],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        // 7. Total p2p volume in range
+        let p2p_volume: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_lamports), 0) FROM p2p_transfers WHERE sender_meta_hash = ?1 AND status = 'completed' AND created_at >= ?2 AND created_at <= ?3",
+            params![owner_meta_hash, start_time, end_time],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        // 8. First and last activity timestamps
+        let first_activity: Option<i64> = conn.query_row(
+            "SELECT MIN(created_at) FROM (
+                SELECT created_at FROM maze_pockets WHERE owner_meta_hash = ?1 AND created_at >= ?2 AND created_at <= ?3 AND status != 'deleted' AND id NOT LIKE 'route_%'
+                UNION ALL
+                SELECT created_at FROM funding_requests WHERE owner_meta_hash = ?1 AND created_at >= ?2 AND created_at <= ?3
+                UNION ALL
+                SELECT sr.created_at FROM sweep_requests sr JOIN maze_pockets mp ON sr.pocket_id = mp.id WHERE mp.owner_meta_hash = ?1 AND sr.created_at >= ?2 AND sr.created_at <= ?3
+            )",
+            params![owner_meta_hash, start_time, end_time, owner_meta_hash, start_time, end_time, owner_meta_hash, start_time, end_time],
+            |row| row.get(0)
+        ).unwrap_or(None);
+
+        let last_activity: Option<i64> = conn.query_row(
+            "SELECT MAX(created_at) FROM (
+                SELECT created_at FROM maze_pockets WHERE owner_meta_hash = ?1 AND created_at >= ?2 AND created_at <= ?3 AND status != 'deleted' AND id NOT LIKE 'route_%'
+                UNION ALL
+                SELECT created_at FROM funding_requests WHERE owner_meta_hash = ?1 AND created_at >= ?2 AND created_at <= ?3
+                UNION ALL
+                SELECT sr.created_at FROM sweep_requests sr JOIN maze_pockets mp ON sr.pocket_id = mp.id WHERE mp.owner_meta_hash = ?1 AND sr.created_at >= ?2 AND sr.created_at <= ?3
+            )",
+            params![owner_meta_hash, start_time, end_time, owner_meta_hash, start_time, end_time, owner_meta_hash, start_time, end_time],
+            |row| row.get(0)
+        ).unwrap_or(None);
+
+        Ok(AirdropStats {
+            pockets_created,
+            routes_completed,
+            funding_volume_lamports: funding_volume as u64,
+            sweeps_completed,
+            unique_destinations,
+            p2p_completed,
+            p2p_volume_lamports: p2p_volume as u64,
+            first_activity,
+            last_activity,
+        })
     }
 }
 impl Drop for PocketDatabase {
