@@ -8,6 +8,8 @@ pub mod core;
 pub mod relay;
 pub mod error;
 pub mod config;
+pub mod tokens;
+pub mod swap;
 
 // Re-export commonly used types
 pub use config::Config;

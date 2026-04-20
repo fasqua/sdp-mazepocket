@@ -36,6 +36,8 @@ use sdp_mazepocket::{
         database::{MazePocket, PocketStatus, FundingRequest, RouteHistoryEntry, UsageStats, P2pTransfer, Contact, AirdropStats},
     },
     error::{MazeError, Result},
+    swap::{self, SwapQuoteRequest, SwapQuoteResponse, SwapResult},
+    tokens::{self, TokenInfo},
 };
 
 
@@ -86,6 +88,7 @@ struct AppState {
     rpc: RpcClient,
     config: Config,
     pool_lock: Arc<tokio::sync::Semaphore>,
+    http_client: reqwest::Client,
 }
 
 // ============ API TYPES ============
@@ -3593,6 +3596,380 @@ async fn sweep_all_pockets(
         results,
     }))
 }
+
+
+// ============ TOKEN BALANCE HANDLER ============
+
+#[derive(Debug, Deserialize)]
+struct TokenBalancesQuery {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenBalancesResponse {
+    success: bool,
+    pocket_id: String,
+    sol_balance: f64,
+    tokens: Vec<swap::TokenBalance>,
+    error: Option<String>,
+}
+
+async fn token_balances_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Query(query): Query<TokenBalancesQuery>,
+) -> std::result::Result<Json<TokenBalancesResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let pocket_pubkey = Pubkey::from_str(&pocket.stealth_pubkey)
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+
+    // Get SOL balance
+    let sol_balance = state.rpc.get_balance(&pocket_pubkey).unwrap_or(0);
+
+    // Scan token balances (SPL Token + Token-2022)
+    let raw_balances = swap::scan_token_balances(&state.rpc, &pocket_pubkey);
+
+    // Resolve metadata for each token
+    let mut token_balances: Vec<swap::TokenBalance> = Vec::new();
+    for (mint, amount, program) in raw_balances {
+        // Try curated list first
+        let token_info = match tokens::resolve_token(&mint) {
+            Some(t) if t.symbol != "UNKNOWN" => t,
+            _ => {
+                // Try DexScreener
+                match swap::resolve_token_dexscreener(&state.http_client, &mint).await {
+                    Some(t) => t,
+                    None => tokens::TokenInfo {
+                        symbol: format!("{}...{}", &mint[..4], &mint[mint.len()-4..]),
+                        name: "Unknown Token".to_string(),
+                        mint: mint.clone(),
+                        decimals: 6,
+                        logo_uri: None,
+                    },
+                }
+            }
+        };
+
+        let decimals = token_info.decimals;
+        let balance_formatted = amount as f64 / 10f64.powi(decimals as i32);
+
+        token_balances.push(swap::TokenBalance {
+            mint: token_info.mint,
+            symbol: token_info.symbol,
+            name: token_info.name,
+            decimals,
+            balance_raw: amount,
+            balance_formatted,
+            token_program: program,
+        });
+    }
+
+    Ok(Json(TokenBalancesResponse {
+        success: true,
+        pocket_id,
+        sol_balance: lamports_to_sol(sol_balance),
+        tokens: token_balances,
+        error: None,
+    }))
+}
+// ============ SWAP HANDLERS ============
+
+#[derive(Debug, Deserialize)]
+struct SwapQuoteQuery {
+    meta_address: String,
+    output_token: String,
+    amount_sol: f64,
+    slippage_bps: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+struct SwapQuoteApiResponse {
+    success: bool,
+    quote: Option<SwapQuoteResponse>,
+    output_token: Option<TokenInfo>,
+    error: Option<String>,
+}
+
+/// Get swap quote for a pocket
+async fn swap_quote_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Query(query): Query<SwapQuoteQuery>,
+) -> std::result::Result<Json<SwapQuoteApiResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    // Verify pocket ownership
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(SwapQuoteApiResponse {
+            success: false,
+            quote: None,
+            output_token: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    // Resolve output token (curated list first, then DexScreener for unknown CAs)
+    let output_token = match tokens::resolve_token(&query.output_token) {
+        Some(t) if t.symbol != "UNKNOWN" => t,
+        Some(t) => {
+            match swap::resolve_token_dexscreener(&state.http_client, &t.mint).await {
+                Some(resolved) => resolved,
+                None => t,
+            }
+        }
+        None => return Ok(Json(SwapQuoteApiResponse {
+            success: false,
+            quote: None,
+            output_token: None,
+            error: Some(format!("Token not found: {}. Use symbol (BONK, USDC) or contract address.", query.output_token)),
+        })),
+    };
+    let amount_lamports = sol_to_lamports(query.amount_sol);
+
+
+
+
+
+
+
+
+
+
+
+    let amount_lamports = sol_to_lamports(query.amount_sol);
+    if amount_lamports == 0 {
+        return Ok(Json(SwapQuoteApiResponse {
+            success: false,
+            quote: None,
+            output_token: None,
+            error: Some("Amount must be greater than 0".into()),
+        }));
+    }
+
+    // Fetch quote from Jupiter
+    let quote_req = SwapQuoteRequest {
+        input_mint: tokens::SOL_MINT.to_string(),
+        output_mint: output_token.mint.clone(),
+        amount: amount_lamports,
+        taker: pocket.stealth_pubkey.clone(),
+        slippage_bps: query.slippage_bps,
+    };
+
+    let quote = swap::get_swap_quote(&state.http_client, &quote_req).await
+        .map_err(|e| AppError(e))?;
+
+    Ok(Json(SwapQuoteApiResponse {
+        success: true,
+        quote: Some(quote),
+        output_token: Some(output_token),
+        error: None,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SwapExecuteRequest {
+    meta_address: String,
+    output_token: String,
+    amount_sol: f64,
+    slippage_bps: Option<u16>,
+    input_token: Option<String>,
+    amount_raw: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SwapExecuteResponse {
+    success: bool,
+    swap_result: Option<SwapResult>,
+    output_token: Option<TokenInfo>,
+    error: Option<String>,
+}
+
+/// Execute a swap from a pocket
+async fn swap_execute_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<SwapExecuteRequest>,
+) -> std::result::Result<Json<SwapExecuteResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Verify pocket ownership
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(SwapExecuteResponse {
+            success: false,
+            swap_result: None,
+            output_token: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    // Resolve output token (curated list first, then DexScreener for unknown CAs)
+    let output_token = match tokens::resolve_token(&req.output_token) {
+        Some(t) if t.symbol != "UNKNOWN" => t,
+        Some(t) => {
+            match swap::resolve_token_dexscreener(&state.http_client, &t.mint).await {
+                Some(resolved) => resolved,
+                None => t,
+            }
+        }
+        None => return Ok(Json(SwapExecuteResponse {
+            success: false,
+            swap_result: None,
+            output_token: None,
+            error: Some(format!("Token not found: {}", req.output_token)),
+        })),
+    };
+
+    let amount_lamports = sol_to_lamports(req.amount_sol);
+    let sell_amount_raw = req.amount_raw.unwrap_or(0);
+    if amount_lamports == 0 && sell_amount_raw == 0 {
+        return Ok(Json(SwapExecuteResponse {
+            success: false,
+            swap_result: None,
+            output_token: None,
+            error: Some("Amount must be greater than 0".into()),
+        }));
+    }
+
+    // Check pocket balance
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let balance = state.rpc.get_balance(&pocket_keypair.pubkey())
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+
+    // Balance check depends on direction
+    let buffer = 3_000_000; // 0.003 SOL buffer for tx fees + priority fees + rent
+    if req.input_token.is_none() {
+        // Buy (SOL -> Token): need SOL for swap amount + fees
+        if balance < amount_lamports + buffer {
+            return Ok(Json(SwapExecuteResponse {
+                success: false,
+                swap_result: None,
+                output_token: None,
+                error: Some(format!(
+                    "Insufficient balance. Need {} SOL + fees, have {} SOL",
+                    lamports_to_sol(amount_lamports),
+                    lamports_to_sol(balance)
+                )),
+            }));
+        }
+    } else {
+        // Sell (Token -> SOL): only need SOL for tx fees
+        if balance < buffer {
+            return Ok(Json(SwapExecuteResponse {
+                success: false,
+                swap_result: None,
+                output_token: None,
+                error: Some(format!(
+                    "Insufficient SOL for transaction fees. Need ~0.003 SOL, have {} SOL",
+                    lamports_to_sol(balance)
+                )),
+            }));
+        }
+    }
+    // Determine swap direction
+    let (swap_input_mint, swap_output_mint, swap_amount) = if let Some(ref input_tok) = req.input_token {
+        // Token -> SOL (sell)
+        let input_info = match tokens::resolve_token(input_tok) {
+            Some(t) if t.symbol != "UNKNOWN" => t,
+            Some(t) => {
+                match swap::resolve_token_dexscreener(&state.http_client, &t.mint).await {
+                    Some(resolved) => resolved,
+                    None => t,
+                }
+            }
+            None => return Ok(Json(SwapExecuteResponse {
+                success: false,
+                swap_result: None,
+                output_token: None,
+                error: Some(format!("Input token not found: {}", input_tok)),
+            })),
+        };
+        let amt = req.amount_raw.unwrap_or(sol_to_lamports(req.amount_sol));
+        info!("Swap execute: pocket {} selling {} {} -> SOL", pocket_id, amt, input_info.symbol);
+        (input_info.mint.clone(), tokens::SOL_MINT.to_string(), amt)
+    } else {
+        // SOL -> Token (buy)
+        info!("Swap execute: pocket {} buying {} SOL -> {}", pocket_id, req.amount_sol, output_token.symbol);
+        (tokens::SOL_MINT.to_string(), output_token.mint.clone(), amount_lamports)
+    };
+    // Execute swap via Jupiter Ultra
+    let result = swap::execute_swap(
+        &state.http_client,
+        &state.rpc,
+        &pocket_keypair,
+        &swap_input_mint,
+        &swap_output_mint,
+        swap_amount,
+        req.slippage_bps,
+    ).await.map_err(|e| AppError(e))?;
+
+    let success = result.success;
+    info!("Swap result for pocket {}: success={}", pocket_id, success);
+
+    Ok(Json(SwapExecuteResponse {
+        success,
+        swap_result: Some(result),
+        output_token: Some(output_token),
+        error: None,
+    }))
+}
+
+/// Get curated token list
+async fn token_list_handler() -> Json<serde_json::Value> {
+    let tokens_list = tokens::get_token_list();
+    Json(serde_json::json!({
+        "success": true,
+        "tokens": tokens_list,
+        "count": tokens_list.len(),
+    }))
+}
+
+/// Resolve a token query
+#[derive(Debug, Deserialize)]
+struct TokenResolveQuery {
+    query: String,
+}
+
+async fn token_resolve_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TokenResolveQuery>,
+) -> Json<serde_json::Value> {
+    match tokens::resolve_token(&q.query) {
+        Some(t) if t.symbol != "UNKNOWN" => Json(serde_json::json!({
+            "success": true,
+            "token": t,
+        })),
+        Some(t) => {
+            // Unknown CA — try DexScreener
+            match swap::resolve_token_dexscreener(&state.http_client, &t.mint).await {
+                Some(resolved) => Json(serde_json::json!({
+                    "success": true,
+                    "token": resolved,
+                })),
+                None => Json(serde_json::json!({
+                    "success": true,
+                    "token": t,
+                })),
+            }
+        }
+        None => Json(serde_json::json!({
+            "success": false,
+            "error": format!("Token not found: {}", q.query),
+        })),
+    }
+}
 // ============ MAIN ============
 
 #[tokio::main]
@@ -3628,7 +4005,8 @@ async fn main() {
     info!("RPC client connected to {}", rpc_display);
 
     // Create app state
-    let state = Arc::new(AppState { db, rpc, config: config.clone(), pool_lock: Arc::new(tokio::sync::Semaphore::new(1)) });
+    let http_client = reqwest::Client::new();
+    let state = Arc::new(AppState { db, rpc, config: config.clone(), pool_lock: Arc::new(tokio::sync::Semaphore::new(1)), http_client });
 
     // Start deposit monitor
     let monitor_state = state.clone();
@@ -3674,6 +4052,11 @@ async fn main() {
         .route("/admin/partners", get(list_partners_handler))
         .route("/admin/partners", post(add_partner_handler))
         .route("/admin/partners/:id", axum::routing::delete(delete_partner_handler))
+        .route("/pocket/:pocket_id/token-balances", get(token_balances_handler))
+        .route("/pocket/:pocket_id/swap/quote", get(swap_quote_handler))
+        .route("/pocket/:pocket_id/swap", post(swap_execute_handler))
+        .route("/tokens", get(token_list_handler))
+        .route("/token/resolve", get(token_resolve_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
