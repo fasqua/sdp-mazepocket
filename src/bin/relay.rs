@@ -4385,6 +4385,8 @@ struct AirdropPoints {
     volume_bonus: i64,
     multi_route_bonus: i64,
     total: i64,
+    multiplier: f64,
+    final_total: i64,
 }
 
 async fn airdrop_verify(
@@ -4399,33 +4401,40 @@ async fn airdrop_verify(
 
     let stats = state.db.get_airdrop_stats(&owner_meta_hash, start_time, end_time)?;
 
-    // Calculate points
-    let pocket_points = stats.pockets_created.min(5) * 100; // max 5 pockets = 500 pts
-    let route_points = stats.routes_completed.min(10) * 150; // max 10 routes = 1500 pts
-    let sweep_points = stats.sweeps_completed.min(5) * 100; // max 5 sweeps = 500 pts
-    let p2p_points = stats.p2p_completed.min(5) * 75; // max 5 p2p = 375 pts
+    // Calculate points (no cap - reward all activity)
+    let pocket_points = stats.pockets_created * 100;
+    let route_points = stats.routes_completed * 150;
+    let sweep_points = stats.sweeps_completed * 100;
+    let p2p_points = stats.p2p_completed * 75;
 
-    // Volume bonus: 100 pts per 0.5 SOL routed, max 500 pts
+    // Volume bonus: 100 pts per 0.5 SOL routed (no cap)
     let total_volume_lamports = stats.funding_volume_lamports + stats.p2p_volume_lamports;
-    let volume_bonus = ((total_volume_lamports as f64 / 500_000_000.0) as i64).min(5) * 100;
+    let volume_bonus = ((total_volume_lamports as f64 / 500_000_000.0) as i64) * 100;
 
     // Multi-route bonus: 200 pts if 3+ distinct routes
     let multi_route_bonus = if stats.routes_completed >= 3 { 200 } else { 0 };
 
     let total_points = pocket_points + route_points + sweep_points + p2p_points + volume_bonus + multi_route_bonus;
 
-    // Determine tier
-    let has_on_chain = stats.pockets_created > 0 || stats.routes_completed > 0;
-    let has_builder_potential = stats.routes_completed >= 3 && stats.sweeps_completed >= 1 && stats.p2p_completed >= 1;
-    let tier = if total_points >= 1000 && has_builder_potential {
+    // Determine tier based on activity thresholds
+    let tier = if stats.routes_completed >= 100 && stats.sweeps_completed >= 100 && stats.p2p_completed >= 100 {
         "Pioneer"
-    } else if total_points >= 500 && has_on_chain && stats.routes_completed >= 2 {
+    } else if stats.routes_completed >= 50 && stats.sweeps_completed >= 50 && stats.p2p_completed >= 50 {
         "Explorer"
-    } else if total_points >= 200 && has_on_chain {
+    } else if stats.routes_completed >= 25 && stats.sweeps_completed >= 25 && stats.p2p_completed >= 25 {
         "Navigator"
     } else {
         "Observer"
     };
+
+    // Tier multiplier
+    let multiplier: f64 = match tier {
+        "Pioneer" => 3.0,
+        "Explorer" => 2.0,
+        "Navigator" => 1.5,
+        _ => 1.0,
+    };
+    let final_total = (total_points as f64 * multiplier) as i64;
 
     let total_volume_sol = lamports_to_sol(total_volume_lamports);
 
@@ -4451,6 +4460,8 @@ async fn airdrop_verify(
             volume_bonus,
             multi_route_bonus,
             total: total_points,
+            multiplier,
+            final_total,
         },
         tier: tier.to_string(),
     }))
