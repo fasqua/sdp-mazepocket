@@ -38,6 +38,7 @@ use sdp_mazepocket::{
     error::{MazeError, Result},
     swap::{self, SwapQuoteRequest, SwapQuoteResponse, SwapResult},
     tokens::{self, TokenInfo},
+    printr::{self, PrintrCreateRequest, PrintrDeploymentStatus},
 };
 
 
@@ -3970,6 +3971,187 @@ async fn token_resolve_handler(
         })),
     }
 }
+
+// ============ PRINTR TOKEN CREATION HANDLERS ============
+
+#[derive(Debug, Deserialize)]
+struct PocketPrintrCreateRequest {
+    meta_address: String,
+    name: String,
+    symbol: String,
+    description: Option<String>,
+    image_url: Option<String>,
+    image_path: Option<String>,
+    chains: Option<Vec<String>>,
+    initial_supply: Option<u64>,
+    decimals: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct PocketPrintrCreateResponse {
+    success: bool,
+    pocket_id: String,
+    token_id: Option<String>,
+    mint_address: Option<String>,
+    tx_signature: Option<String>,
+    deployments: Vec<printr::ChainDeployment>,
+    error: Option<String>,
+}
+
+/// Create a token from a pocket via Printr
+async fn printr_create_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<PocketPrintrCreateRequest>,
+) -> std::result::Result<Json<PocketPrintrCreateResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(PocketPrintrCreateResponse {
+            success: false,
+            pocket_id,
+            token_id: None,
+            mint_address: None,
+            tx_signature: None,
+            deployments: vec![],
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let balance = state.rpc.get_balance(&pocket_keypair.pubkey())
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+
+    let buffer = 5_000_000;
+    if balance < buffer {
+        return Ok(Json(PocketPrintrCreateResponse {
+            success: false,
+            pocket_id,
+            token_id: None,
+            mint_address: None,
+            tx_signature: None,
+            deployments: vec![],
+            error: Some(format!("Insufficient balance. Have {} SOL, need at least 0.005 SOL for fees", lamports_to_sol(balance))),
+        }));
+    }
+
+    let chains = req.chains.unwrap_or_else(|| vec!["solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".to_string()]);
+    let creator_accounts = vec![format!("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:{}", pocket.stealth_pubkey)];
+
+    let create_req = PrintrCreateRequest {
+        name: req.name,
+        symbol: req.symbol,
+        description: req.description,
+        image_url: req.image_url,
+        image_path: req.image_path,
+        chains,
+        creator_accounts,
+        initial_supply: req.initial_supply,
+        decimals: req.decimals,
+    };
+
+    let create_result = printr::create_token(&state.http_client, &create_req).await
+        .map_err(|e| AppError(e))?;
+
+    if !create_result.success {
+        return Ok(Json(PocketPrintrCreateResponse {
+            success: false,
+            pocket_id,
+            token_id: create_result.token_id,
+            mint_address: create_result.mint_address,
+            tx_signature: None,
+            deployments: create_result.chains,
+            error: create_result.error,
+        }));
+    }
+
+    let mut tx_signature = None;
+    if let Some(ref tx_data) = create_result.transaction_data {
+        match printr::sign_and_submit_token(&state.http_client, &state.rpc, &pocket_keypair, tx_data).await {
+            Ok(sig) => {
+                info!("Printr token TX signed from pocket {}: {}", pocket_id, sig);
+                tx_signature = Some(sig);
+            }
+            Err(e) => {
+                return Ok(Json(PocketPrintrCreateResponse {
+                    success: true,
+                    pocket_id,
+                    token_id: create_result.token_id,
+                    mint_address: create_result.mint_address,
+                    tx_signature: None,
+                    deployments: create_result.chains,
+                    error: Some(format!("Token created successfully. On-chain signing pending: {}", e)),
+                }));
+            }
+        }
+    }
+
+    info!("Printr token created from pocket {}: {:?}", pocket_id, create_result.token_id);
+
+    Ok(Json(PocketPrintrCreateResponse {
+        success: true,
+        pocket_id,
+        token_id: create_result.token_id,
+        mint_address: create_result.mint_address,
+        tx_signature,
+        deployments: create_result.chains,
+        error: None,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct PrintrDeploymentQuery {
+    token_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PocketPrintrDeploymentResponse {
+    success: bool,
+    token_id: String,
+    deployments: Vec<printr::ChainDeployment>,
+    error: Option<String>,
+}
+
+/// Get Printr deployment status
+async fn printr_deployment_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PrintrDeploymentQuery>,
+) -> std::result::Result<Json<PocketPrintrDeploymentResponse>, AppError> {
+    let status = printr::get_deployment_status(&state.http_client, &query.token_id).await
+        .map_err(|e| AppError(e))?;
+
+    Ok(Json(PocketPrintrDeploymentResponse {
+        success: status.success,
+        token_id: status.token_id,
+        deployments: status.deployments,
+        error: status.error,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct PrintrTokenInfoQuery {
+    token_id: String,
+}
+
+/// Get Printr token info
+async fn printr_token_info_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PrintrTokenInfoQuery>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    let info = printr::get_token_info(&state.http_client, &query.token_id).await
+        .map_err(|e| AppError(e))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "token": info,
+    })))
+}
 // ============ MAIN ============
 
 #[tokio::main]
@@ -4057,6 +4239,9 @@ async fn main() {
         .route("/pocket/:pocket_id/swap", post(swap_execute_handler))
         .route("/tokens", get(token_list_handler))
         .route("/token/resolve", get(token_resolve_handler))
+        .route("/pocket/:pocket_id/printr/create", post(printr_create_handler))
+        .route("/printr/deployment", get(printr_deployment_handler))
+        .route("/printr/token", get(printr_token_info_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)

@@ -10,6 +10,7 @@ pub mod error;
 pub mod config;
 pub mod tokens;
 pub mod swap;
+pub mod printr;
 
 // Re-export commonly used types
 pub use config::Config;
