@@ -165,6 +165,18 @@ pub struct Partner {
     pub created_at: i64,
     pub updated_at: i64,
 }
+/// Maze routing preferences per user
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MazePreferences {
+    pub owner_meta_hash: String,
+    pub hop_count: u8,
+    pub split_ratio: f64,
+    pub merge_strategy: String,
+    pub delay_pattern: String,
+    pub delay_ms: u64,
+    pub delay_scope: String,
+    pub updated_at: i64,
+}
 /// Database wrapper with Argon2id + AES-256-GCM encryption
 pub struct PocketDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -462,6 +474,21 @@ impl PocketDatabase {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_partners_mint ON partners(token_mint)",
+            [],
+        )?;
+
+        // Maze preferences table
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS maze_preferences (
+                owner_meta_hash TEXT PRIMARY KEY,
+                hop_count INTEGER NOT NULL DEFAULT 7,
+                split_ratio REAL NOT NULL DEFAULT 1.618,
+                merge_strategy TEXT NOT NULL DEFAULT 'random',
+                delay_pattern TEXT NOT NULL DEFAULT 'none',
+                delay_ms INTEGER NOT NULL DEFAULT 0,
+                delay_scope TEXT NOT NULL DEFAULT 'node',
+                updated_at INTEGER NOT NULL
+            )"#,
             [],
         )?;
         Ok(())
@@ -1941,6 +1968,59 @@ impl PocketDatabase {
             first_activity,
             last_activity,
         })
+    }
+
+    // ============ MAZE PREFERENCES ============
+
+    /// Save maze preferences for a user
+    pub fn save_maze_preferences(&self, prefs: &MazePreferences) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT OR REPLACE INTO maze_preferences
+               (owner_meta_hash, hop_count, split_ratio, merge_strategy,
+                delay_pattern, delay_ms, delay_scope, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            params![
+                prefs.owner_meta_hash,
+                prefs.hop_count,
+                prefs.split_ratio,
+                prefs.merge_strategy,
+                prefs.delay_pattern,
+                prefs.delay_ms,
+                prefs.delay_scope,
+                prefs.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get maze preferences for a user
+    pub fn get_maze_preferences(&self, owner_meta_hash: &str) -> Result<Option<MazePreferences>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT owner_meta_hash, hop_count, split_ratio, merge_strategy,
+                      delay_pattern, delay_ms, delay_scope, updated_at
+               FROM maze_preferences WHERE owner_meta_hash = ?1"#
+        )?;
+
+        let result = stmt.query_row(params![owner_meta_hash], |row| {
+            Ok(MazePreferences {
+                owner_meta_hash: row.get(0)?,
+                hop_count: row.get::<_, u8>(1)?,
+                split_ratio: row.get(2)?,
+                merge_strategy: row.get(3)?,
+                delay_pattern: row.get(4)?,
+                delay_ms: row.get::<_, i64>(5)? as u64,
+                delay_scope: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        });
+
+        match result {
+            Ok(prefs) => Ok(Some(prefs)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
     }
 }
 impl Drop for PocketDatabase {

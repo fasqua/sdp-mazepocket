@@ -33,7 +33,7 @@ use sdp_mazepocket::{
     core::{lamports_to_sol, sol_to_lamports, generate_pocket_id},
     relay::{
         PocketDatabase, MazeGenerator, MazeGraph, MazeNode,
-        database::{MazePocket, PocketStatus, FundingRequest, RouteHistoryEntry, UsageStats, P2pTransfer, Contact, AirdropStats},
+        database::{MazePocket, PocketStatus, FundingRequest, RouteHistoryEntry, UsageStats, P2pTransfer, Contact, AirdropStats, MazePreferences},
     },
     error::{MazeError, Result},
     swap::{self, SwapQuoteRequest, SwapQuoteResponse, SwapResult},
@@ -4152,6 +4152,106 @@ async fn printr_token_info_handler(
         "token": info,
     })))
 }
+// ============ MAZE PREFERENCES HANDLERS ============
+
+#[derive(Debug, Deserialize)]
+struct GetMazePreferencesRequest {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MazePreferencesResponse {
+    success: bool,
+    preferences: Option<MazePreferencesData>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MazePreferencesData {
+    hop_count: u8,
+    split_ratio: f64,
+    merge_strategy: String,
+    delay_pattern: String,
+    delay_ms: u64,
+    delay_scope: String,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveMazePreferencesRequest {
+    meta_address: String,
+    hop_count: Option<u8>,
+    split_ratio: Option<f64>,
+    merge_strategy: Option<String>,
+    delay_pattern: Option<String>,
+    delay_ms: Option<u64>,
+    delay_scope: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SaveMazePreferencesResponse {
+    success: bool,
+    error: Option<String>,
+}
+
+async fn get_maze_preferences_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GetMazePreferencesRequest>,
+) -> std::result::Result<Json<MazePreferencesResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let prefs = state.db.get_maze_preferences(&owner_meta_hash)?;
+
+    match prefs {
+        Some(p) => Ok(Json(MazePreferencesResponse {
+            success: true,
+            preferences: Some(MazePreferencesData {
+                hop_count: p.hop_count,
+                split_ratio: p.split_ratio,
+                merge_strategy: p.merge_strategy,
+                delay_pattern: p.delay_pattern,
+                delay_ms: p.delay_ms,
+                delay_scope: p.delay_scope,
+                updated_at: p.updated_at,
+            }),
+            error: None,
+        })),
+        None => Ok(Json(MazePreferencesResponse {
+            success: true,
+            preferences: None,
+            error: None,
+        })),
+    }
+}
+
+async fn save_maze_preferences_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SaveMazePreferencesRequest>,
+) -> std::result::Result<Json<SaveMazePreferencesResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+    let now = chrono::Utc::now().timestamp();
+
+    let prefs = MazePreferences {
+        owner_meta_hash,
+        hop_count: req.hop_count.unwrap_or(7).max(5).min(10),
+        split_ratio: req.split_ratio.unwrap_or(1.618).max(1.1).min(3.0),
+        merge_strategy: req.merge_strategy.unwrap_or_else(|| "random".to_string()),
+        delay_pattern: req.delay_pattern.unwrap_or_else(|| "none".to_string()),
+        delay_ms: req.delay_ms.unwrap_or(0).min(5000),
+        delay_scope: req.delay_scope.unwrap_or_else(|| "node".to_string()),
+        updated_at: now,
+    };
+
+    state.db.save_maze_preferences(&prefs)?;
+
+    info!("Maze preferences saved for user");
+
+    Ok(Json(SaveMazePreferencesResponse {
+        success: true,
+        error: None,
+    }))
+}
+
 // ============ MAIN ============
 
 #[tokio::main]
@@ -4242,6 +4342,8 @@ async fn main() {
         .route("/pocket/:pocket_id/printr/create", post(printr_create_handler))
         .route("/printr/deployment", get(printr_deployment_handler))
         .route("/printr/token", get(printr_token_info_handler))
+        .route("/preferences/maze", post(get_maze_preferences_handler))
+        .route("/preferences/maze/save", post(save_maze_preferences_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
