@@ -349,10 +349,14 @@ impl PocketDatabase {
                 wallet_address TEXT NOT NULL,
                 owner_meta_hash TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                last_used_at INTEGER
+                last_used_at INTEGER,
+                raw_meta_address TEXT
             )"#,
             [],
         )?;
+
+        // Migration: add raw_meta_address column if missing
+        let _ = conn.execute("ALTER TABLE mcp_api_keys ADD COLUMN raw_meta_address TEXT", []);
 
         // Destination wallets table (saved withdrawal addresses)
         conn.execute(
@@ -1339,12 +1343,12 @@ impl PocketDatabase {
     }
 
     /// Store MCP API key
-    pub fn store_mcp_api_key(&self, api_key_hash: &str, wallet_address: &str, owner_meta_hash: &str) -> Result<()> {
+    pub fn store_mcp_api_key(&self, api_key_hash: &str, wallet_address: &str, owner_meta_hash: &str, raw_meta_address: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
-            "INSERT OR REPLACE INTO mcp_api_keys (api_key_hash, wallet_address, owner_meta_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![api_key_hash, wallet_address, owner_meta_hash, now],
+            "INSERT OR REPLACE INTO mcp_api_keys (api_key_hash, wallet_address, owner_meta_hash, created_at, raw_meta_address) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![api_key_hash, wallet_address, owner_meta_hash, now, raw_meta_address],
         )?;
         Ok(())
     }
@@ -1358,6 +1362,22 @@ impl PocketDatabase {
         let mut rows = stmt.query(params![api_key_hash])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Validate MCP API key and return wallet address + raw_meta_address
+    pub fn validate_mcp_api_key_full(&self, api_key_hash: &str) -> Result<Option<(String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT wallet_address, raw_meta_address FROM mcp_api_keys WHERE api_key_hash = ?1"
+        )?;
+        let mut rows = stmt.query(params![api_key_hash])?;
+        if let Some(row) = rows.next()? {
+            let wallet: String = row.get(0)?;
+            let raw_meta: Option<String> = row.get(1).ok();
+            Ok(Some((wallet, raw_meta)))
         } else {
             Ok(None)
         }

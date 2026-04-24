@@ -4837,6 +4837,7 @@ struct McpRegisterRequest {
     signature: String,
     message: String,
     timestamp: i64,
+    meta_address: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4890,9 +4891,13 @@ async fn mcp_register(
     hasher.update(api_key.as_bytes());
     let api_key_hash = hex::encode(hasher.finalize());
     
-    // Store in database
-    let owner_meta_hash = hash_meta_address(&req.wallet_address);
-    state.db.store_mcp_api_key(&api_key_hash, &req.wallet_address, &owner_meta_hash)?;
+    // Store in database - use meta_address from frontend if provided, otherwise hash wallet address
+    let raw_meta = req.meta_address.as_deref().filter(|m| !m.is_empty());
+    let owner_meta_hash = match raw_meta {
+        Some(meta) => hash_meta_address(meta),
+        None => hash_meta_address(&req.wallet_address),
+    };
+    state.db.store_mcp_api_key(&api_key_hash, &req.wallet_address, &owner_meta_hash, raw_meta)?;
     
     info!("MCP API key generated for wallet: {}", &req.wallet_address);
     
@@ -4915,6 +4920,7 @@ struct McpValidateKeyRequest {
 struct McpValidateKeyResponse {
     valid: bool,
     wallet_address: Option<String>,
+    meta_address: Option<String>,
 }
 
 async fn mcp_validate_key(
@@ -4929,14 +4935,16 @@ async fn mcp_validate_key(
     let api_key_hash = hex::encode(hasher.finalize());
     
     // Lookup in database
-    match state.db.validate_mcp_api_key(&api_key_hash) {
-        Ok(Some(wallet_address)) => Json(McpValidateKeyResponse {
+    match state.db.validate_mcp_api_key_full(&api_key_hash) {
+        Ok(Some((wallet_address, raw_meta))) => Json(McpValidateKeyResponse {
             valid: true,
             wallet_address: Some(wallet_address),
+            meta_address: raw_meta,
         }),
         _ => Json(McpValidateKeyResponse {
             valid: false,
             wallet_address: None,
+            meta_address: None,
         }),
     }
 }
