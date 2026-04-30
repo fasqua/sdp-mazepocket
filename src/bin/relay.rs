@@ -3639,7 +3639,20 @@ async fn token_balances_handler(
     for (mint, amount, program) in raw_balances {
         // Try curated list first
         let token_info = match tokens::resolve_token(&mint) {
-            Some(t) if t.symbol != "UNKNOWN" => t,
+            Some(t) if t.symbol != "UNKNOWN" => {
+                // If logo_uri missing, try DexScreener for logo
+                if t.logo_uri.is_none() {
+                    match swap::resolve_token_dexscreener(&state.http_client, &t.mint).await {
+                        Some(resolved) if resolved.logo_uri.is_some() => tokens::TokenInfo {
+                            logo_uri: resolved.logo_uri,
+                            ..t
+                        },
+                        _ => t,
+                    }
+                } else {
+                    t
+                }
+            },
             _ => {
                 // Try DexScreener
                 match swap::resolve_token_dexscreener(&state.http_client, &mint).await {
@@ -3666,6 +3679,7 @@ async fn token_balances_handler(
             balance_raw: amount,
             balance_formatted,
             token_program: program,
+            logo_uri: token_info.logo_uri,
         });
     }
 
@@ -3685,6 +3699,8 @@ struct SwapQuoteQuery {
     output_token: String,
     amount_sol: f64,
     slippage_bps: Option<u16>,
+    input_token: Option<String>,
+    amount_raw: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3716,6 +3732,58 @@ async fn swap_quote_handler(
         }));
     }
 
+    // Determine swap direction
+    if let Some(ref input_tok) = query.input_token {
+        // Token -> SOL direction
+        let input_token = match tokens::resolve_token(input_tok) {
+            Some(t) if t.symbol != "UNKNOWN" => t,
+            Some(t) => {
+                match swap::resolve_token_dexscreener(&state.http_client, &t.mint).await {
+                    Some(resolved) => resolved,
+                    None => t,
+                }
+            }
+            None => return Ok(Json(SwapQuoteApiResponse {
+                success: false,
+                quote: None,
+                output_token: None,
+                error: Some(format!("Input token not found: {}", input_tok)),
+            })),
+        };
+        let amount = query.amount_raw.unwrap_or(0);
+        if amount == 0 {
+            return Ok(Json(SwapQuoteApiResponse {
+                success: false,
+                quote: None,
+                output_token: None,
+                error: Some("amount_raw must be greater than 0 for token->SOL".into()),
+            }));
+        }
+        let quote_req = SwapQuoteRequest {
+            input_mint: input_token.mint.clone(),
+            output_mint: tokens::SOL_MINT.to_string(),
+            amount,
+            taker: pocket.stealth_pubkey.clone(),
+            slippage_bps: query.slippage_bps,
+        };
+        let quote = swap::get_swap_quote(&state.http_client, &quote_req).await
+            .map_err(|e| AppError(e))?;
+        let sol_token = TokenInfo {
+            symbol: "SOL".to_string(),
+            name: "Solana".to_string(),
+            mint: tokens::SOL_MINT.to_string(),
+            decimals: 9,
+            logo_uri: None,
+        };
+        return Ok(Json(SwapQuoteApiResponse {
+            success: true,
+            quote: Some(quote),
+            output_token: Some(sol_token),
+            error: None,
+        }));
+    }
+
+    // SOL -> Token direction (existing logic)
     // Resolve output token (curated list first, then DexScreener for unknown CAs)
     let output_token = match tokens::resolve_token(&query.output_token) {
         Some(t) if t.symbol != "UNKNOWN" => t,
@@ -3948,10 +4016,24 @@ async fn token_resolve_handler(
     Query(q): Query<TokenResolveQuery>,
 ) -> Json<serde_json::Value> {
     match tokens::resolve_token(&q.query) {
-        Some(t) if t.symbol != "UNKNOWN" => Json(serde_json::json!({
-            "success": true,
-            "token": t,
-        })),
+        Some(t) if t.symbol != "UNKNOWN" => {
+            // If logo_uri is missing, try DexScreener for logo only
+            let token = if t.logo_uri.is_none() {
+                match swap::resolve_token_dexscreener(&state.http_client, &t.mint).await {
+                    Some(resolved) if resolved.logo_uri.is_some() => tokens::TokenInfo {
+                        logo_uri: resolved.logo_uri,
+                        ..t
+                    },
+                    _ => t,
+                }
+            } else {
+                t
+            };
+            Json(serde_json::json!({
+                "success": true,
+                "token": token,
+            }))
+        },
         Some(t) => {
             // Unknown CA — try DexScreener
             match swap::resolve_token_dexscreener(&state.http_client, &t.mint).await {

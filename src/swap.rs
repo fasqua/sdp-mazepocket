@@ -415,12 +415,17 @@ pub async fn resolve_token_dexscreener(
 
     // DexScreener doesn't return decimals directly, default to 6
     // (most Solana SPL tokens use 6 or 9 decimals)
+    let logo_uri = pair.get("info")
+        .and_then(|info| info.get("imageUrl"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     Some(crate::tokens::TokenInfo {
         symbol,
         name,
         mint: address,
         decimals: 6,
-        logo_uri: None,
+        logo_uri,
     })
 }
 
@@ -434,6 +439,7 @@ pub struct TokenBalance {
     pub balance_raw: u64,
     pub balance_formatted: f64,
     pub token_program: String,
+    pub logo_uri: Option<String>,
 }
 
 /// Scan all SPL token balances in a pocket address

@@ -13,3 +13,5 @@ recover*.rs
 package*.json
 /data/
 *.bak
+*.backup*
+*.bak.*
