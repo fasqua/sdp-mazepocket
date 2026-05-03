@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{Aead, KeyInit};
-use argon2::{Argon2, password_hash::SaltString, PasswordHasher};
+use argon2::Argon2;
 use sha2::{Sha256, Digest};
 use zeroize::Zeroize;
 

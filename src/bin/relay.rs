@@ -28,17 +28,17 @@ use tracing::{info, error, warn};
 use sdp_mazepocket::{
     config::{
         Config, MazeParameters, MergeStrategy, DelayPattern, DelayScope,
-        TX_FEE_LAMPORTS, FEE_PERCENT, FEE_WALLET, MIN_AMOUNT_SOL, EXPIRY_SECONDS,
+        TX_FEE_LAMPORTS, FEE_PERCENT, MIN_AMOUNT_SOL, EXPIRY_SECONDS,
     },
     core::{lamports_to_sol, sol_to_lamports, generate_pocket_id},
     relay::{
         PocketDatabase, MazeGenerator, MazeGraph, MazeNode,
-        database::{MazePocket, PocketStatus, FundingRequest, RouteHistoryEntry, UsageStats, P2pTransfer, Contact, AirdropStats, MazePreferences},
+        database::{MazePocket, PocketStatus, FundingRequest, P2pTransfer, Contact, MazePreferences},
     },
     error::{MazeError, Result},
     swap::{self, SwapQuoteRequest, SwapQuoteResponse, SwapResult},
     tokens::{self, TokenInfo},
-    printr::{self, PrintrCreateRequest, PrintrDeploymentStatus},
+    printr::{self, PrintrCreateRequest},
 };
 
 
@@ -63,7 +63,7 @@ impl From<MazeError> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        let (status, code) = match &self.0 {
+        let (status, _code) = match &self.0 {
             MazeError::InvalidMetaAddress(_) => (StatusCode::BAD_REQUEST, "INVALID_ADDRESS"),
             MazeError::InvalidParameters(_) => (StatusCode::BAD_REQUEST, "INVALID_PARAMS"),
             MazeError::InsufficientFunds { .. } => (StatusCode::BAD_REQUEST, "INSUFFICIENT_FUNDS"),
@@ -1026,9 +1026,30 @@ async fn sweep_pocket(
                 info!("Sweep maze completed for {}", pocket_id_clone);
             }
             Err(e) => {
-                error!("Sweep maze failed for {}: {}", pocket_id_clone, sanitize_error(&e.to_string()));
-                let _ = state_clone.db.update_pocket_status(&pocket_id_clone, PocketStatus::Active);
-                let _ = state_clone.db.update_sweep_status(&sweep_id_clone, "failed", None, Some(&sanitize_error(&e.to_string())));
+                error!("Sweep maze failed for {}, starting auto-recover: {}", pocket_id_clone, sanitize_error(&e.to_string()));
+                // Auto-recover: get sweep maze and destination, recover silently
+                let mut recovered = false;
+                if let Ok(Some(sweep_req)) = state_clone.db.get_sweep_request(&sweep_id_clone) {
+                    let destination = sweep_req.2.clone();
+                    if let Ok(maze_json) = state_clone.db.get_sweep_maze_graph(&sweep_id_clone) {
+                        if let Ok(maze) = serde_json::from_str::<MazeGraph>(&maze_json) {
+                            let amount = auto_recover_nodes_to_destination(
+                                state_clone.clone(), &maze.nodes, &destination, &sweep_id_clone, 3
+                            ).await;
+                            if amount > 0 {
+                                info!("Auto-recover sweep {}: recovered {} lamports", sweep_id_clone, amount);
+                                let _ = state_clone.db.update_sweep_status(&sweep_id_clone, "completed", None, None);
+                                let _ = state_clone.db.mark_pocket_swept(&pocket_id_clone);
+                                recovered = true;
+                            }
+                        }
+                    }
+                }
+                if !recovered {
+                    error!("Auto-recover sweep {} exhausted, marking failed", sweep_id_clone);
+                    let _ = state_clone.db.update_pocket_status(&pocket_id_clone, PocketStatus::Active);
+                    let _ = state_clone.db.update_sweep_status(&sweep_id_clone, "failed", None, Some(&sanitize_error(&e.to_string())));
+                }
             }
         }
     });
@@ -1245,6 +1266,163 @@ async fn get_balance_with_retry(
 
 
 // ============ MAZE EXECUTION (Copied from sdp-maze with fixes) ============
+
+// ============ AUTO-RECOVERY HELPER ============
+
+/// Automatic silent recovery for failed maze routing.
+/// Scans all maze nodes for stuck funds and transfers them to destination.
+/// Retries up to max_attempts with exponential backoff.
+/// Returns total recovered lamports, or 0 if nothing recovered.
+async fn auto_recover_nodes_to_destination(
+    state: Arc<AppState>,
+    nodes: &[MazeNode],
+    destination: &str,
+    route_id: &str,
+    max_attempts: u8,
+) -> u64 {
+    let dest_pubkey = match Pubkey::from_str(destination) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Auto-recover {}: invalid destination {}: {}", route_id, destination, e);
+            return 0;
+        }
+    };
+
+    for attempt in 1..=max_attempts {
+        // Cooldown before each attempt: 10s, 20s, 40s (exponential backoff)
+        let cooldown_secs = 10u64 * (1u64 << (attempt as u64 - 1));
+        info!("Auto-recover {}: attempt {}/{} after {}s cooldown", route_id, attempt, max_attempts, cooldown_secs);
+        tokio::time::sleep(tokio::time::Duration::from_secs(cooldown_secs)).await;
+
+        let mut total_recovered: u64 = 0;
+        let mut any_error = false;
+
+        for node in nodes {
+            let node_pubkey = match Pubkey::from_str(&node.address) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let balance = match state.rpc.get_balance(&node_pubkey) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("Auto-recover {}: get_balance failed for node {}: {}", route_id, node.index, e);
+                    any_error = true;
+                    continue;
+                }
+            };
+
+            if balance <= TX_FEE_LAMPORTS {
+                continue;
+            }
+
+            // Decrypt keypair
+            let keypair_bytes = match state.db.decrypt(&node.keypair_encrypted) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("Auto-recover {}: decrypt failed for node {}: {}", route_id, node.index, e);
+                    any_error = true;
+                    continue;
+                }
+            };
+            let keypair = match Keypair::from_bytes(&keypair_bytes) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!("Auto-recover {}: keypair error for node {}: {}", route_id, node.index, e);
+                    any_error = true;
+                    continue;
+                }
+            };
+
+            let transfer_amount = balance.saturating_sub(TX_FEE_LAMPORTS);
+            if transfer_amount == 0 {
+                continue;
+            }
+
+            // Transfer with retry (5 internal retries per node)
+            let mut tx_success = false;
+            for tx_attempt in 1..=5u8 {
+                let blockhash = match state.rpc.get_latest_blockhash() {
+                    Ok(bh) => bh,
+                    Err(e) => {
+                        warn!("Auto-recover {}: node {} blockhash attempt {}/5: {}", route_id, node.index, tx_attempt, e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+                let ix = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, transfer_amount);
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&keypair.pubkey()),
+                    &[&keypair],
+                    blockhash,
+                );
+                let config = RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    preflight_commitment: None,
+                    encoding: None,
+                    max_retries: Some(3),
+                    min_context_slot: None,
+                };
+                match state.rpc.send_transaction_with_config(&tx, config) {
+                    Ok(sig) => {
+                        // Wait for confirmation
+                        let mut confirmed = false;
+                        for _ in 0..30 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+                                if result.is_ok() {
+                                    confirmed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if confirmed {
+                            info!("Auto-recover {}: recovered {} lamports from node {} ({})", route_id, transfer_amount, node.index, sig);
+                            total_recovered += transfer_amount;
+                            tx_success = true;
+                            break;
+                        } else {
+                            warn!("Auto-recover {}: node {} TX sent but confirmation timeout", route_id, node.index);
+                        }
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                            warn!("Auto-recover {}: node {} TX attempt {}/5: {}", route_id, node.index, tx_attempt, err_str);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        warn!("Auto-recover {}: node {} TX failed: {}", route_id, node.index, err_str);
+                        break;
+                    }
+                }
+            }
+
+            if !tx_success {
+                any_error = true;
+            }
+        }
+
+        if total_recovered > 0 {
+            info!("Auto-recover {}: attempt {}/{} recovered {} lamports total", route_id, attempt, max_attempts, total_recovered);
+            return total_recovered;
+        }
+
+        if !any_error {
+            // No errors but no funds found either — nothing to recover
+            info!("Auto-recover {}: attempt {}/{} no funds found in any node", route_id, attempt, max_attempts);
+            return 0;
+        }
+
+        // Had errors, will retry on next attempt
+        warn!("Auto-recover {}: attempt {}/{} failed with errors, will retry", route_id, attempt, max_attempts);
+    }
+
+    error!("Auto-recover {}: all {} attempts exhausted", route_id, max_attempts);
+    0
+}
+
 
 async fn execute_maze(state: Arc<AppState>, request_id: &str) -> Result<()> {
     info!("Executing maze for funding request {}", request_id);
@@ -2307,8 +2485,25 @@ async fn send_to_pocket(
                 info!("P2P maze completed for {}", transfer_id_clone);
             }
             Err(e) => {
-                error!("P2P maze failed for {}: {}", transfer_id_clone, sanitize_error(&e.to_string()));
-                let _ = state_clone.db.update_p2p_status(&transfer_id_clone, "failed", Some(&sanitize_error(&e.to_string())));
+                error!("P2P maze failed for {}, starting auto-recover: {}", transfer_id_clone, sanitize_error(&e.to_string()));
+                // Auto-recover: get P2P maze and recover to receiver address
+                let mut recovered = false;
+                if let Ok(maze_json) = state_clone.db.get_p2p_maze_graph(&transfer_id_clone) {
+                    if let Ok(maze) = serde_json::from_str::<MazeGraph>(&maze_json) {
+                        let amount = auto_recover_nodes_to_destination(
+                            state_clone.clone(), &maze.nodes, &receiver_address, &transfer_id_clone, 3
+                        ).await;
+                        if amount > 0 {
+                            info!("Auto-recover P2P {}: recovered {} lamports", transfer_id_clone, amount);
+                            let _ = state_clone.db.update_p2p_status(&transfer_id_clone, "completed", None);
+                            recovered = true;
+                        }
+                    }
+                }
+                if !recovered {
+                    error!("Auto-recover P2P {} exhausted, marking failed", transfer_id_clone);
+                    let _ = state_clone.db.update_p2p_status(&transfer_id_clone, "failed", Some(&sanitize_error(&e.to_string())));
+                }
             }
         }
     });
@@ -3179,8 +3374,31 @@ async fn deposit_monitor(state: Arc<AppState>) {
                             info!("Maze execution completed for {}", req_id);
                         }
                         Err(e) => {
-                            error!("Maze execution failed for {}: {}", req_id, sanitize_error(&e.to_string()));
-                            let _ = state_clone.db.update_funding_status(&req_id, "failed", Some(&sanitize_error(&e.to_string())));
+                            error!("Maze execution failed for {}, starting auto-recover: {}", req_id, sanitize_error(&e.to_string()));
+                            // Auto-recover: get maze graph and pocket destination, then recover silently
+                            let mut recovered = false;
+                            if let Ok(maze_json) = state_clone.db.get_maze_graph(&req_id) {
+                                if let Ok(maze) = serde_json::from_str::<MazeGraph>(&maze_json) {
+                                    // Determine destination: pocket stealth_pubkey
+                                    if let Ok(Some(funding_req)) = state_clone.db.get_funding_request(&req_id) {
+                                        if let Ok(Some(pocket)) = state_clone.db.get_pocket(&funding_req.pocket_id) {
+                                            let dest = pocket.stealth_pubkey.clone();
+                                            let amount = auto_recover_nodes_to_destination(
+                                                state_clone.clone(), &maze.nodes, &dest, &req_id, 3
+                                            ).await;
+                                            if amount > 0 {
+                                                info!("Auto-recover funding {}: recovered {} lamports", req_id, amount);
+                                                let _ = state_clone.db.update_funding_status(&req_id, "completed", None);
+                                                recovered = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !recovered {
+                                error!("Auto-recover funding {} exhausted, marking failed", req_id);
+                                let _ = state_clone.db.update_funding_status(&req_id, "failed", Some(&sanitize_error(&e.to_string())));
+                            }
                         }
                     }
                 });
@@ -3567,9 +3785,30 @@ async fn sweep_all_pockets(
                     info!("Sweep all: maze completed for {}", pocket_id_clone);
                 }
                 Err(e) => {
-                    error!("Sweep all: maze failed for {}: {}", pocket_id_clone, sanitize_error(&e.to_string()));
-                    let _ = state_clone.db.update_pocket_status(&pocket_id_clone, PocketStatus::Active);
-                    let _ = state_clone.db.update_sweep_status(&sweep_id_clone, "failed", None, Some(&sanitize_error(&e.to_string())));
+                    error!("Sweep all: maze failed for {}, starting auto-recover: {}", pocket_id_clone, sanitize_error(&e.to_string()));
+                    // Auto-recover: get sweep maze and destination, recover silently
+                    let mut recovered = false;
+                    if let Ok(Some(sweep_req)) = state_clone.db.get_sweep_request(&sweep_id_clone) {
+                        let destination = sweep_req.2.clone();
+                        if let Ok(maze_json) = state_clone.db.get_sweep_maze_graph(&sweep_id_clone) {
+                            if let Ok(maze) = serde_json::from_str::<MazeGraph>(&maze_json) {
+                                let amount = auto_recover_nodes_to_destination(
+                                    state_clone.clone(), &maze.nodes, &destination, &sweep_id_clone, 3
+                                ).await;
+                                if amount > 0 {
+                                    info!("Auto-recover sweep-all {}: recovered {} lamports", sweep_id_clone, amount);
+                                    let _ = state_clone.db.update_sweep_status(&sweep_id_clone, "completed", None, None);
+                                    let _ = state_clone.db.mark_pocket_swept(&pocket_id_clone);
+                                    recovered = true;
+                                }
+                            }
+                        }
+                    }
+                    if !recovered {
+                        error!("Auto-recover sweep-all {} exhausted, marking failed", sweep_id_clone);
+                        let _ = state_clone.db.update_pocket_status(&pocket_id_clone, PocketStatus::Active);
+                        let _ = state_clone.db.update_sweep_status(&sweep_id_clone, "failed", None, Some(&sanitize_error(&e.to_string())));
+                    }
                 }
             }
         });
@@ -3800,18 +4039,6 @@ async fn swap_quote_handler(
             error: Some(format!("Token not found: {}. Use symbol (BONK, USDC) or contract address.", query.output_token)),
         })),
     };
-    let amount_lamports = sol_to_lamports(query.amount_sol);
-
-
-
-
-
-
-
-
-
-
-
     let amount_lamports = sol_to_lamports(query.amount_sol);
     if amount_lamports == 0 {
         return Ok(Json(SwapQuoteApiResponse {
