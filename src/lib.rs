@@ -4,6 +4,8 @@
 //! Users can create "pockets" - stealth wallets funded via maze routing
 //! that can be used freely in any dApp.
 
+pub mod x402;
+pub mod payment_router;
 pub mod core;
 pub mod relay;
 pub mod error;

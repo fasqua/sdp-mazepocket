@@ -39,6 +39,7 @@ use sdp_mazepocket::{
     swap::{self, SwapQuoteRequest, SwapQuoteResponse, SwapResult},
     tokens::{self, TokenInfo},
     printr::{self, PrintrCreateRequest},
+    payment_router,
 };
 
 
@@ -4561,6 +4562,97 @@ async fn save_maze_preferences_handler(
     }))
 }
 
+// ============ KAUSAPAY PAYMENT HANDLER ============
+
+#[derive(Debug, Deserialize)]
+struct KausaPayRequest {
+    meta_address: String,
+    url: String,
+    max_amount_usdc: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct KausaPayResponse {
+    success: bool,
+    response_body: Option<String>,
+    payment_signature: Option<String>,
+    amount_paid_usdc: f64,
+    protocol_used: String,
+    token_symbol: String,
+    error: Option<String>,
+}
+
+/// KausaPay: pay any x402/MPP endpoint from a pocket
+async fn kausa_pay_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<KausaPayRequest>,
+) -> std::result::Result<Json<KausaPayResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Verify pocket ownership
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(KausaPayResponse {
+            success: false,
+            response_body: None,
+            payment_signature: None,
+            amount_paid_usdc: 0.0,
+            protocol_used: String::new(),
+            token_symbol: String::new(),
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    // Decrypt pocket keypair
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    info!("KausaPay request: pocket {} -> {}", pocket_id, &req.url[..60.min(req.url.len())]);
+
+    // Execute payment via router
+    let result = payment_router::pay(
+        &state.http_client,
+        &state.rpc,
+        &pocket_keypair,
+        &req.url,
+        req.max_amount_usdc,
+    ).await;
+
+    match result {
+        Ok(pay_result) => {
+            if pay_result.success {
+                info!("KausaPay success: pocket {} paid {} {} via {}",
+                    pocket_id, pay_result.amount_paid_usdc, pay_result.token_symbol, pay_result.protocol_used);
+            }
+            Ok(Json(KausaPayResponse {
+                success: pay_result.success,
+                response_body: pay_result.response_body,
+                payment_signature: pay_result.payment_signature,
+                amount_paid_usdc: pay_result.amount_paid_usdc,
+                protocol_used: pay_result.protocol_used.to_string(),
+                token_symbol: pay_result.token_symbol,
+                error: pay_result.error,
+            }))
+        }
+        Err(e) => {
+            warn!("KausaPay failed for pocket {}: {}", pocket_id, sanitize_error(&e.to_string()));
+            Ok(Json(KausaPayResponse {
+                success: false,
+                response_body: None,
+                payment_signature: None,
+                amount_paid_usdc: 0.0,
+                protocol_used: String::new(),
+                token_symbol: String::new(),
+                error: Some(sanitize_error(&e.to_string())),
+            }))
+        }
+    }
+}
+
 // ============ MAIN ============
 
 #[tokio::main]
@@ -4653,6 +4745,7 @@ async fn main() {
         .route("/printr/token", get(printr_token_info_handler))
         .route("/preferences/maze", post(get_maze_preferences_handler))
         .route("/preferences/maze/save", post(save_maze_preferences_handler))
+        .route("/pocket/:pocket_id/pay", post(kausa_pay_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
