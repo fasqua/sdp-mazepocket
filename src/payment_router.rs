@@ -58,6 +58,8 @@ pub async fn pay(
     pocket_keypair: &Keypair,
     url: &str,
     max_amount_usdc: f64,
+    method: &str,
+    request_body: Option<&str>,
 ) -> Result<PaymentResult> {
     // === SECURITY VALIDATIONS ===
     if url.len() > MAX_URL_LENGTH {
@@ -91,9 +93,19 @@ pub async fn pay(
     info!("KausaPay: probing {} (max: {} USDC)", url, max_amount_usdc);
 
     // === STEP 1: PROBE THE URL ===
-    let probe_response = http_client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS))
+    let method_upper = method.to_uppercase();
+    let mut probe_req = match method_upper.as_str() {
+        "POST" => http_client.post(url),
+        "PUT" => http_client.put(url),
+        "PATCH" => http_client.patch(url),
+        "DELETE" => http_client.delete(url),
+        _ => http_client.get(url),
+    };
+    probe_req = probe_req.timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS));
+    if let Some(body) = request_body {
+        probe_req = probe_req.header("Content-Type", "application/json").body(body.to_string());
+    }
+    let probe_response = probe_req
         .send()
         .await
         .map_err(|e| MazeError::RpcError(format!("Failed to reach URL: {}", e)))?;
@@ -153,6 +165,8 @@ pub async fn pay(
         &challenge,
         max_amount_usdc,
         url,
+        &method_upper,
+        request_body,
     ).await?;
 
     Ok(PaymentResult {

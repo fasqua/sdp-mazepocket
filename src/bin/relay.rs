@@ -4569,6 +4569,14 @@ struct KausaPayRequest {
     meta_address: String,
     url: String,
     max_amount_usdc: f64,
+    #[serde(default = "default_http_method")]
+    method: String,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+fn default_http_method() -> String {
+    "GET".to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -4620,6 +4628,8 @@ async fn kausa_pay_handler(
         &pocket_keypair,
         &req.url,
         req.max_amount_usdc,
+        &req.method,
+        req.body.as_deref(),
     ).await;
 
     match result {

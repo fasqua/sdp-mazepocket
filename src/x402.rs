@@ -294,6 +294,8 @@ pub async fn execute_x402_payment(
     challenge: &X402Challenge,
     max_amount_usdc: f64,
     original_url: &str,
+    method: &str,
+    request_body: Option<&str>,
 ) -> Result<X402PaymentResult> {
     let token_symbol = challenge.token_symbol.clone();
 
@@ -427,33 +429,49 @@ pub async fn execute_x402_payment(
             &challenge.recipient[..16.min(challenge.recipient.len())],
             &fee_payer_pubkey.to_string()[..16]);
 
-        // Build v2 PAYMENT-SIGNATURE payload (must include "accepted" per spec)
+        // Build v2 PAYMENT-SIGNATURE payload (x402 v2 SVM spec)
+        // "accepted" must be deepEqual to the original accepts entry for server matching
+        let mut accepted = serde_json::json!({
+            "scheme": "exact",
+            "network": challenge.network,
+            "amount": challenge.amount_raw.to_string(),
+            "asset": challenge.token_mint,
+            "payTo": challenge.recipient,
+            "maxTimeoutSeconds": 300
+        });
+        if let Some(ref extra) = challenge.extra_payload {
+            if let Ok(extra_val) = serde_json::from_str::<serde_json::Value>(extra) {
+                accepted["extra"] = extra_val;
+            }
+        }
         let payment_payload = serde_json::json!({
             "x402Version": 2,
             "scheme": "exact",
             "network": challenge.network,
-            "accepted": {
-                "scheme": "exact",
-                "network": challenge.network,
-                "amount": challenge.amount_raw.to_string(),
-                "asset": challenge.token_mint,
-                "payTo": challenge.recipient,
-                "maxTimeoutSeconds": 60
-            },
             "payload": {
                 "transaction": tx_b64
             },
-            "extensions": {}
+            "accepted": accepted
         });
         let payment_b64 = base64::engine::general_purpose::STANDARD.encode(
             payment_payload.to_string().as_bytes()
         );
 
-        // Retry with PAYMENT-SIGNATURE header
-        let final_response = http_client
-            .get(original_url)
+        // Retry with PAYMENT-SIGNATURE header (use same method as original request)
+        let mut retry_req = match method {
+            "POST" => http_client.post(original_url),
+            "PUT" => http_client.put(original_url),
+            "PATCH" => http_client.patch(original_url),
+            "DELETE" => http_client.delete(original_url),
+            _ => http_client.get(original_url),
+        };
+        retry_req = retry_req
             .header("PAYMENT-SIGNATURE", &payment_b64)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(30));
+        if let Some(body) = request_body {
+            retry_req = retry_req.header("Content-Type", "application/json").body(body.to_string());
+        }
+        let final_response = retry_req
             .send()
             .await
             .map_err(|e| MazeError::RpcError(format!("Failed to fetch paid content: {}", e)))?;
@@ -585,11 +603,21 @@ pub async fn execute_x402_payment(
             payment_payload.to_string().as_bytes()
         );
 
-        // Retry with PAYMENT-SIGNATURE header
-        let final_response = http_client
-            .get(original_url)
+        // Retry with PAYMENT-SIGNATURE header (use same method as original request)
+        let mut retry_req2 = match method {
+            "POST" => http_client.post(original_url),
+            "PUT" => http_client.put(original_url),
+            "PATCH" => http_client.patch(original_url),
+            "DELETE" => http_client.delete(original_url),
+            _ => http_client.get(original_url),
+        };
+        retry_req2 = retry_req2
             .header("PAYMENT-SIGNATURE", &payment_b64)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(30));
+        if let Some(body) = request_body {
+            retry_req2 = retry_req2.header("Content-Type", "application/json").body(body.to_string());
+        }
+        let final_response = retry_req2
             .send()
             .await
             .map_err(|e| MazeError::RpcError(format!("Failed to fetch paid content: {}", e)))?;
