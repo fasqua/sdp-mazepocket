@@ -252,7 +252,7 @@ fn is_solana_network(network: &str) -> bool {
 }
 
 /// Identify stablecoin from asset identifier.
-fn identify_stablecoin(asset: &str) -> Result<(String, String)> {
+pub fn identify_stablecoin(asset: &str) -> Result<(String, String)> {
     let asset_upper = asset.trim().to_uppercase();
 
     if asset.trim() == USDC_MINT {
@@ -661,7 +661,7 @@ pub async fn execute_x402_payment(
 }
 
 /// Send a direct payment transaction (no facilitator) with retries
-async fn send_direct_payment(
+pub async fn send_direct_payment(
     rpc_client: &solana_client::rpc_client::RpcClient,
     tx: &Transaction,
 ) -> Result<String> {

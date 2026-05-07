@@ -9,18 +9,21 @@ use tracing::info;
 
 use crate::error::{MazeError, Result};
 use crate::x402;
+use crate::mpp;
 
 /// Detected payment protocol
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum PaymentProtocol {
     X402,
+    MPP,
 }
 
 impl std::fmt::Display for PaymentProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PaymentProtocol::X402 => write!(f, "x402"),
+            PaymentProtocol::MPP => write!(f, "mpp"),
         }
     }
 }
@@ -131,11 +134,50 @@ pub async fn pay(
         ));
     }
 
-    // === STEP 2: PARSE x402 CHALLENGE ===
+    // === STEP 2: DETECT PROTOCOL (MPP or x402) ===
     let headers = probe_response.headers().clone();
     let body = probe_response.text().await
         .map_err(|e| MazeError::RpcError(format!("Failed to read 402 response: {}", e)))?;
 
+    // Check for MPP protocol first (WWW-Authenticate: Payment header)
+    if let Some(www_auth) = headers.get("www-authenticate")
+        .or_else(|| headers.get("WWW-Authenticate"))
+    {
+        let auth_str = www_auth.to_str()
+            .map_err(|_| MazeError::InvalidParameters("Invalid WWW-Authenticate header encoding".into()))?;
+
+        if auth_str.starts_with("Payment ") || auth_str.contains("method=") {
+            info!("KausaPay: detected MPP protocol");
+            match mpp::parse_mpp_challenge(auth_str) {
+                Ok(mpp_challenge) => {
+                    info!("KausaPay MPP: {} {} to {} ({})",
+                        mpp_challenge.request.amount, mpp_challenge.request.currency,
+                        &mpp_challenge.request.recipient[..16.min(mpp_challenge.request.recipient.len())],
+                        mpp_challenge.description);
+
+                    let result = mpp::execute_mpp_payment(
+                        http_client, rpc_client, pocket_keypair,
+                        &mpp_challenge, max_amount_usdc, url, &method_upper, request_body,
+                    ).await?;
+
+                    return Ok(PaymentResult {
+                        success: result.success,
+                        response_body: result.response_body,
+                        payment_signature: result.tx_signature,
+                        amount_paid_usdc: result.amount_paid,
+                        protocol_used: PaymentProtocol::MPP,
+                        token_symbol: result.token_symbol,
+                        error: result.error,
+                    });
+                }
+                Err(e) => {
+                    info!("KausaPay: MPP unsupported ({}), falling back to x402", e);
+                }
+            }
+        }
+    }
+
+    // Fallback to x402 protocol (payment-required header)
     let challenge_data = if let Some(header_val) = headers.get("payment-required")
         .or_else(|| headers.get("PAYMENT-REQUIRED"))
         .or_else(|| headers.get("Payment-Required"))

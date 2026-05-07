@@ -5,6 +5,7 @@
 //! that can be used freely in any dApp.
 
 pub mod x402;
+pub mod mpp;
 pub mod payment_router;
 pub mod core;
 pub mod relay;
