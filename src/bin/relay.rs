@@ -33,7 +33,7 @@ use sdp_mazepocket::{
     core::{lamports_to_sol, sol_to_lamports, generate_pocket_id},
     relay::{
         PocketDatabase, MazeGenerator, MazeGraph, MazeNode,
-        database::{MazePocket, PocketStatus, FundingRequest, P2pTransfer, Contact, MazePreferences},
+        database::{MazePocket, PocketStatus, FundingRequest, P2pTransfer, Contact, MazePreferences, GateEndpoint},
     },
     error::{MazeError, Result},
     swap::{self, SwapQuoteRequest, SwapQuoteResponse, SwapResult},
@@ -4864,6 +4864,431 @@ async fn kausa_pay_handler(
     }
 }
 
+// ============ KAUSAGATE PROXY ============
+
+/// Proxy request from Pay.sh gateway to upstream user API
+async fn gate_proxy(
+    State(state): State<Arc<AppState>>,
+    Path(endpoint_id): Path<String>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    // Lookup endpoint in database
+    let endpoint = match state.db.list_all_gate_endpoints() {
+        Ok(endpoints) => endpoints.into_iter().find(|ep| ep.id == endpoint_id),
+        Err(e) => {
+            error!("KausaGate proxy: database error: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Internal server error"
+            }))).into_response();
+        }
+    };
+
+    let endpoint = match endpoint {
+        Some(ep) => ep,
+        None => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "error": "Endpoint not found"
+            }))).into_response();
+        }
+    };
+
+    if endpoint.status != "active" {
+        return (StatusCode::GONE, Json(serde_json::json!({
+            "error": "Endpoint is paused"
+        }))).into_response();
+    }
+
+    info!("KausaGate proxy: {} -> {}", endpoint_id, endpoint.endpoint_url);
+
+    // Extract method and body from incoming request
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("KausaGate proxy: failed to read request body: {}", e);
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "Failed to read request body"
+            }))).into_response();
+        }
+    };
+
+    // Build upstream request
+    let mut upstream_req = state.http_client.request(
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST),
+        &endpoint.endpoint_url,
+    );
+
+    // Forward relevant headers (skip host and connection headers)
+    for (key, value) in headers.iter() {
+        let key_str = key.as_str().to_lowercase();
+        if key_str != "host" && key_str != "connection" && key_str != "transfer-encoding"
+            && !key_str.starts_with("x-pay-") {
+            if let Ok(v) = value.to_str() {
+                upstream_req = upstream_req.header(key.as_str(), v);
+            }
+        }
+    }
+
+    // Add body if present
+    if !body_bytes.is_empty() {
+        upstream_req = upstream_req.body(body_bytes.to_vec());
+    }
+
+    // Execute upstream request
+    let upstream_resp = match upstream_req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("KausaGate proxy: upstream request failed: {}", e);
+            return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": format!("Upstream request failed: {}", e)
+            }))).into_response();
+        }
+    };
+
+    // Build response
+    let status = StatusCode::from_u16(upstream_resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    let resp_headers = upstream_resp.headers().clone();
+    let resp_body = match upstream_resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("KausaGate proxy: failed to read upstream response: {}", e);
+            return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": "Failed to read upstream response"
+            }))).into_response();
+        }
+    };
+
+    let mut response = axum::response::Response::builder()
+        .status(status);
+
+    // Forward upstream response headers
+    for (key, value) in resp_headers.iter() {
+        let key_str = key.as_str().to_lowercase();
+        if key_str != "transfer-encoding" && key_str != "connection" {
+            response = response.header(key.as_str(), value.as_bytes());
+        }
+    }
+
+    match response.body(axum::body::Body::from(resp_body.to_vec())) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("KausaGate proxy: failed to build response: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to build response"
+            }))).into_response()
+        }
+    }
+}
+
+/// Regenerate KausaGate YAML and restart gateway service
+fn regenerate_gate_yaml() {
+    std::thread::spawn(|| {
+        // Run YAML generator
+        match std::process::Command::new("python3")
+            .arg("/root/sdp-mazepocket/generate_gate_yaml.py")
+            .output()
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    info!("KausaGate: YAML regenerated");
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    error!("KausaGate: YAML generation failed: {}", stderr);
+                    return;
+                }
+            }
+            Err(e) => {
+                error!("KausaGate: failed to run YAML generator: {}", e);
+                return;
+            }
+        }
+
+        // Restart gateway service
+        match std::process::Command::new("systemctl")
+            .args(&["restart", "kausalayer-gate"])
+            .output()
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    info!("KausaGate: gateway service restarted");
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    error!("KausaGate: gateway restart failed: {}", stderr);
+                }
+            }
+            Err(e) => {
+                error!("KausaGate: failed to restart gateway: {}", e);
+            }
+        }
+    });
+}
+
+// ============ KAUSAGATE HANDLERS ============
+
+#[derive(Debug, Deserialize)]
+struct GateRegisterRequest {
+    meta_address: String,
+    endpoint_url: String,
+    method: Option<String>,
+    description: String,
+    price_usdc: f64,
+    category: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GateRegisterResponse {
+    success: bool,
+    endpoint_id: Option<String>,
+    pocket_id: String,
+    pocket_address: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GateEndpointInfo {
+    id: String,
+    endpoint_url: String,
+    method: String,
+    description: String,
+    price_usdc: f64,
+    category: String,
+    status: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct GateListResponse {
+    success: bool,
+    pocket_id: String,
+    endpoints: Vec<GateEndpointInfo>,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GateListAllResponse {
+    success: bool,
+    endpoints: Vec<GateEndpointInfoFull>,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GateEndpointInfoFull {
+    id: String,
+    pocket_id: String,
+    pocket_address: String,
+    endpoint_url: String,
+    description: String,
+    price_usdc: f64,
+    category: String,
+    status: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GateDeleteRequest {
+    meta_address: String,
+    endpoint_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GateDeleteResponse {
+    success: bool,
+    message: String,
+}
+
+/// Register an endpoint to a pocket via KausaGate
+async fn gate_register(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<GateRegisterRequest>,
+) -> std::result::Result<Json<GateRegisterResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Verify pocket ownership
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(GateRegisterResponse {
+            success: false,
+            endpoint_id: None,
+            pocket_id,
+            pocket_address: String::new(),
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    // Validate URL format
+    if !req.endpoint_url.starts_with("https://") {
+        return Ok(Json(GateRegisterResponse {
+            success: false,
+            endpoint_id: None,
+            pocket_id,
+            pocket_address: String::new(),
+            error: Some("Endpoint URL must start with https://".to_string()),
+        }));
+    }
+
+    // Validate price
+    if req.price_usdc <= 0.0 {
+        return Ok(Json(GateRegisterResponse {
+            success: false,
+            endpoint_id: None,
+            pocket_id,
+            pocket_address: String::new(),
+            error: Some("Price must be greater than 0".to_string()),
+        }));
+    }
+
+    // Validate category
+    let valid_categories = ["ai_ml", "search", "maps", "data", "compute", "productivity"];
+    if !valid_categories.contains(&req.category.as_str()) {
+        return Ok(Json(GateRegisterResponse {
+            success: false,
+            endpoint_id: None,
+            pocket_id,
+            pocket_address: String::new(),
+            error: Some(format!("Invalid category. Must be one of: {}", valid_categories.join(", "))),
+        }));
+    }
+
+    // Check if endpoint already registered
+    if state.db.is_endpoint_registered(&req.endpoint_url)? {
+        return Ok(Json(GateRegisterResponse {
+            success: false,
+            endpoint_id: None,
+            pocket_id,
+            pocket_address: String::new(),
+            error: Some("Endpoint URL already registered".to_string()),
+        }));
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let endpoint_id = format!("gate_{}", &generate_pocket_id()[7..]);
+
+    let gate_endpoint = GateEndpoint {
+        id: endpoint_id.clone(),
+        pocket_id: pocket_id.clone(),
+        pocket_address: pocket.stealth_pubkey.clone(),
+        owner_meta_hash,
+        endpoint_url: req.endpoint_url.clone(),
+        method: req.method.clone().unwrap_or_else(|| "POST".to_string()),
+        description: req.description,
+        price_usdc: req.price_usdc,
+        category: req.category,
+        status: "active".to_string(),
+        created_at: now,
+    };
+
+    state.db.create_gate_endpoint(&gate_endpoint)?;
+
+    info!("KausaGate: endpoint {} registered to pocket {}", req.endpoint_url, pocket_id);
+
+    // Auto-regenerate YAML and restart gateway
+    regenerate_gate_yaml();
+
+    Ok(Json(GateRegisterResponse {
+        success: true,
+        endpoint_id: Some(endpoint_id),
+        pocket_id,
+        pocket_address: pocket.stealth_pubkey,
+        error: None,
+    }))
+}
+
+/// List endpoints registered to a pocket
+async fn gate_list_by_pocket(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Query(query): Query<ListPocketsQuery>,
+) -> std::result::Result<Json<GateListResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    let endpoints = state.db.list_gate_endpoints_by_pocket(&pocket_id, &owner_meta_hash)?;
+
+    let endpoint_infos: Vec<GateEndpointInfo> = endpoints.iter().map(|ep| GateEndpointInfo {
+        id: ep.id.clone(),
+        endpoint_url: ep.endpoint_url.clone(),
+        method: ep.method.clone(),
+        description: ep.description.clone(),
+        price_usdc: ep.price_usdc,
+        category: ep.category.clone(),
+        status: ep.status.clone(),
+        created_at: ep.created_at,
+    }).collect();
+
+    let count = endpoint_infos.len();
+
+    Ok(Json(GateListResponse {
+        success: true,
+        pocket_id,
+        endpoints: endpoint_infos,
+        count,
+    }))
+}
+
+/// List all gate endpoints (admin)
+async fn gate_list_all(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<GateListAllResponse>, AppError> {
+    let endpoints = state.db.list_all_gate_endpoints()?;
+
+    let endpoint_infos: Vec<GateEndpointInfoFull> = endpoints.iter().map(|ep| GateEndpointInfoFull {
+        id: ep.id.clone(),
+        pocket_id: ep.pocket_id.clone(),
+        pocket_address: ep.pocket_address.clone(),
+        endpoint_url: ep.endpoint_url.clone(),
+        description: ep.description.clone(),
+        price_usdc: ep.price_usdc,
+        category: ep.category.clone(),
+        status: ep.status.clone(),
+        created_at: ep.created_at,
+    }).collect();
+
+    let count = endpoint_infos.len();
+
+    Ok(Json(GateListAllResponse {
+        success: true,
+        endpoints: endpoint_infos,
+        count,
+    }))
+}
+
+/// Delete a gate endpoint
+async fn gate_delete(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<GateDeleteRequest>,
+) -> std::result::Result<Json<GateDeleteResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Verify pocket ownership
+    let _pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let deleted = state.db.delete_gate_endpoint(&req.endpoint_url, &owner_meta_hash)?;
+
+    if deleted {
+        info!("KausaGate: endpoint {} deleted from pocket {}", req.endpoint_url, pocket_id);
+
+        // Auto-regenerate YAML and restart gateway
+        regenerate_gate_yaml();
+
+        Ok(Json(GateDeleteResponse {
+            success: true,
+            message: format!("Endpoint {} removed", req.endpoint_url),
+        }))
+    } else {
+        Ok(Json(GateDeleteResponse {
+            success: false,
+            message: "Endpoint not found or access denied".to_string(),
+        }))
+    }
+}
+
 // ============ MAIN ============
 
 #[tokio::main]
@@ -4957,6 +5382,11 @@ async fn main() {
         .route("/preferences/maze", post(get_maze_preferences_handler))
         .route("/preferences/maze/save", post(save_maze_preferences_handler))
         .route("/pocket/:pocket_id/pay", post(kausa_pay_handler))
+        .route("/pocket/:pocket_id/gate/register", post(gate_register))
+        .route("/pocket/:pocket_id/gate/endpoints", get(gate_list_by_pocket))
+        .route("/pocket/:pocket_id/gate/endpoint", axum::routing::delete(gate_delete))
+        .route("/gate/endpoints", get(gate_list_all))
+        .route("/gate/proxy/:endpoint_id", post(gate_proxy).get(gate_proxy))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)

@@ -177,6 +177,21 @@ pub struct MazePreferences {
     pub delay_scope: String,
     pub updated_at: i64,
 }
+/// KausaGate endpoint registration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateEndpoint {
+    pub id: String,
+    pub pocket_id: String,
+    pub pocket_address: String,
+    pub owner_meta_hash: String,
+    pub endpoint_url: String,
+    pub method: String,
+    pub description: String,
+    pub price_usdc: f64,
+    pub category: String,
+    pub status: String,
+    pub created_at: i64,
+}
 /// Database wrapper with Argon2id + AES-256-GCM encryption
 pub struct PocketDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -495,6 +510,43 @@ impl PocketDatabase {
             )"#,
             [],
         )?;
+
+        // KausaGate endpoints table
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS gate_endpoints (
+                id TEXT PRIMARY KEY,
+                pocket_id TEXT NOT NULL,
+                pocket_address TEXT NOT NULL,
+                owner_meta_hash TEXT NOT NULL,
+                endpoint_url TEXT NOT NULL UNIQUE,
+                method TEXT NOT NULL DEFAULT 'POST',
+                description TEXT NOT NULL,
+                price_usdc REAL NOT NULL,
+                category TEXT NOT NULL,
+                status TEXT DEFAULT 'active',
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (pocket_id) REFERENCES maze_pockets(id)
+            )"#,
+            [],
+        )?;
+
+        // KausaGate indexes
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gate_pocket ON gate_endpoints(pocket_id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gate_owner ON gate_endpoints(owner_meta_hash)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gate_url ON gate_endpoints(endpoint_url)",
+            [],
+        )?;
+
+        // Migration: add method column to gate_endpoints
+        let _ = conn.execute("ALTER TABLE gate_endpoints ADD COLUMN method TEXT DEFAULT 'POST'", []);
+
         Ok(())
     }
 
@@ -2041,6 +2093,123 @@ impl PocketDatabase {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(MazeError::DatabaseError(e.to_string())),
         }
+    }
+
+
+    // ============ KAUSAGATE OPERATIONS ============
+
+    /// Register an endpoint to a pocket
+    pub fn create_gate_endpoint(&self, endpoint: &GateEndpoint) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO gate_endpoints
+               (id, pocket_id, pocket_address, owner_meta_hash, endpoint_url,
+                      method, description, price_usdc, category, status, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+            params![
+                endpoint.id,
+                endpoint.pocket_id,
+                endpoint.pocket_address,
+                endpoint.owner_meta_hash,
+                endpoint.endpoint_url,
+                endpoint.method,
+                endpoint.description,
+                endpoint.price_usdc,
+                endpoint.category,
+                endpoint.status,
+                endpoint.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List endpoints registered to a specific pocket
+    pub fn list_gate_endpoints_by_pocket(&self, pocket_id: &str, owner_meta_hash: &str) -> Result<Vec<GateEndpoint>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, pocket_id, pocket_address, owner_meta_hash, endpoint_url,
+                      method, description, price_usdc, category, status, created_at
+               FROM gate_endpoints
+               WHERE pocket_id = ?1 AND owner_meta_hash = ?2 AND status != 'deleted'
+               ORDER BY created_at DESC"#
+        )?;
+
+        let endpoints = stmt.query_map(params![pocket_id, owner_meta_hash], |row| {
+            Ok(GateEndpoint {
+                id: row.get(0)?,
+                pocket_id: row.get(1)?,
+                pocket_address: row.get(2)?,
+                owner_meta_hash: row.get(3)?,
+                endpoint_url: row.get(4)?,
+                method: row.get(5)?,
+                description: row.get(6)?,
+                price_usdc: row.get(7)?,
+                category: row.get(8)?,
+                status: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for ep in endpoints {
+            result.push(ep.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
+        }
+        Ok(result)
+    }
+
+    /// List all active gate endpoints (for YAML generation / admin)
+    pub fn list_all_gate_endpoints(&self) -> Result<Vec<GateEndpoint>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, pocket_id, pocket_address, owner_meta_hash, endpoint_url,
+                      method, description, price_usdc, category, status, created_at
+               FROM gate_endpoints
+               WHERE status = 'active'
+               ORDER BY created_at DESC"#
+        )?;
+
+        let endpoints = stmt.query_map([], |row| {
+            Ok(GateEndpoint {
+                id: row.get(0)?,
+                pocket_id: row.get(1)?,
+                pocket_address: row.get(2)?,
+                owner_meta_hash: row.get(3)?,
+                endpoint_url: row.get(4)?,
+                method: row.get(5)?,
+                description: row.get(6)?,
+                price_usdc: row.get(7)?,
+                category: row.get(8)?,
+                status: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for ep in endpoints {
+            result.push(ep.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
+        }
+        Ok(result)
+    }
+
+    /// Delete a gate endpoint (soft delete)
+    pub fn delete_gate_endpoint(&self, endpoint_url: &str, owner_meta_hash: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM gate_endpoints WHERE endpoint_url = ?1 AND owner_meta_hash = ?2",
+            params![endpoint_url, owner_meta_hash],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Check if an endpoint URL is already registered (across all users)
+    pub fn is_endpoint_registered(&self, endpoint_url: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM gate_endpoints WHERE endpoint_url = ?1 AND status = 'active'",
+            params![endpoint_url],
+            |row| row.get(0)
+        ).unwrap_or(0);
+        Ok(count > 0)
     }
 }
 impl Drop for PocketDatabase {
