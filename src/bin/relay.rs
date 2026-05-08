@@ -28,7 +28,7 @@ use tracing::{info, error, warn};
 use sdp_mazepocket::{
     config::{
         Config, MazeParameters, MergeStrategy, DelayPattern, DelayScope,
-        TX_FEE_LAMPORTS, FEE_PERCENT, MIN_AMOUNT_SOL, EXPIRY_SECONDS,
+        TX_FEE_LAMPORTS, FEE_PERCENT, MIN_AMOUNT_SOL, EXPIRY_SECONDS, FEE_WALLET, PROTOCOL_FEE_BPS,
     },
     core::{lamports_to_sol, sol_to_lamports, generate_pocket_id},
     relay::{
@@ -1624,7 +1624,7 @@ async fn execute_node(
     };
     let num_outputs = outputs.len();
     let total_fees = TX_FEE_LAMPORTS * num_outputs as u64;
-    let distributable = balance.saturating_sub(total_fees);
+    let mut distributable = balance.saturating_sub(total_fees);
 
     if distributable == 0 {
         return Err(MazeError::InsufficientFunds {
@@ -1632,6 +1632,73 @@ async fn execute_node(
             available: balance,
         });
     }
+
+    // === PROTOCOL FEE DEDUCTION (pool node only) ===
+    let mut protocol_fee_deducted: u64 = 0;
+    if let Some(ref pool_addr) = state.config.pool_address {
+        if node.address == *pool_addr {
+            let fee_amount = distributable * PROTOCOL_FEE_BPS / 10_000;
+            if fee_amount > TX_FEE_LAMPORTS * 2 {
+                let fee_wallet_pubkey = match Pubkey::from_str(FEE_WALLET) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        warn!("Invalid FEE_WALLET address, skipping fee: {}", e);
+                        Pubkey::default()
+                    }
+                };
+                if fee_wallet_pubkey != Pubkey::default() {
+                    let fee_result: std::result::Result<(), String> = async {
+                        let blockhash = state.rpc.get_latest_blockhash()
+                            .map_err(|e| e.to_string())?;
+                        let fee_ix = system_instruction::transfer(
+                            &keypair.pubkey(),
+                            &fee_wallet_pubkey,
+                            fee_amount,
+                        );
+                        let fee_tx = Transaction::new_signed_with_payer(
+                            &[fee_ix],
+                            Some(&keypair.pubkey()),
+                            &[&keypair],
+                            blockhash,
+                        );
+                        let config = RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            preflight_commitment: None,
+                            encoding: None,
+                            max_retries: Some(3),
+                            min_context_slot: None,
+                        };
+                        let sig = state.rpc.send_transaction_with_config(&fee_tx, config)
+                            .map_err(|e| e.to_string())?;
+                        for _ in 0..30 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+                                if result.is_ok() {
+                                    info!("Protocol fee collected: {} lamports, tx: {}", fee_amount, sig);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err("Fee TX confirmation timeout".to_string())
+                    }.await;
+
+                    match fee_result {
+                        Ok(()) => {
+                            distributable = distributable - fee_amount - TX_FEE_LAMPORTS;
+                            protocol_fee_deducted = fee_amount + TX_FEE_LAMPORTS;
+                            info!("Protocol fee deducted: {} lamports (fee) + {} lamports (gas)", fee_amount, TX_FEE_LAMPORTS);
+                        }
+                        Err(e) => {
+                            warn!("Protocol fee collection failed, skipping: {}", e);
+                        }
+                    }
+                }
+            } else {
+                info!("Protocol fee too small ({} lamports), skipping", fee_amount);
+            }
+        }
+    }
+
 
     // Calculate all transfer amounts DETERMINISTICALLY upfront
     let base_amount = distributable / num_outputs as u64;
@@ -1646,12 +1713,12 @@ async fn execute_node(
         }
     }
 
-    // Verify math
+    // Verify math (account for protocol fee if deducted)
     let total_to_send: u64 = amounts.iter().sum();
-    if total_to_send + total_fees != balance {
-        error!("Amount calculation mismatch: {} + {} != {}", total_to_send, total_fees, balance);
+    if total_to_send + total_fees + protocol_fee_deducted != balance {
+        error!("Amount calculation mismatch: {} + {} + {} != {}", total_to_send, total_fees, protocol_fee_deducted, balance);
         return Err(MazeError::InsufficientFunds {
-            required: total_to_send + total_fees,
+            required: total_to_send + total_fees + protocol_fee_deducted,
             available: balance,
         });
     }
@@ -1968,7 +2035,7 @@ async fn execute_sweep_node(
     };
     let num_outputs = outputs.len();
     let total_fees = TX_FEE_LAMPORTS * num_outputs as u64;
-    let distributable = balance.saturating_sub(total_fees);
+    let mut distributable = balance.saturating_sub(total_fees);
     
     if distributable == 0 {
         return Err(MazeError::InsufficientFunds {
@@ -1976,6 +2043,73 @@ async fn execute_sweep_node(
             available: balance,
         });
     }
+
+    // === PROTOCOL FEE DEDUCTION (pool node only) ===
+    let mut protocol_fee_deducted: u64 = 0;
+    if let Some(ref pool_addr) = state.config.pool_address {
+        if node.address == *pool_addr {
+            let fee_amount = distributable * PROTOCOL_FEE_BPS / 10_000;
+            if fee_amount > TX_FEE_LAMPORTS * 2 {
+                let fee_wallet_pubkey = match Pubkey::from_str(FEE_WALLET) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        warn!("Invalid FEE_WALLET address, skipping fee: {}", e);
+                        Pubkey::default()
+                    }
+                };
+                if fee_wallet_pubkey != Pubkey::default() {
+                    let fee_result: std::result::Result<(), String> = async {
+                        let blockhash = state.rpc.get_latest_blockhash()
+                            .map_err(|e| e.to_string())?;
+                        let fee_ix = system_instruction::transfer(
+                            &keypair.pubkey(),
+                            &fee_wallet_pubkey,
+                            fee_amount,
+                        );
+                        let fee_tx = Transaction::new_signed_with_payer(
+                            &[fee_ix],
+                            Some(&keypair.pubkey()),
+                            &[&keypair],
+                            blockhash,
+                        );
+                        let config = RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            preflight_commitment: None,
+                            encoding: None,
+                            max_retries: Some(3),
+                            min_context_slot: None,
+                        };
+                        let sig = state.rpc.send_transaction_with_config(&fee_tx, config)
+                            .map_err(|e| e.to_string())?;
+                        for _ in 0..30 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+                                if result.is_ok() {
+                                    info!("Protocol fee collected: {} lamports, tx: {}", fee_amount, sig);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err("Fee TX confirmation timeout".to_string())
+                    }.await;
+
+                    match fee_result {
+                        Ok(()) => {
+                            distributable = distributable - fee_amount - TX_FEE_LAMPORTS;
+                            protocol_fee_deducted = fee_amount + TX_FEE_LAMPORTS;
+                            info!("Protocol fee deducted: {} lamports (fee) + {} lamports (gas)", fee_amount, TX_FEE_LAMPORTS);
+                        }
+                        Err(e) => {
+                            warn!("Protocol fee collection failed, skipping: {}", e);
+                        }
+                    }
+                }
+            } else {
+                info!("Protocol fee too small ({} lamports), skipping", fee_amount);
+            }
+        }
+    }
+
     
     let base_amount = distributable / num_outputs as u64;
     let remainder = distributable % num_outputs as u64;
@@ -1989,12 +2123,12 @@ async fn execute_sweep_node(
         }
     }
 
-    // Verify math: total_amounts + total_fees == initial_balance
+    // Verify math: total_amounts + total_fees + protocol_fee == initial_balance
     let total_to_send: u64 = amounts.iter().sum();
-    if total_to_send + total_fees != balance {
-        error!("Sweep amount calculation mismatch: {} + {} != {}", total_to_send, total_fees, balance);
+    if total_to_send + total_fees + protocol_fee_deducted != balance {
+        error!("Sweep amount calculation mismatch: {} + {} + {} != {}", total_to_send, total_fees, protocol_fee_deducted, balance);
         return Err(MazeError::InsufficientFunds {
-            required: total_to_send + total_fees,
+            required: total_to_send + total_fees + protocol_fee_deducted,
             available: balance,
         });
     }
@@ -2735,7 +2869,7 @@ async fn execute_p2p_node(
     };
     let num_outputs = outputs.len();
     let total_fees = TX_FEE_LAMPORTS * num_outputs as u64;
-    let distributable = balance.saturating_sub(total_fees);
+    let mut distributable = balance.saturating_sub(total_fees);
 
     if distributable == 0 {
         return Err(MazeError::InsufficientFunds {
@@ -2743,6 +2877,73 @@ async fn execute_p2p_node(
             available: balance,
         });
     }
+
+    // === PROTOCOL FEE DEDUCTION (pool node only) ===
+    let mut protocol_fee_deducted: u64 = 0;
+    if let Some(ref pool_addr) = state.config.pool_address {
+        if node.address == *pool_addr {
+            let fee_amount = distributable * PROTOCOL_FEE_BPS / 10_000;
+            if fee_amount > TX_FEE_LAMPORTS * 2 {
+                let fee_wallet_pubkey = match Pubkey::from_str(FEE_WALLET) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        warn!("Invalid FEE_WALLET address, skipping fee: {}", e);
+                        Pubkey::default()
+                    }
+                };
+                if fee_wallet_pubkey != Pubkey::default() {
+                    let fee_result: std::result::Result<(), String> = async {
+                        let blockhash = state.rpc.get_latest_blockhash()
+                            .map_err(|e| e.to_string())?;
+                        let fee_ix = system_instruction::transfer(
+                            &keypair.pubkey(),
+                            &fee_wallet_pubkey,
+                            fee_amount,
+                        );
+                        let fee_tx = Transaction::new_signed_with_payer(
+                            &[fee_ix],
+                            Some(&keypair.pubkey()),
+                            &[&keypair],
+                            blockhash,
+                        );
+                        let config = RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            preflight_commitment: None,
+                            encoding: None,
+                            max_retries: Some(3),
+                            min_context_slot: None,
+                        };
+                        let sig = state.rpc.send_transaction_with_config(&fee_tx, config)
+                            .map_err(|e| e.to_string())?;
+                        for _ in 0..30 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+                                if result.is_ok() {
+                                    info!("Protocol fee collected: {} lamports, tx: {}", fee_amount, sig);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err("Fee TX confirmation timeout".to_string())
+                    }.await;
+
+                    match fee_result {
+                        Ok(()) => {
+                            distributable = distributable - fee_amount - TX_FEE_LAMPORTS;
+                            protocol_fee_deducted = fee_amount + TX_FEE_LAMPORTS;
+                            info!("Protocol fee deducted: {} lamports (fee) + {} lamports (gas)", fee_amount, TX_FEE_LAMPORTS);
+                        }
+                        Err(e) => {
+                            warn!("Protocol fee collection failed, skipping: {}", e);
+                        }
+                    }
+                }
+            } else {
+                info!("Protocol fee too small ({} lamports), skipping", fee_amount);
+            }
+        }
+    }
+
 
     // Calculate all transfer amounts DETERMINISTICALLY upfront
     let base_amount = distributable / num_outputs as u64;
@@ -2757,12 +2958,12 @@ async fn execute_p2p_node(
         }
     }
 
-    // Verify math
+    // Verify math (account for protocol fee if deducted)
     let total_to_send: u64 = amounts.iter().sum();
-    if total_to_send + total_fees != balance {
-        error!("P2P amount calculation mismatch: {} + {} != {}", total_to_send, total_fees, balance);
+    if total_to_send + total_fees + protocol_fee_deducted != balance {
+        error!("P2P amount calculation mismatch: {} + {} + {} != {}", total_to_send, total_fees, protocol_fee_deducted, balance);
         return Err(MazeError::InsufficientFunds {
-            required: total_to_send + total_fees,
+            required: total_to_send + total_fees + protocol_fee_deducted,
             available: balance,
         });
     }

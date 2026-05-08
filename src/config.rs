@@ -8,6 +8,9 @@ pub const FEE_PERCENT: f64 = 0.5;
 /// Transaction fee per TX in lamports
 pub const TX_FEE_LAMPORTS: u64 = 5_000;
 
+/// Protocol fee in basis points (30 bps = 0.3%)
+pub const PROTOCOL_FEE_BPS: u64 = 30;
+
 /// Minimum transfer amount in SOL
 pub const MIN_AMOUNT_SOL: f64 = 0.01;
 
