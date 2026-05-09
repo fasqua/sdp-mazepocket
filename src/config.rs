@@ -17,6 +17,9 @@ pub const MIN_AMOUNT_SOL: f64 = 0.01;
 /// Request expiry in seconds (30 minutes)
 pub const EXPIRY_SECONDS: i64 = 1800;
 
+/// Send link expiry in seconds (7 days)
+pub const SEND_LINK_EXPIRY_SECONDS: i64 = 604800;
+
 /// Fee wallet address
 pub const FEE_WALLET: &str = "Nd5yLUNpZwqQ9GzMt1TmbwBNfR5EYpjrNWuHbQh9SDP";
 

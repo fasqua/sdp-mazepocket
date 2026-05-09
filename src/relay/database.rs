@@ -193,6 +193,27 @@ pub struct GateEndpoint {
     pub status: String,
     pub created_at: i64,
 }
+/// Send link record (KausaLink)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendLink {
+    pub id: String,
+    pub sender_pocket_id: String,
+    pub owner_meta_hash: String,
+    pub amount_lamports: u64,
+    pub label: Option<String>,
+    pub escrow_address: String,
+    pub escrow_keypair_encrypted: Vec<u8>,
+    pub secret_hash: String,
+    pub status: String,
+    pub expires_at: i64,
+    pub claimed_by_meta_hash: Option<String>,
+    pub claimed_pocket_id: Option<String>,
+    pub claimed_at: Option<i64>,
+    pub refund_tx_signature: Option<String>,
+    pub funding_maze_json: Option<String>,
+    pub claim_maze_json: Option<String>,
+    pub created_at: i64,
+}
 /// Database wrapper with Argon2id + AES-256-GCM encryption
 pub struct PocketDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -576,6 +597,41 @@ impl PocketDatabase {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_txlog_type ON transaction_log(tx_type)",
+            [],
+        )?;
+
+        // Send links table (KausaLink)
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS send_links (
+                id TEXT PRIMARY KEY,
+                sender_pocket_id TEXT NOT NULL,
+                owner_meta_hash TEXT NOT NULL,
+                amount_lamports INTEGER NOT NULL,
+                label TEXT,
+                escrow_address TEXT NOT NULL,
+                escrow_keypair_encrypted BLOB NOT NULL,
+                secret_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                expires_at INTEGER NOT NULL,
+                claimed_by_meta_hash TEXT,
+                claimed_pocket_id TEXT,
+                claimed_at INTEGER,
+                refund_tx_signature TEXT,
+                funding_maze_json TEXT,
+                claim_maze_json TEXT,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (sender_pocket_id) REFERENCES maze_pockets(id)
+            )"#,
+            [],
+        )?;
+
+        // Send links indexes
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_send_links_owner ON send_links(owner_meta_hash)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_send_links_status ON send_links(status)",
             [],
         )?;
 
@@ -2439,7 +2495,206 @@ impl PocketDatabase {
 
         Ok(all_entries)
     }
+
+
+    // ============ SEND LINK OPERATIONS (KausaLink) ============
+
+    /// Create a send link
+    pub fn create_send_link(&self, link: &SendLink) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO send_links
+               (id, sender_pocket_id, owner_meta_hash, amount_lamports, label,
+                escrow_address, escrow_keypair_encrypted, secret_hash, status,
+                expires_at, funding_maze_json, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+            params![
+                link.id,
+                link.sender_pocket_id,
+                link.owner_meta_hash,
+                link.amount_lamports,
+                link.label,
+                link.escrow_address,
+                link.escrow_keypair_encrypted,
+                link.secret_hash,
+                link.status,
+                link.expires_at,
+                link.funding_maze_json,
+                link.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get send link by ID
+    pub fn get_send_link(&self, link_id: &str) -> Result<Option<SendLink>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, sender_pocket_id, owner_meta_hash, amount_lamports, label,
+                      escrow_address, escrow_keypair_encrypted, secret_hash, status,
+                      expires_at, claimed_by_meta_hash, claimed_pocket_id, claimed_at,
+                      refund_tx_signature, funding_maze_json, claim_maze_json, created_at
+               FROM send_links WHERE id = ?1"#
+        )?;
+
+        let result = stmt.query_row(params![link_id], |row| {
+            Ok(SendLink {
+                id: row.get(0)?,
+                sender_pocket_id: row.get(1)?,
+                owner_meta_hash: row.get(2)?,
+                amount_lamports: row.get::<_, i64>(3)? as u64,
+                label: row.get(4)?,
+                escrow_address: row.get(5)?,
+                escrow_keypair_encrypted: row.get(6)?,
+                secret_hash: row.get(7)?,
+                status: row.get(8)?,
+                expires_at: row.get(9)?,
+                claimed_by_meta_hash: row.get(10)?,
+                claimed_pocket_id: row.get(11)?,
+                claimed_at: row.get(12)?,
+                refund_tx_signature: row.get(13)?,
+                funding_maze_json: row.get(14)?,
+                claim_maze_json: row.get(15)?,
+                created_at: row.get(16)?,
+            })
+        });
+
+        match result {
+            Ok(link) => Ok(Some(link)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
+    }
+
+    /// List send links for an owner
+    pub fn list_send_links(&self, owner_meta_hash: &str) -> Result<Vec<SendLink>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, sender_pocket_id, owner_meta_hash, amount_lamports, label,
+                      escrow_address, escrow_keypair_encrypted, secret_hash, status,
+                      expires_at, claimed_by_meta_hash, claimed_pocket_id, claimed_at,
+                      refund_tx_signature, funding_maze_json, claim_maze_json, created_at
+               FROM send_links WHERE owner_meta_hash = ?1
+               ORDER BY created_at DESC"#
+        )?;
+
+        let links = stmt.query_map(params![owner_meta_hash], |row| {
+            Ok(SendLink {
+                id: row.get(0)?,
+                sender_pocket_id: row.get(1)?,
+                owner_meta_hash: row.get(2)?,
+                amount_lamports: row.get::<_, i64>(3)? as u64,
+                label: row.get(4)?,
+                escrow_address: row.get(5)?,
+                escrow_keypair_encrypted: row.get(6)?,
+                secret_hash: row.get(7)?,
+                status: row.get(8)?,
+                expires_at: row.get(9)?,
+                claimed_by_meta_hash: row.get(10)?,
+                claimed_pocket_id: row.get(11)?,
+                claimed_at: row.get(12)?,
+                refund_tx_signature: row.get(13)?,
+                funding_maze_json: row.get(14)?,
+                claim_maze_json: row.get(15)?,
+                created_at: row.get(16)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for link in links {
+            result.push(link.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
+        }
+        Ok(result)
+    }
+
+    /// Update send link as claimed
+    pub fn update_send_link_claimed(
+        &self, link_id: &str, claimed_by_meta_hash: &str,
+        claimed_pocket_id: &str, claim_maze_json: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            r#"UPDATE send_links SET status = 'claimed', claimed_by_meta_hash = ?1,
+               claimed_pocket_id = ?2, claimed_at = ?3, claim_maze_json = ?4
+               WHERE id = ?5"#,
+            params![claimed_by_meta_hash, claimed_pocket_id, now, claim_maze_json, link_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update send link as refunded
+    pub fn update_send_link_refunded(&self, link_id: &str, tx_signature: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE send_links SET status = 'refunded', refund_tx_signature = ?1 WHERE id = ?2",
+            params![tx_signature, link_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update send link as expired (no balance to refund)
+    pub fn update_send_link_expired(&self, link_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE send_links SET status = 'expired' WHERE id = ?1",
+            params![link_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get expired active send links (for refund job)
+    pub fn get_expired_send_links(&self) -> Result<Vec<SendLink>> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, sender_pocket_id, owner_meta_hash, amount_lamports, label,
+                      escrow_address, escrow_keypair_encrypted, secret_hash, status,
+                      expires_at, claimed_by_meta_hash, claimed_pocket_id, claimed_at,
+                      refund_tx_signature, funding_maze_json, claim_maze_json, created_at
+               FROM send_links WHERE status = 'active' AND expires_at < ?1"#
+        )?;
+
+        let links = stmt.query_map(params![now], |row| {
+            Ok(SendLink {
+                id: row.get(0)?,
+                sender_pocket_id: row.get(1)?,
+                owner_meta_hash: row.get(2)?,
+                amount_lamports: row.get::<_, i64>(3)? as u64,
+                label: row.get(4)?,
+                escrow_address: row.get(5)?,
+                escrow_keypair_encrypted: row.get(6)?,
+                secret_hash: row.get(7)?,
+                status: row.get(8)?,
+                expires_at: row.get(9)?,
+                claimed_by_meta_hash: row.get(10)?,
+                claimed_pocket_id: row.get(11)?,
+                claimed_at: row.get(12)?,
+                refund_tx_signature: row.get(13)?,
+                funding_maze_json: row.get(14)?,
+                claim_maze_json: row.get(15)?,
+                created_at: row.get(16)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for link in links {
+            result.push(link.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
+        }
+        Ok(result)
+    }
+
+    /// Update send link funding maze JSON
+    pub fn update_send_link_funding_maze(&self, link_id: &str, maze_json: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE send_links SET funding_maze_json = ?1 WHERE id = ?2",
+            params![maze_json, link_id],
+        )?;
+        Ok(())
+    }
 }
+
 impl Drop for PocketDatabase {
     fn drop(&mut self) {
         // Securely wipe encryption key from memory

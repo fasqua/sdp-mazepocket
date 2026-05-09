@@ -28,12 +28,12 @@ use tracing::{info, error, warn};
 use sdp_mazepocket::{
     config::{
         Config, MazeParameters, MergeStrategy, DelayPattern, DelayScope,
-        TX_FEE_LAMPORTS, FEE_PERCENT, MIN_AMOUNT_SOL, EXPIRY_SECONDS, FEE_WALLET, PROTOCOL_FEE_BPS,
+        TX_FEE_LAMPORTS, FEE_PERCENT, MIN_AMOUNT_SOL, EXPIRY_SECONDS, SEND_LINK_EXPIRY_SECONDS, FEE_WALLET, PROTOCOL_FEE_BPS,
     },
     core::{lamports_to_sol, sol_to_lamports, generate_pocket_id},
     relay::{
         PocketDatabase, MazeGenerator, MazeGraph, MazeNode,
-        database::{MazePocket, PocketStatus, FundingRequest, P2pTransfer, Contact, MazePreferences, GateEndpoint},
+        database::{MazePocket, PocketStatus, FundingRequest, P2pTransfer, Contact, MazePreferences, GateEndpoint, SendLink},
     },
     error::{MazeError, Result},
     swap::{self, SwapQuoteRequest, SwapQuoteResponse, SwapResult},
@@ -322,6 +322,79 @@ struct P2pStatusResponse {
     status: String,
     progress: Option<MazeProgress>,
     error: Option<String>,
+}
+
+// ============ SEND LINK TYPES (KausaLink) ============
+
+#[derive(Debug, Deserialize)]
+struct CreateSendLinkRequest {
+    meta_address: String,
+    pocket_id: String,
+    amount_sol: f64,
+    label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateSendLinkResponse {
+    success: bool,
+    link_id: String,
+    link_url: String,
+    amount_lamports: u64,
+    expires_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendLinkInfoQuery {
+    s: String, // secret
+}
+
+#[derive(Debug, Serialize)]
+struct SendLinkInfoResponse {
+    success: bool,
+    amount_sol: f64,
+    label: Option<String>,
+    status: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimSendLinkRequest {
+    secret: String,
+    wallet_address: String,
+    signature: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaimSendLinkResponse {
+    success: bool,
+    pocket_id: Option<String>,
+    meta_address: Option<String>,
+    amount_sol: f64,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListSendLinksQuery {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SendLinkEntry {
+    id: String,
+    amount_sol: f64,
+    label: Option<String>,
+    status: String,
+    created_at: i64,
+    expires_at: i64,
+    claimed_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListSendLinksResponse {
+    success: bool,
+    links: Vec<SendLinkEntry>,
+    count: usize,
 }
 
 // ============ UTILITY FUNCTIONS ============
@@ -3530,6 +3603,647 @@ async fn recover_sweep(
     }))
 }
 
+// ============ SEND LINK HANDLERS (KausaLink) ============
+
+/// Create a send link - generate escrow wallet and maze route funds to it
+async fn create_send_link(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateSendLinkRequest>,
+) -> std::result::Result<Json<CreateSendLinkResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Validate amount
+    if req.amount_sol < MIN_AMOUNT_SOL {
+        return Err(MazeError::InvalidParameters(format!("Minimum amount is {} SOL", MIN_AMOUNT_SOL)).into());
+    }
+
+    // Verify pocket ownership
+    let sender_pocket = state.db.get_pocket_for_owner(&req.pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(format!("Pocket not found or access denied: {}", req.pocket_id)))?;
+
+    if sender_pocket.status != PocketStatus::Active {
+        return Err(MazeError::InvalidParameters(format!("Pocket status is {}, must be active", sender_pocket.status.as_str())).into());
+    }
+
+    // Decrypt sender pocket keypair and check balance
+    let keypair_bytes = state.db.decrypt(&sender_pocket.keypair_encrypted)?;
+    let sender_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let balance = state.rpc.get_balance(&sender_keypair.pubkey())
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+
+    let amount_lamports = sol_to_lamports(req.amount_sol);
+    let fee_lamports = (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64;
+    let total_needed = amount_lamports + fee_lamports + (TX_FEE_LAMPORTS * 50);
+
+    if balance < total_needed {
+        return Err(MazeError::InsufficientFunds {
+            required: total_needed,
+            available: balance,
+        }.into());
+    }
+
+    info!("Creating send link: {} SOL from pocket {}", req.amount_sol, req.pocket_id);
+
+    // Generate escrow wallet
+    let escrow_keypair = Keypair::new();
+    let escrow_address = escrow_keypair.pubkey().to_string();
+    let escrow_keypair_encrypted = state.db.encrypt(&escrow_keypair.to_bytes())?;
+
+    // Generate secret (32 bytes hex = 64 chars)
+    let secret_bytes: [u8; 32] = rand::random();
+    let secret = hex::encode(secret_bytes);
+
+    // Hash secret for storage (SHA-256)
+    let secret_hash = hash_meta_address(&secret);
+
+    // Generate link ID
+    let link_id = format!("link_{}", &generate_pocket_id()[7..]);
+
+    // Generate maze (WITH pool for protocol fee)
+    let maze_params = parse_maze_config(None, state.config.pool_address.clone(), state.config.pool_private_key.clone());
+    let generator = MazeGenerator::new(maze_params);
+    let encrypt_fn = |data: &[u8]| state.db.encrypt(data);
+
+    let maze = match generator.generate(total_needed, encrypt_fn) {
+        Ok(m) => m,
+        Err(e) => return Err(MazeError::MazeGenerationError(format!("Failed to generate maze: {}", e)).into()),
+    };
+
+    let maze_json = serde_json::to_string(&maze).unwrap_or_default();
+    let now = chrono::Utc::now().timestamp();
+    let expires_at = now + SEND_LINK_EXPIRY_SECONDS;
+
+    // Save send link record
+    let send_link = SendLink {
+        id: link_id.clone(),
+        sender_pocket_id: req.pocket_id.clone(),
+        owner_meta_hash: owner_meta_hash.clone(),
+        amount_lamports,
+        label: req.label.clone(),
+        escrow_address: escrow_address.clone(),
+        escrow_keypair_encrypted,
+        secret_hash,
+        status: "active".to_string(),
+        expires_at,
+        claimed_by_meta_hash: None,
+        claimed_pocket_id: None,
+        claimed_at: None,
+        refund_tx_signature: None,
+        funding_maze_json: Some(maze_json.clone()),
+        claim_maze_json: None,
+        created_at: now,
+    };
+
+    state.db.create_send_link(&send_link)?;
+
+    // Transfer from sender pocket to first maze node
+    let first_node = &maze.nodes[0];
+    let first_node_pubkey = Pubkey::from_str(&first_node.address)
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+
+    let transfer_to_maze = amount_lamports + fee_lamports + (TX_FEE_LAMPORTS * maze.total_transactions as u64);
+
+    let sig = {
+        let mut last_err = String::new();
+        let mut result_sig = None;
+        for attempt in 1..=5u8 {
+            let blockhash = match state.rpc.get_latest_blockhash() {
+                Ok(bh) => bh,
+                Err(e) => {
+                    warn!("SendLink initial attempt {}/5: Failed to get blockhash: {}", attempt, e);
+                    last_err = e.to_string();
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let ix = system_instruction::transfer(
+                &sender_keypair.pubkey(),
+                &first_node_pubkey,
+                transfer_to_maze,
+            );
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&sender_keypair.pubkey()),
+                &[&sender_keypair],
+                blockhash,
+            );
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: None,
+                encoding: None,
+                max_retries: Some(3),
+                min_context_slot: None,
+            };
+            match state.rpc.send_transaction_with_config(&tx, config) {
+                Ok(s) => {
+                    if attempt > 1 {
+                        info!("SendLink initial TX succeeded on attempt {}/5", attempt);
+                    }
+                    result_sig = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                        warn!("SendLink initial attempt {}/5: {}", attempt, err_str);
+                        last_err = err_str;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    return Err(AppError(MazeError::TransactionError(format!("TX failed: {}", e))));
+                }
+            }
+        }
+        match result_sig {
+            Some(s) => s,
+            None => {
+                return Err(AppError(MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err))));
+            }
+        }
+    };
+
+    // Wait for confirmation
+    let mut confirmed = false;
+    for _ in 0..30 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+            if result.is_ok() {
+                confirmed = true;
+                break;
+            } else if let Err(e) = result {
+                return Err(AppError(MazeError::TransactionError(format!("Initial transfer failed: {:?}", e))));
+            }
+        }
+    }
+
+    if !confirmed {
+        return Err(AppError(MazeError::TransactionError("Initial transfer confirmation timeout".into())));
+    }
+
+    info!("SendLink {} initiated: {} lamports via maze to escrow {}", link_id, amount_lamports, escrow_address);
+
+    // Execute maze in background (pocket -> maze -> escrow)
+    let state_clone = state.clone();
+    let link_id_clone = link_id.clone();
+    let escrow_addr = escrow_address.clone();
+    tokio::spawn(async move {
+        // Reuse sweep maze execution pattern: maze nodes -> final destination (escrow)
+        match execute_sendlink_maze(state_clone.clone(), &link_id_clone, &escrow_addr).await {
+            Ok(_) => {
+                info!("SendLink maze completed for {}", link_id_clone);
+            }
+            Err(e) => {
+                error!("SendLink maze failed for {}: {}", link_id_clone, sanitize_error(&e.to_string()));
+                // Auto-recover to escrow
+                if let Ok(Some(link)) = state_clone.db.get_send_link(&link_id_clone) {
+                    if let Some(ref mj) = link.funding_maze_json {
+                        if let Ok(maze) = serde_json::from_str::<MazeGraph>(mj) {
+                            let amount = auto_recover_nodes_to_destination(
+                                state_clone.clone(), &maze.nodes, &escrow_addr, &link_id_clone, 3
+                            ).await;
+                            if amount > 0 {
+                                info!("Auto-recover SendLink {}: recovered {} lamports", link_id_clone, amount);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Log to transaction_log
+    let _ = state.db.insert_transaction_log(
+        &link_id,
+        &owner_meta_hash, "send_link", "completed",
+        Some(amount_lamports as i64),
+        Some(&format!("{} SOL", lamports_to_sol(amount_lamports))),
+        Some(&format!("Send link created: {}", req.label.as_deref().unwrap_or("no label"))),
+        None,
+        None,
+    );
+
+    let link_url = format!("https://kausalayer.com/claim/{}?s={}", link_id, secret);
+
+    Ok(Json(CreateSendLinkResponse {
+        success: true,
+        link_id,
+        link_url,
+        amount_lamports,
+        expires_at,
+    }))
+}
+
+/// Execute send link maze routing (pocket -> maze -> escrow)
+async fn execute_sendlink_maze(
+    state: Arc<AppState>,
+    link_id: &str,
+    escrow_address: &str,
+) -> Result<()> {
+    let link = state.db.get_send_link(link_id)?
+        .ok_or(MazeError::RequestNotFound(link_id.into()))?;
+
+    let maze_json = link.funding_maze_json
+        .ok_or(MazeError::DatabaseError("No maze graph for send link".into()))?;
+
+    let maze: MazeGraph = serde_json::from_str(&maze_json)
+        .map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+
+    // Detect pool node level
+    let pool_level: Option<u8> = if let Some(ref pool_addr) = state.config.pool_address {
+        maze.nodes.iter()
+            .find(|n| n.address == *pool_addr)
+            .map(|n| n.level)
+    } else {
+        None
+    };
+
+    let mut _pool_guard: Option<tokio::sync::SemaphorePermit<'_>> = None;
+
+    for level in 0..=maze.total_levels {
+        if let Some(pl) = pool_level {
+            if level == pl && _pool_guard.is_none() {
+                info!("SendLink waiting for pool lock ({})", link_id);
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(180),
+                    state.pool_lock.acquire()
+                ).await {
+                    Ok(Ok(permit)) => {
+                        info!("SendLink pool lock acquired ({})", link_id);
+                        _pool_guard = Some(permit);
+                    }
+                    Ok(Err(_)) => return Err(MazeError::TransactionError("Pool semaphore closed".into())),
+                    Err(_) => return Err(MazeError::TransactionError("Pool busy, timeout after 180s".into())),
+                }
+            }
+        }
+
+        let nodes_at_level: Vec<&MazeNode> = maze.nodes.iter()
+            .filter(|n| n.level == level)
+            .collect();
+
+        for node in nodes_at_level {
+            execute_sweep_node(state.clone(), link_id, node, &maze, escrow_address).await?;
+
+            let delay_ms = calculate_delay(&maze.parameters, node.level);
+            if delay_ms > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+
+    drop(_pool_guard);
+    info!("SendLink maze completed for {}", link_id);
+    Ok(())
+}
+
+/// Get send link info (public, no auth)
+async fn get_send_link_info(
+    State(state): State<Arc<AppState>>,
+    Path(link_id): Path<String>,
+    Query(query): Query<SendLinkInfoQuery>,
+) -> std::result::Result<Json<SendLinkInfoResponse>, AppError> {
+    let link = state.db.get_send_link(&link_id)?;
+
+    match link {
+        Some(link) => {
+            // Constant-time secret comparison
+            let provided_hash = hash_meta_address(&query.s);
+            if provided_hash != link.secret_hash {
+                return Ok(Json(SendLinkInfoResponse {
+                    success: false,
+                    amount_sol: 0.0,
+                    label: None,
+                    status: "invalid".to_string(),
+                    created_at: 0,
+                }));
+            }
+
+            Ok(Json(SendLinkInfoResponse {
+                success: true,
+                amount_sol: lamports_to_sol(link.amount_lamports),
+                label: link.label,
+                status: link.status,
+                created_at: link.created_at,
+            }))
+        }
+        None => Ok(Json(SendLinkInfoResponse {
+            success: false,
+            amount_sol: 0.0,
+            label: None,
+            status: "not_found".to_string(),
+            created_at: 0,
+        })),
+    }
+}
+
+/// Claim a send link (public, no auth - creates new pocket for recipient)
+async fn claim_send_link(
+    State(state): State<Arc<AppState>>,
+    Path(link_id): Path<String>,
+    Json(req): Json<ClaimSendLinkRequest>,
+) -> std::result::Result<Json<ClaimSendLinkResponse>, AppError> {
+    // Get send link
+    let link = state.db.get_send_link(&link_id)?
+        .ok_or(MazeError::RequestNotFound(link_id.clone()))?;
+
+    // Validate secret
+    let provided_hash = hash_meta_address(&req.secret);
+    if provided_hash != link.secret_hash {
+        return Ok(Json(ClaimSendLinkResponse {
+            success: false,
+            pocket_id: None,
+            meta_address: None,
+            amount_sol: 0.0,
+            message: "Invalid secret".to_string(),
+        }));
+    }
+
+    // Validate status
+    if link.status != "active" {
+        return Ok(Json(ClaimSendLinkResponse {
+            success: false,
+            pocket_id: None,
+            meta_address: None,
+            amount_sol: 0.0,
+            message: format!("Link status is '{}', cannot claim", link.status),
+        }));
+    }
+
+    // Check expiry
+    let now = chrono::Utc::now().timestamp();
+    if now > link.expires_at {
+        return Ok(Json(ClaimSendLinkResponse {
+            success: false,
+            pocket_id: None,
+            meta_address: None,
+            amount_sol: 0.0,
+            message: "Link has expired".to_string(),
+        }));
+    }
+
+    // Validate wallet address
+    let _wallet_pubkey = Pubkey::from_str(&req.wallet_address)
+        .map_err(|_| MazeError::InvalidParameters("Invalid wallet address".into()))?;
+
+    // Use meta_address derived by frontend (same derivation as ConnectWallet)
+    // The "message" field now contains the frontend-derived meta_address string
+    let claimer_meta = req.message.clone();
+    let claimer_meta_hash = hash_meta_address(&claimer_meta);
+
+    info!("Claiming send link {}: creating pocket for {}", link_id, &req.wallet_address[..20.min(req.wallet_address.len())]);
+
+    // Create new pocket for recipient
+    let pocket_keypair = Keypair::new();
+    let pocket_pubkey = pocket_keypair.pubkey().to_string();
+    let pocket_id = generate_pocket_id();
+    let keypair_encrypted = state.db.encrypt(&pocket_keypair.to_bytes())?;
+
+    let pocket = MazePocket {
+        id: pocket_id.clone(),
+        owner_meta_hash: claimer_meta_hash.clone(),
+        stealth_pubkey: pocket_pubkey.clone(),
+        keypair_encrypted,
+        funding_maze_id: None,
+        funding_amount_lamports: link.amount_lamports,
+        created_at: now,
+        last_sweep_at: None,
+        status: PocketStatus::Active,
+        label: link.label.clone(),
+        archived: false,
+    };
+
+    state.db.create_pocket(&pocket)?;
+
+    // Decrypt escrow keypair
+    let escrow_bytes = state.db.decrypt(&link.escrow_keypair_encrypted)?;
+    let escrow_keypair = Keypair::from_bytes(&escrow_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    // Check escrow balance
+    let escrow_balance = state.rpc.get_balance(&escrow_keypair.pubkey())
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+
+    if escrow_balance <= TX_FEE_LAMPORTS * 20 {
+        return Ok(Json(ClaimSendLinkResponse {
+            success: false,
+            pocket_id: None,
+            meta_address: None,
+            amount_sol: 0.0,
+            message: "Escrow has insufficient funds. Link may still be processing.".to_string(),
+        }));
+    }
+
+    // Generate maze WITHOUT pool (no protocol fee on claim)
+    let maze_params = parse_maze_config(None, None, None);
+    let generator = MazeGenerator::new(maze_params);
+    let sweep_amount = escrow_balance.saturating_sub(TX_FEE_LAMPORTS);
+    let encrypt_fn = |data: &[u8]| state.db.encrypt(data);
+
+    let maze = match generator.generate(sweep_amount, encrypt_fn) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(Json(ClaimSendLinkResponse {
+                success: false,
+                pocket_id: None,
+                meta_address: None,
+                amount_sol: 0.0,
+                message: format!("Failed to generate claim maze: {}", e),
+            }));
+        }
+    };
+
+    let claim_maze_json = serde_json::to_string(&maze).unwrap_or_default();
+
+    // Transfer from escrow to first maze node
+    let first_node = &maze.nodes[0];
+    let first_node_pubkey = Pubkey::from_str(&first_node.address)
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+
+    let sig = {
+        let mut last_err = String::new();
+        let mut result_sig = None;
+        for attempt in 1..=5u8 {
+            let blockhash = match state.rpc.get_latest_blockhash() {
+                Ok(bh) => bh,
+                Err(e) => {
+                    warn!("Claim initial attempt {}/5: Failed to get blockhash: {}", attempt, e);
+                    last_err = e.to_string();
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let ix = system_instruction::transfer(
+                &escrow_keypair.pubkey(),
+                &first_node_pubkey,
+                sweep_amount,
+            );
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&escrow_keypair.pubkey()),
+                &[&escrow_keypair],
+                blockhash,
+            );
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: None,
+                encoding: None,
+                max_retries: Some(3),
+                min_context_slot: None,
+            };
+            match state.rpc.send_transaction_with_config(&tx, config) {
+                Ok(s) => {
+                    if attempt > 1 {
+                        info!("Claim initial TX succeeded on attempt {}/5", attempt);
+                    }
+                    result_sig = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                        warn!("Claim initial attempt {}/5: {}", attempt, err_str);
+                        last_err = err_str;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    return Err(AppError(MazeError::TransactionError(format!("TX failed: {}", e))));
+                }
+            }
+        }
+        match result_sig {
+            Some(s) => s,
+            None => {
+                return Err(AppError(MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err))));
+            }
+        }
+    };
+
+    // Wait for confirmation
+    let mut confirmed = false;
+    for _ in 0..30 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+            if result.is_ok() {
+                confirmed = true;
+                break;
+            }
+        }
+    }
+
+    if !confirmed {
+        return Err(AppError(MazeError::TransactionError("Claim initial transfer confirmation timeout".into())));
+    }
+
+    // Mark as claimed
+    state.db.update_send_link_claimed(&link_id, &claimer_meta_hash, &pocket_id, &claim_maze_json)?;
+
+    info!("SendLink {} claimed: pocket {} for {}", link_id, pocket_id, &req.wallet_address[..20.min(req.wallet_address.len())]);
+
+    // Execute claim maze in background (escrow -> maze -> new pocket)
+    let state_clone = state.clone();
+    let link_id_clone = link_id.clone();
+    let pocket_pubkey_clone = pocket_pubkey.clone();
+    let claim_maze_json_clone = claim_maze_json.clone();
+    tokio::spawn(async move {
+        match execute_sendlink_claim_maze(state_clone.clone(), &link_id_clone, &pocket_pubkey_clone, &claim_maze_json_clone).await {
+            Ok(_) => {
+                info!("SendLink claim maze completed for {}", link_id_clone);
+            }
+            Err(e) => {
+                error!("SendLink claim maze failed for {}: {}", link_id_clone, sanitize_error(&e.to_string()));
+                // Auto-recover to new pocket
+                if let Ok(maze) = serde_json::from_str::<MazeGraph>(&claim_maze_json_clone) {
+                    let amount = auto_recover_nodes_to_destination(
+                        state_clone.clone(), &maze.nodes, &pocket_pubkey_clone, &link_id_clone, 3
+                    ).await;
+                    if amount > 0 {
+                        info!("Auto-recover claim {}: recovered {} lamports", link_id_clone, amount);
+                    }
+                }
+            }
+        }
+    });
+
+    // Log to transaction_log
+    let _ = state.db.insert_transaction_log(
+        &link_id,
+        &claimer_meta_hash, "send_link_claim", "completed",
+        Some(link.amount_lamports as i64),
+        Some(&format!("{} SOL", lamports_to_sol(link.amount_lamports))),
+        Some(&format!("Send link claimed: {}", link_id)),
+        None,
+        None,
+    );
+
+    Ok(Json(ClaimSendLinkResponse {
+        success: true,
+        pocket_id: Some(pocket_id),
+        meta_address: Some(claimer_meta),
+        amount_sol: lamports_to_sol(link.amount_lamports),
+        message: "Link claimed successfully. Pocket created with funds.".to_string(),
+    }))
+}
+
+/// Execute claim maze routing (escrow -> maze -> new pocket) - NO pool, no protocol fee
+async fn execute_sendlink_claim_maze(
+    state: Arc<AppState>,
+    link_id: &str,
+    pocket_address: &str,
+    maze_json: &str,
+) -> Result<()> {
+    let maze: MazeGraph = serde_json::from_str(maze_json)
+        .map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+
+    // No pool lock needed - claim maze has no pool node
+    for level in 0..=maze.total_levels {
+        let nodes_at_level: Vec<&MazeNode> = maze.nodes.iter()
+            .filter(|n| n.level == level)
+            .collect();
+
+        for node in nodes_at_level {
+            execute_sweep_node(state.clone(), link_id, node, &maze, pocket_address).await?;
+
+            let delay_ms = calculate_delay(&maze.parameters, node.level);
+            if delay_ms > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+
+    info!("SendLink claim maze completed for {}", link_id);
+    Ok(())
+}
+
+/// List send links for a user
+async fn list_send_links(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListSendLinksQuery>,
+) -> std::result::Result<Json<ListSendLinksResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    let links = state.db.list_send_links(&owner_meta_hash)?;
+
+    let link_entries: Vec<SendLinkEntry> = links.iter().map(|l| SendLinkEntry {
+        id: l.id.clone(),
+        amount_sol: lamports_to_sol(l.amount_lamports),
+        label: l.label.clone(),
+        status: l.status.clone(),
+        created_at: l.created_at,
+        expires_at: l.expires_at,
+        claimed_at: l.claimed_at,
+    }).collect();
+
+    let count = link_entries.len();
+
+    Ok(Json(ListSendLinksResponse {
+        success: true,
+        links: link_entries,
+        count,
+    }))
+}
+
 // ============ DEPOSIT MONITOR ============
 
 async fn deposit_monitor(state: Arc<AppState>) {
@@ -3608,6 +4322,126 @@ async fn deposit_monitor(state: Arc<AppState>) {
                 });
             }
         }
+
+        // === KausaLink: Check expired send links and refund ===
+        if let Ok(expired_links) = state.db.get_expired_send_links() {
+            for link in expired_links {
+                // Decrypt escrow keypair
+                let escrow_bytes = match state.db.decrypt(&link.escrow_keypair_encrypted) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("SendLink refund: decrypt failed for {}: {}", link.id, e);
+                        let _ = state.db.update_send_link_expired(&link.id);
+                        continue;
+                    }
+                };
+                let escrow_keypair = match Keypair::from_bytes(&escrow_bytes) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        warn!("SendLink refund: keypair error for {}: {}", link.id, e);
+                        let _ = state.db.update_send_link_expired(&link.id);
+                        continue;
+                    }
+                };
+
+                // Check escrow balance
+                let balance = match state.rpc.get_balance(&escrow_keypair.pubkey()) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        continue; // Will retry next iteration
+                    }
+                };
+
+                if balance <= TX_FEE_LAMPORTS {
+                    // No funds to refund
+                    let _ = state.db.update_send_link_expired(&link.id);
+                    info!("SendLink {} expired, no balance to refund", link.id);
+                    continue;
+                }
+
+                // Get sender pocket address for refund
+                let sender_pocket = match state.db.get_pocket(&link.sender_pocket_id) {
+                    Ok(Some(p)) => p,
+                    _ => {
+                        warn!("SendLink refund: sender pocket {} not found for {}", link.sender_pocket_id, link.id);
+                        let _ = state.db.update_send_link_expired(&link.id);
+                        continue;
+                    }
+                };
+
+                let dest_pubkey = match Pubkey::from_str(&sender_pocket.stealth_pubkey) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let _ = state.db.update_send_link_expired(&link.id);
+                        continue;
+                    }
+                };
+
+                // Direct refund (no maze routing - saves fees)
+                let transfer_amount = balance.saturating_sub(TX_FEE_LAMPORTS);
+                if transfer_amount == 0 {
+                    let _ = state.db.update_send_link_expired(&link.id);
+                    continue;
+                }
+
+                let refund_result: std::result::Result<String, String> = async {
+                    let blockhash = state.rpc.get_latest_blockhash()
+                        .map_err(|e| e.to_string())?;
+                    let ix = system_instruction::transfer(
+                        &escrow_keypair.pubkey(),
+                        &dest_pubkey,
+                        transfer_amount,
+                    );
+                    let tx = Transaction::new_signed_with_payer(
+                        &[ix],
+                        Some(&escrow_keypair.pubkey()),
+                        &[&escrow_keypair],
+                        blockhash,
+                    );
+                    let config = RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: None,
+                        max_retries: Some(3),
+                        min_context_slot: None,
+                    };
+                    let sig = state.rpc.send_transaction_with_config(&tx, config)
+                        .map_err(|e| e.to_string())?;
+                    // Wait for confirmation
+                    for _ in 0..30 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+                            if result.is_ok() {
+                                return Ok(sig.to_string());
+                            }
+                        }
+                    }
+                    Err("Refund TX confirmation timeout".to_string())
+                }.await;
+
+                match refund_result {
+                    Ok(sig) => {
+                        let _ = state.db.update_send_link_refunded(&link.id, &sig);
+                        info!("SendLink {} refunded: {} lamports to sender pocket ({})", link.id, transfer_amount, sig);
+                        // Log to transaction_log
+                        let _ = state.db.insert_transaction_log(
+                            &format!("refund_{}", chrono::Utc::now().timestamp_millis()),
+                            &link.owner_meta_hash, "send_link_refund", "completed",
+                            Some(transfer_amount as i64),
+                            Some(&format!("{} SOL", lamports_to_sol(transfer_amount))),
+                            Some(&format!("Send link expired, refunded: {}", link.id)),
+                            Some(&sig),
+                            None,
+                        );
+                    }
+                    Err(e) => {
+                        warn!("SendLink {} refund failed: {}", link.id, e);
+                        // Will retry next iteration
+                    }
+                }
+            }
+        }
+
     }
 }
 
@@ -5562,6 +6396,21 @@ async fn get_proof_handler(
             transfer.tx_signature.as_deref(), Some(&transfer.receiver_pocket_id),
             &state.config.master_key,
         )
+    } else if route_id.starts_with("link_") {
+        // KausaLink route
+        let link = state.db.get_send_link(&route_id)?
+            .ok_or(MazeError::RequestNotFound(route_id.clone()))?;
+        if link.owner_meta_hash != owner_meta_hash {
+            return Err(MazeError::PocketNotFound("Access denied".into()).into());
+        }
+        let maze_json = link.funding_maze_json
+            .ok_or(MazeError::DatabaseError("No maze data for send link".into()))?;
+        generate_proof(
+            &route_id, "send_link", &maze_json,
+            link.amount_lamports, &link.status, link.created_at, link.claimed_at,
+            link.refund_tx_signature.as_deref(), Some(&link.escrow_address),
+            &state.config.master_key,
+        )
     } else {
         None
     };
@@ -5617,6 +6466,16 @@ async fn download_proof_handler(
             _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Maze data unavailable"}))).into_response(),
         };
         generate_proof(&route_id, "p2p", &maze_json, transfer.amount_lamports, &transfer.status, transfer.created_at, transfer.completed_at, transfer.tx_signature.as_deref(), Some(&transfer.receiver_pocket_id), &state.config.master_key)
+    } else if route_id.starts_with("link_") {
+        let link = match state.db.get_send_link(&route_id) {
+            Ok(Some(l)) if l.owner_meta_hash == owner_meta_hash => l,
+            _ => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Route not found"}))).into_response(),
+        };
+        let maze_json = match link.funding_maze_json {
+            Some(j) => j,
+            None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Maze data unavailable"}))).into_response(),
+        };
+        generate_proof(&route_id, "send_link", &maze_json, link.amount_lamports, &link.status, link.created_at, link.claimed_at, link.refund_tx_signature.as_deref(), Some(&link.escrow_address), &state.config.master_key)
     } else {
         None
     };
@@ -5839,6 +6698,10 @@ async fn main() {
         .route("/pocket/:pocket_id/proof/:route_id/download", get(download_proof_handler))
         .route("/history", get(get_history_handler))
         .route("/proof/verify", post(verify_proof_handler))
+        .route("/send-link/create", post(create_send_link))
+        .route("/send-link/:id", get(get_send_link_info))
+        .route("/send-link/:id/claim", post(claim_send_link))
+        .route("/send-links", get(list_send_links))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
