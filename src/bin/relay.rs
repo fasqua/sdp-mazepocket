@@ -5343,7 +5343,7 @@ async fn gate_delete(
 
 // ============ PROOF OF PRIVACY ============
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct ProofOfPrivacy {
     proof_id: String,
     route_id: String,
@@ -5417,9 +5417,14 @@ fn sign_proof(proof: &ProofOfPrivacy, master_key: &str) -> String {
     type HmacSha256 = Hmac<Sha256>;
 
     let payload = format!(
-        "{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{:?}",
         proof.proof_id, proof.route_id, proof.route_type,
-        proof.hop_count, proof.privacy_grade, proof.maze_hash, proof.generated_at
+        proof.hop_count, proof.total_nodes, proof.total_levels, proof.total_transactions,
+        proof.delay_pattern, proof.merge_strategy,
+        proof.privacy_grade, proof.amount_range, proof.maze_hash,
+        proof.entry_hash, proof.exit_hash,
+        proof.route_created_at, proof.route_status, proof.route_completed_at,
+        proof.generated_at, proof.tx_signature
     );
     let mut mac = HmacSha256::new_from_slice(master_key.as_bytes())
         .expect("HMAC key");
@@ -5695,6 +5700,43 @@ async fn get_history_handler(
     }))
 }
 
+// ============ PROOF VERIFY ============
+
+#[derive(Debug, Deserialize)]
+struct VerifyProofRequest {
+    proof: ProofOfPrivacy,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifyProofResponse {
+    valid: bool,
+    proof_id: String,
+    route_type: String,
+    privacy_grade: String,
+    message: String,
+}
+
+async fn verify_proof_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerifyProofRequest>,
+) -> Json<VerifyProofResponse> {
+    let proof = req.proof;
+    let expected_sig = sign_proof(&proof, &state.config.master_key);
+    let valid = expected_sig == proof.signature;
+
+    Json(VerifyProofResponse {
+        valid,
+        proof_id: proof.proof_id.clone(),
+        route_type: proof.route_type.clone(),
+        privacy_grade: proof.privacy_grade.clone(),
+        message: if valid {
+            "Proof is valid and was issued by KausaLayer".to_string()
+        } else {
+            "Invalid proof - signature does not match".to_string()
+        },
+    })
+}
+
 // ============ MAIN ============
 
 #[tokio::main]
@@ -5796,6 +5838,7 @@ async fn main() {
         .route("/pocket/:pocket_id/proof/:route_id", get(get_proof_handler))
         .route("/pocket/:pocket_id/proof/:route_id/download", get(download_proof_handler))
         .route("/history", get(get_history_handler))
+        .route("/proof/verify", post(verify_proof_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
