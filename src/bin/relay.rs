@@ -2511,6 +2511,7 @@ async fn send_to_pocket(
         created_at: now,
         completed_at: None,
         error_message: None,
+        tx_signature: None,
     };
 
     state.db.create_p2p_transfer(&transfer)?;
@@ -2574,7 +2575,7 @@ async fn send_to_pocket(
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         continue;
                     }
-                    let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&sanitize_error(&e.to_string())));
+                    let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&sanitize_error(&e.to_string())), None);
                     return Err(AppError(MazeError::TransactionError(format!("TX failed: {}", e))));
                 }
             }
@@ -2582,7 +2583,7 @@ async fn send_to_pocket(
         match result_sig {
             Some(s) => s,
             None => {
-                let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&sanitize_error(&last_err)));
+                let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&sanitize_error(&last_err)), None);
                 return Err(AppError(MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err))));
             }
         }
@@ -2597,14 +2598,14 @@ async fn send_to_pocket(
                 confirmed = true;
                 break;
             } else if let Err(e) = result {
-                let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&format!("Initial transfer failed: {:?}", e)));
+                let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&format!("Initial transfer failed: {:?}", e)), None);
                 return Err(AppError(MazeError::TransactionError(format!("Initial transfer failed: {:?}", e))));
             }
         }
     }
 
     if !confirmed {
-        let _ = state.db.update_p2p_status(&transfer_id, "failed", Some("Initial transfer confirmation timeout"));
+        let _ = state.db.update_p2p_status(&transfer_id, "failed", Some("Initial transfer confirmation timeout"), None);
         return Err(AppError(MazeError::TransactionError("Initial transfer confirmation timeout".into())));
     }
 
@@ -2630,14 +2631,14 @@ async fn send_to_pocket(
                         ).await;
                         if amount > 0 {
                             info!("Auto-recover P2P {}: recovered {} lamports", transfer_id_clone, amount);
-                            let _ = state_clone.db.update_p2p_status(&transfer_id_clone, "completed", None);
+                            let _ = state_clone.db.update_p2p_status(&transfer_id_clone, "completed", None, None);
                             recovered = true;
                         }
                     }
                 }
                 if !recovered {
                     error!("Auto-recover P2P {} exhausted, marking failed", transfer_id_clone);
-                    let _ = state_clone.db.update_p2p_status(&transfer_id_clone, "failed", Some(&sanitize_error(&e.to_string())));
+                    let _ = state_clone.db.update_p2p_status(&transfer_id_clone, "failed", Some(&sanitize_error(&e.to_string())), None);
                 }
             }
         }
@@ -2666,7 +2667,7 @@ async fn execute_p2p_maze(
     info!("Executing P2P maze for {}", transfer_id);
 
     // Update status to processing
-    state.db.update_p2p_status(transfer_id, "processing", None)?;
+    state.db.update_p2p_status(transfer_id, "processing", None, None)?;
 
     // Get maze graph
     let maze_json = state.db.get_p2p_maze_graph(transfer_id)?;
@@ -2734,8 +2735,9 @@ async fn execute_p2p_maze(
     // Pool lock auto-released when _pool_guard is dropped
     drop(_pool_guard);
 
-    // Mark P2P transfer as completed
-    state.db.update_p2p_status(transfer_id, "completed", None)?;
+    // Mark P2P transfer as completed with final tx signature
+    let final_tx_sig = state.db.get_p2p_final_tx_signature(transfer_id)?;
+    state.db.update_p2p_status(transfer_id, "completed", None, final_tx_sig.as_deref())?;
 
     info!("P2P maze completed for {}", transfer_id);
     Ok(())
@@ -3224,7 +3226,7 @@ async fn recover_p2p_transfer(
 
     // Update P2P status if recovered
     if total_recovered > 0 {
-        let _ = state.db.update_p2p_status(&transfer_id, "completed", None);
+        let _ = state.db.update_p2p_status(&transfer_id, "completed", None, None);
         info!("P2P transfer {} recovered: {} lamports", transfer_id, total_recovered);
     }
 
@@ -4416,6 +4418,24 @@ async fn swap_execute_handler(
     let success = result.success;
     info!("Swap result for pocket {}: success={}", pocket_id, success);
 
+    // Log to transaction_log
+    if success {
+        let swap_desc = if req.input_token.is_some() {
+            format!("Sell {} -> SOL", req.output_token)
+        } else {
+            format!("Buy SOL -> {}", req.output_token)
+        };
+        let _ = state.db.insert_transaction_log(
+            &format!("swap_{}", chrono::Utc::now().timestamp_millis()),
+            &owner_meta_hash, "swap", "completed",
+            Some(swap_amount as i64),
+            Some(&format!("{} SOL", lamports_to_sol(swap_amount))),
+            Some(&swap_desc),
+            result.tx_signature.as_deref(),
+            None,
+        );
+    }
+
     Ok(Json(SwapExecuteResponse {
         success,
         swap_result: Some(result),
@@ -4604,6 +4624,16 @@ async fn printr_create_handler(
     }
 
     info!("Printr token created from pocket {}: {:?}", pocket_id, create_result.token_id);
+
+    // Log to transaction_log
+    let _ = state.db.insert_transaction_log(
+        &format!("printr_{}", chrono::Utc::now().timestamp_millis()),
+        &owner_meta_hash, "printr", "completed",
+        None, None,
+        Some(&format!("Token created: {}", create_result.token_id.as_deref().unwrap_or("unknown"))),
+        tx_signature.as_deref(),
+        None,
+    );
 
     Ok(Json(PocketPrintrCreateResponse {
         success: true,
@@ -4838,6 +4868,17 @@ async fn kausa_pay_handler(
             if pay_result.success {
                 info!("KausaPay success: pocket {} paid {} {} via {}",
                     pocket_id, pay_result.amount_paid_usdc, pay_result.token_symbol, pay_result.protocol_used);
+
+                // Log to transaction_log
+                let _ = state.db.insert_transaction_log(
+                    &format!("pay_{}", chrono::Utc::now().timestamp_millis()),
+                    &owner_meta_hash, "kausapay", "completed",
+                    None,
+                    Some(&format!("{} {}", pay_result.amount_paid_usdc, pay_result.token_symbol)),
+                    Some(&format!("Payment via {} to {}", pay_result.protocol_used, &req.url[..60.min(req.url.len())])),
+                    pay_result.payment_signature.as_deref(),
+                    None,
+                );
             }
             Ok(Json(KausaPayResponse {
                 success: pay_result.success,
@@ -5173,7 +5214,7 @@ async fn gate_register(
         id: endpoint_id.clone(),
         pocket_id: pocket_id.clone(),
         pocket_address: pocket.stealth_pubkey.clone(),
-        owner_meta_hash,
+        owner_meta_hash: owner_meta_hash.clone(),
         endpoint_url: req.endpoint_url.clone(),
         method: req.method.clone().unwrap_or_else(|| "POST".to_string()),
         description: req.description,
@@ -5186,6 +5227,16 @@ async fn gate_register(
     state.db.create_gate_endpoint(&gate_endpoint)?;
 
     info!("KausaGate: endpoint {} registered to pocket {}", req.endpoint_url, pocket_id);
+
+    // Log to transaction_log
+    let _ = state.db.insert_transaction_log(
+        &format!("gate_{}", chrono::Utc::now().timestamp_millis()),
+        &owner_meta_hash, "gate_register", "completed",
+        None, None,
+        Some(&format!("Endpoint registered: {}", req.endpoint_url)),
+        None,
+        None,
+    );
 
     // Auto-regenerate YAML and restart gateway
     regenerate_gate_yaml();
@@ -5289,6 +5340,361 @@ async fn gate_delete(
     }
 }
 
+
+// ============ PROOF OF PRIVACY ============
+
+#[derive(Debug, Serialize, Clone)]
+struct ProofOfPrivacy {
+    proof_id: String,
+    route_id: String,
+    route_type: String,  // "funding", "sweep", "p2p"
+    generated_at: i64,
+    // Maze metrics (from maze_graph_json)
+    hop_count: u8,
+    total_nodes: usize,
+    total_levels: u8,
+    total_transactions: u16,
+    delay_pattern: String,
+    merge_strategy: String,
+    // Privacy indicators
+    privacy_grade: String,  // A, B, C, D
+    amount_range: String,   // e.g. "0.1-0.5 SOL"
+    // Hashed identifiers (no raw addresses)
+    maze_hash: String,      // SHA-256 of maze_graph_json
+    entry_hash: String,     // SHA-256 of entry node address
+    exit_hash: String,      // SHA-256 of exit/destination address
+    // Timing
+    route_created_at: i64,
+    route_completed_at: Option<i64>,
+    // Status
+    route_status: String,
+    tx_signature: Option<String>,
+    // Proof signature (HMAC-SHA256)
+    signature: String,
+}
+
+fn calculate_privacy_grade(hop_count: u8, delay_pattern: &str, merge_strategy: &str) -> String {
+    let delay_score = match delay_pattern {
+        "fibonacci" | "exponential" => 3,
+        "random" | "linear" => 2,
+        _ => 0,
+    };
+    let merge_score = match merge_strategy {
+        "fibonacci" => 3,
+        "late" | "middle" => 2,
+        "early" => 1,
+        _ => 1,
+    };
+    let hop_score = if hop_count >= 9 { 4 } else if hop_count >= 7 { 3 } else if hop_count >= 6 { 2 } else { 1 };
+    let total = hop_score + delay_score + merge_score;
+    if total >= 9 { "A".to_string() }
+    else if total >= 7 { "B".to_string() }
+    else if total >= 4 { "C".to_string() }
+    else { "D".to_string() }
+}
+
+fn calculate_amount_range(lamports: u64) -> String {
+    let sol = lamports as f64 / 1_000_000_000.0;
+    if sol < 0.01 { "< 0.01 SOL".to_string() }
+    else if sol < 0.1 { "0.01-0.1 SOL".to_string() }
+    else if sol < 0.5 { "0.1-0.5 SOL".to_string() }
+    else if sol < 1.0 { "0.5-1 SOL".to_string() }
+    else if sol < 5.0 { "1-5 SOL".to_string() }
+    else if sol < 10.0 { "5-10 SOL".to_string() }
+    else { "10+ SOL".to_string() }
+}
+
+fn hash_string(input: &str) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn sign_proof(proof: &ProofOfPrivacy, master_key: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let payload = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        proof.proof_id, proof.route_id, proof.route_type,
+        proof.hop_count, proof.privacy_grade, proof.maze_hash, proof.generated_at
+    );
+    let mut mac = HmacSha256::new_from_slice(master_key.as_bytes())
+        .expect("HMAC key");
+    mac.update(payload.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+fn generate_proof(
+    route_id: &str,
+    route_type: &str,
+    maze_json: &str,
+    amount_lamports: u64,
+    status: &str,
+    created_at: i64,
+    completed_at: Option<i64>,
+    tx_signature: Option<&str>,
+    destination: Option<&str>,
+    master_key: &str,
+) -> Option<ProofOfPrivacy> {
+    let maze: MazeGraph = serde_json::from_str(maze_json).ok()?;
+
+    let hop_count = maze.parameters.hop_count;
+    let delay_pattern = format!("{:?}", maze.parameters.delay_pattern).to_lowercase();
+    let merge_strategy = format!("{:?}", maze.parameters.merge_strategy).to_lowercase();
+
+    let privacy_grade = calculate_privacy_grade(hop_count, &delay_pattern, &merge_strategy);
+    let amount_range = calculate_amount_range(amount_lamports);
+    let maze_hash = hash_string(maze_json);
+
+    // Entry = first node address
+    let entry_hash = maze.nodes.first()
+        .map(|n| hash_string(&n.address))
+        .unwrap_or_default();
+
+    // Exit = destination or last node
+    let exit_addr = destination.unwrap_or_else(|| {
+        maze.nodes.last().map(|n| n.address.as_str()).unwrap_or("")
+    });
+    let exit_hash = hash_string(exit_addr);
+
+    let now = chrono::Utc::now().timestamp();
+    let proof_id = format!("proof_{}_{}", route_type, &route_id[route_id.find('_').map(|i| i+1).unwrap_or(0)..]);
+
+    let mut proof = ProofOfPrivacy {
+        proof_id,
+        route_id: route_id.to_string(),
+        route_type: route_type.to_string(),
+        generated_at: now,
+        hop_count,
+        total_nodes: maze.nodes.len(),
+        total_levels: maze.total_levels,
+        total_transactions: maze.total_transactions,
+        delay_pattern,
+        merge_strategy,
+        privacy_grade,
+        amount_range,
+        maze_hash,
+        entry_hash,
+        exit_hash,
+        route_created_at: created_at,
+        route_completed_at: completed_at,
+        route_status: status.to_string(),
+        tx_signature: tx_signature.map(|s| s.to_string()),
+        signature: String::new(),
+    };
+
+    proof.signature = sign_proof(&proof, master_key);
+    Some(proof)
+}
+
+// ============ PROOF OF PRIVACY ENDPOINTS ============
+
+#[derive(Debug, Serialize)]
+struct ProofResponse {
+    success: bool,
+    proof: Option<ProofOfPrivacy>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProofQuery {
+    meta_address: String,
+}
+
+/// Get Proof of Privacy for a route
+async fn get_proof_handler(
+    State(state): State<Arc<AppState>>,
+    Path((pocket_id, route_id)): Path<(String, String)>,
+    Query(query): Query<ProofQuery>,
+) -> std::result::Result<Json<ProofResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    // Verify pocket ownership
+    let _pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    // Determine route type and fetch data
+    let proof = if route_id.starts_with("fund_") {
+        // Funding route
+        let req = state.db.get_funding_request(&route_id)?
+            .ok_or(MazeError::RequestNotFound(route_id.clone()))?;
+        if req.owner_meta_hash != owner_meta_hash {
+            return Err(MazeError::PocketNotFound("Access denied".into()).into());
+        }
+        let maze_json = state.db.get_maze_graph(&route_id)?;
+        generate_proof(
+            &route_id, "funding", &maze_json,
+            req.amount_lamports, &req.status, req.created_at, req.completed_at,
+            req.tx_signature.as_deref(), req.destination_address.as_deref(),
+            &state.config.master_key,
+        )
+    } else if route_id.starts_with("sweep_") {
+        // Sweep route
+        let sweep_req = state.db.get_sweep_request(&route_id)?
+            .ok_or(MazeError::RequestNotFound(route_id.clone()))?;
+        let maze_json = state.db.get_sweep_maze_graph(&route_id)?;
+        let sweep_tx_sig = state.db.get_sweep_final_tx_signature(&route_id)?;
+        generate_proof(
+            &route_id, "sweep", &maze_json,
+            sweep_req.3, &sweep_req.5, chrono::Utc::now().timestamp(), None,
+            sweep_tx_sig.as_deref(), Some(&sweep_req.2),
+            &state.config.master_key,
+        )
+    } else if route_id.starts_with("p2p_") {
+        // P2P route
+        let transfer = state.db.get_p2p_transfer(&route_id)?
+            .ok_or(MazeError::RequestNotFound(route_id.clone()))?;
+        if transfer.sender_meta_hash != owner_meta_hash {
+            return Err(MazeError::PocketNotFound("Access denied".into()).into());
+        }
+        let maze_json = state.db.get_p2p_maze_graph(&route_id)?;
+        generate_proof(
+            &route_id, "p2p", &maze_json,
+            transfer.amount_lamports, &transfer.status, transfer.created_at, transfer.completed_at,
+            transfer.tx_signature.as_deref(), Some(&transfer.receiver_pocket_id),
+            &state.config.master_key,
+        )
+    } else {
+        None
+    };
+
+    match proof {
+        Some(p) => Ok(Json(ProofResponse { success: true, proof: Some(p), error: None })),
+        None => Ok(Json(ProofResponse { success: false, proof: None, error: Some("Could not generate proof".into()) })),
+    }
+}
+
+/// Download Proof of Privacy as JSON file
+async fn download_proof_handler(
+    State(state): State<Arc<AppState>>,
+    Path((pocket_id, route_id)): Path<(String, String)>,
+    Query(query): Query<ProofQuery>,
+) -> axum::response::Response {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    let _pocket = match state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash) {
+        Ok(Some(p)) => p,
+        _ => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Pocket not found"}))).into_response(),
+    };
+
+    // Generate proof (same logic as get_proof_handler)
+    let proof = if route_id.starts_with("fund_") {
+        let req = match state.db.get_funding_request(&route_id) {
+            Ok(Some(r)) if r.owner_meta_hash == owner_meta_hash => r,
+            _ => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Route not found"}))).into_response(),
+        };
+        let maze_json = match state.db.get_maze_graph(&route_id) {
+            Ok(j) => j,
+            _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Maze data unavailable"}))).into_response(),
+        };
+        generate_proof(&route_id, "funding", &maze_json, req.amount_lamports, &req.status, req.created_at, req.completed_at, req.tx_signature.as_deref(), req.destination_address.as_deref(), &state.config.master_key)
+    } else if route_id.starts_with("sweep_") {
+        let sweep_req = match state.db.get_sweep_request(&route_id) {
+            Ok(Some(r)) => r,
+            _ => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Route not found"}))).into_response(),
+        };
+        let maze_json = match state.db.get_sweep_maze_graph(&route_id) {
+            Ok(j) => j,
+            _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Maze data unavailable"}))).into_response(),
+        };
+        let sweep_tx_sig = state.db.get_sweep_final_tx_signature(&route_id).ok().flatten();
+        generate_proof(&route_id, "sweep", &maze_json, sweep_req.3, &sweep_req.5, chrono::Utc::now().timestamp(), None, sweep_tx_sig.as_deref(), Some(&sweep_req.2), &state.config.master_key)
+    } else if route_id.starts_with("p2p_") {
+        let transfer = match state.db.get_p2p_transfer(&route_id) {
+            Ok(Some(t)) if t.sender_meta_hash == owner_meta_hash => t,
+            _ => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Route not found"}))).into_response(),
+        };
+        let maze_json = match state.db.get_p2p_maze_graph(&route_id) {
+            Ok(j) => j,
+            _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Maze data unavailable"}))).into_response(),
+        };
+        generate_proof(&route_id, "p2p", &maze_json, transfer.amount_lamports, &transfer.status, transfer.created_at, transfer.completed_at, transfer.tx_signature.as_deref(), Some(&transfer.receiver_pocket_id), &state.config.master_key)
+    } else {
+        None
+    };
+
+    match proof {
+        Some(p) => {
+            let json_str = serde_json::to_string_pretty(&p).unwrap_or_default();
+            let filename = format!("{}.json", p.proof_id);
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
+                .body(axum::body::Body::from(json_str))
+                .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response())
+        }
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Could not generate proof"}))).into_response(),
+    }
+}
+
+// ============ TRANSACTION HISTORY ENDPOINT ============
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    meta_address: String,
+    tx_type: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryEntry {
+    id: String,
+    tx_type: String,
+    status: String,
+    amount_lamports: Option<i64>,
+    amount_display: Option<String>,
+    tx_signature: Option<String>,
+    description: Option<String>,
+    created_at: i64,
+    completed_at: Option<i64>,
+    has_proof: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryResponse {
+    success: bool,
+    history: Vec<HistoryEntry>,
+    count: usize,
+}
+
+async fn get_history_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HistoryQuery>,
+) -> std::result::Result<Json<HistoryResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+    let limit = query.limit.unwrap_or(50).min(100);
+    let tx_type_filter = query.tx_type.as_deref();
+
+    let entries = state.db.get_transaction_history(&owner_meta_hash, tx_type_filter, limit)?;
+
+    let history: Vec<HistoryEntry> = entries.into_iter().map(|(id, tx_type, status, amount, display, sig, desc, created, completed, has_proof)| {
+        HistoryEntry {
+            id,
+            tx_type,
+            status,
+            amount_lamports: amount,
+            amount_display: display,
+            tx_signature: sig,
+            description: desc,
+            created_at: created,
+            completed_at: completed,
+            has_proof,
+        }
+    }).collect();
+
+    let count = history.len();
+
+    Ok(Json(HistoryResponse {
+        success: true,
+        history,
+        count,
+    }))
+}
+
 // ============ MAIN ============
 
 #[tokio::main]
@@ -5387,6 +5793,9 @@ async fn main() {
         .route("/pocket/:pocket_id/gate/endpoint", axum::routing::delete(gate_delete))
         .route("/gate/endpoints", get(gate_list_all))
         .route("/gate/proxy/:endpoint_id", post(gate_proxy).get(gate_proxy))
+        .route("/pocket/:pocket_id/proof/:route_id", get(get_proof_handler))
+        .route("/pocket/:pocket_id/proof/:route_id/download", get(download_proof_handler))
+        .route("/history", get(get_history_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)

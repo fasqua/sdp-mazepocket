@@ -36,6 +36,7 @@ spl-memo = "4"
 # Crypto - Enhanced Security for Maze Pocket
 ed25519-dalek = "1.0"
 sha2 = "0.10"
+hmac = "0.12"
 aes-gcm = "0.10"
 argon2 = "0.5"
 rand = "0.8"

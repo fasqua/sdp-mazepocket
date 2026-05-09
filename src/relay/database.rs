@@ -151,6 +151,7 @@ pub struct P2pTransfer {
     pub created_at: i64,
     pub completed_at: Option<i64>,
     pub error_message: Option<String>,
+    pub tx_signature: Option<String>,
 }
 /// Partner token for multi-token tier system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,6 +452,9 @@ impl PocketDatabase {
             [],
         )?;
 
+        // Migration: add tx_signature column to p2p_transfers
+        let _ = conn.execute("ALTER TABLE p2p_transfers ADD COLUMN tx_signature TEXT", []);
+
         // Contacts table (alias for pocket IDs)
         conn.execute(
             r#"CREATE TABLE IF NOT EXISTS contacts (
@@ -546,6 +550,34 @@ impl PocketDatabase {
 
         // Migration: add method column to gate_endpoints
         let _ = conn.execute("ALTER TABLE gate_endpoints ADD COLUMN method TEXT DEFAULT 'POST'", []);
+
+        // Transaction log table (for swap, KausaPay, KausaGate, Printr history)
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS transaction_log (
+                id TEXT PRIMARY KEY,
+                owner_meta_hash TEXT NOT NULL,
+                tx_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                amount_lamports INTEGER,
+                amount_display TEXT,
+                description TEXT,
+                tx_signature TEXT,
+                metadata_json TEXT,
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER
+            )"#,
+            [],
+        )?;
+
+        // Transaction log indexes
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_txlog_owner ON transaction_log(owner_meta_hash)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_txlog_type ON transaction_log(tx_type)",
+            [],
+        )?;
 
         Ok(())
     }
@@ -1394,6 +1426,34 @@ impl PocketDatabase {
         }
     }
 
+    /// Get final node tx_signature for a P2P transfer
+    pub fn get_p2p_final_tx_signature(&self, transfer_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tx_signature FROM p2p_maze_nodes WHERE transfer_id = ?1 AND tx_signature IS NOT NULL ORDER BY node_index DESC LIMIT 1"
+        )?;
+        let result = stmt.query_row(params![transfer_id], |row| row.get(0));
+        match result {
+            Ok(sig) => Ok(Some(sig)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
+    }
+
+    /// Get final node tx_signature for a sweep request
+    pub fn get_sweep_final_tx_signature(&self, sweep_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tx_signature FROM sweep_maze_nodes WHERE sweep_id = ?1 AND tx_signature IS NOT NULL ORDER BY node_index DESC LIMIT 1"
+        )?;
+        let result = stmt.query_row(params![sweep_id], |row| row.get(0));
+        match result {
+            Ok(sig) => Ok(Some(sig)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
+    }
+
     /// Store MCP API key
     pub fn store_mcp_api_key(&self, api_key_hash: &str, wallet_address: &str, owner_meta_hash: &str, raw_meta_address: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1502,7 +1562,7 @@ impl PocketDatabase {
         // Get P2P transfers (pocket-to-pocket)
         let mut stmt3 = conn.prepare(
             r#"SELECT id, amount_lamports, fee_lamports, status, receiver_pocket_id,
-                      created_at, completed_at
+                      created_at, completed_at, tx_signature
                FROM p2p_transfers
                WHERE sender_meta_hash = ?1
                ORDER BY created_at DESC
@@ -1519,7 +1579,7 @@ impl PocketDatabase {
                 destination: row.get(4)?,
                 created_at: row.get(5)?,
                 completed_at: row.get(6)?,
-                tx_signature: None,
+                tx_signature: row.get(7)?,
             })
         })?;
 
@@ -1692,7 +1752,7 @@ impl PocketDatabase {
         let mut stmt = conn.prepare(
             r#"SELECT id, sender_pocket_id, receiver_pocket_id, sender_meta_hash,
                       amount_lamports, fee_lamports, maze_graph_json, status,
-                      created_at, completed_at, error_message
+                      created_at, completed_at, error_message, tx_signature
                FROM p2p_transfers WHERE id = ?1"#
         )?;
 
@@ -1709,6 +1769,7 @@ impl PocketDatabase {
                 created_at: row.get(8)?,
                 completed_at: row.get(9)?,
                 error_message: row.get(10)?,
+                tx_signature: row.get(11)?,
             })
         });
 
@@ -1720,13 +1781,13 @@ impl PocketDatabase {
     }
 
     /// Update P2P transfer status
-    pub fn update_p2p_status(&self, transfer_id: &str, status: &str, error: Option<&str>) -> Result<()> {
+    pub fn update_p2p_status(&self, transfer_id: &str, status: &str, error: Option<&str>, tx_sig: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         if status == "completed" {
             let now = chrono::Utc::now().timestamp();
             conn.execute(
-                "UPDATE p2p_transfers SET status = ?1, completed_at = ?2 WHERE id = ?3",
-                params![status, now, transfer_id],
+                "UPDATE p2p_transfers SET status = ?1, completed_at = ?2, tx_signature = ?3 WHERE id = ?4",
+                params![status, now, tx_sig, transfer_id],
             )?;
         } else {
             conn.execute(
@@ -2210,6 +2271,173 @@ impl PocketDatabase {
             |row| row.get(0)
         ).unwrap_or(0);
         Ok(count > 0)
+    }
+
+    // ============ TRANSACTION LOG OPERATIONS ============
+
+    /// Insert a transaction log entry
+    pub fn insert_transaction_log(
+        &self,
+        id: &str,
+        owner_meta_hash: &str,
+        tx_type: &str,
+        status: &str,
+        amount_lamports: Option<i64>,
+        amount_display: Option<&str>,
+        description: Option<&str>,
+        tx_signature: Option<&str>,
+        metadata_json: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let completed_at = if status == "completed" { Some(now) } else { None };
+        conn.execute(
+            r#"INSERT OR REPLACE INTO transaction_log
+               (id, owner_meta_hash, tx_type, status, amount_lamports, amount_display,
+                description, tx_signature, metadata_json, created_at, completed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+            params![
+                id, owner_meta_hash, tx_type, status, amount_lamports, amount_display,
+                description, tx_signature, metadata_json, now, completed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get unified transaction history for a user
+    pub fn get_transaction_history(&self, owner_meta_hash: &str, tx_type_filter: Option<&str>, limit: u32) -> Result<Vec<(String, String, String, Option<i64>, Option<String>, Option<String>, Option<String>, i64, Option<i64>, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut all_entries: Vec<(String, String, String, Option<i64>, Option<String>, Option<String>, Option<String>, i64, Option<i64>, bool)> = Vec::new();
+
+        // 1. Funding requests (has proof)
+        if tx_type_filter.is_none() || tx_type_filter == Some("all") || tx_type_filter == Some("funding") {
+            let mut stmt = conn.prepare(
+                r#"SELECT id, 'funding', status, amount_lamports, deposit_address, tx_signature,
+                          destination_address, created_at, completed_at
+                   FROM funding_requests
+                   WHERE owner_meta_hash = ?1
+                   ORDER BY created_at DESC LIMIT ?2"#
+            )?;
+            let rows = stmt.query_map(params![owner_meta_hash, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    Some(row.get::<_, i64>(3)?),
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    true, // has_proof
+                ))
+            })?;
+            for row in rows {
+                if let Ok(r) = row { all_entries.push(r); }
+            }
+        }
+
+        // 2. Sweep requests (has proof)
+        if tx_type_filter.is_none() || tx_type_filter == Some("all") || tx_type_filter == Some("sweep") {
+            let mut stmt = conn.prepare(
+                r#"SELECT sr.id, 'sweep', sr.status, sr.amount_lamports, sr.destination_address,
+                          sr.tx_signature, sr.destination_address, sr.created_at, sr.completed_at
+                   FROM sweep_requests sr
+                   JOIN maze_pockets mp ON sr.pocket_id = mp.id
+                   WHERE mp.owner_meta_hash = ?1
+                   ORDER BY sr.created_at DESC LIMIT ?2"#
+            )?;
+            let rows = stmt.query_map(params![owner_meta_hash, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    true,
+                ))
+            })?;
+            for row in rows {
+                if let Ok(r) = row { all_entries.push(r); }
+            }
+        }
+
+        // 3. P2P transfers (has proof)
+        if tx_type_filter.is_none() || tx_type_filter == Some("all") || tx_type_filter == Some("p2p") {
+            let mut stmt = conn.prepare(
+                r#"SELECT id, 'p2p', status, amount_lamports, receiver_pocket_id,
+                          tx_signature, sender_pocket_id, created_at, completed_at
+                   FROM p2p_transfers
+                   WHERE sender_meta_hash = ?1
+                   ORDER BY created_at DESC LIMIT ?2"#
+            )?;
+            let rows = stmt.query_map(params![owner_meta_hash, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    Some(row.get::<_, i64>(3)?),
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    true,
+                ))
+            })?;
+            for row in rows {
+                if let Ok(r) = row { all_entries.push(r); }
+            }
+        }
+
+        // 4. Transaction log entries (swap, kausapay, kausagate, printr - no proof)
+        if tx_type_filter.is_none() || tx_type_filter == Some("all")
+            || tx_type_filter == Some("swap") || tx_type_filter == Some("kausapay")
+            || tx_type_filter == Some("kausagate") || tx_type_filter == Some("launch_token") {
+            let type_clause = match tx_type_filter {
+                Some("swap") => "AND tx_type = 'swap'",
+                Some("kausapay") => "AND tx_type = 'kausapay'",
+                Some("kausagate") => "AND tx_type = 'kausagate'",
+                Some("launch_token") => "AND tx_type = 'launch_token'",
+                _ => "",
+            };
+            let query = format!(
+                r#"SELECT id, tx_type, status, amount_lamports, amount_display,
+                          tx_signature, description, created_at, completed_at
+                   FROM transaction_log
+                   WHERE owner_meta_hash = ?1 {}
+                   ORDER BY created_at DESC LIMIT ?2"#,
+                type_clause
+            );
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map(params![owner_meta_hash, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    false, // no proof for these
+                ))
+            })?;
+            for row in rows {
+                if let Ok(r) = row { all_entries.push(r); }
+            }
+        }
+
+        // Sort by created_at desc and truncate
+        all_entries.sort_by(|a, b| b.7.cmp(&a.7));
+        all_entries.truncate(limit as usize);
+
+        Ok(all_entries)
     }
 }
 impl Drop for PocketDatabase {
