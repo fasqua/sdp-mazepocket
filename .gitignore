@@ -16,3 +16,7 @@ package*.json
 *.backup*
 *.bak.*
 kausalayer-gate.yml
+kausa-prompt.txt
+.agents/
+skills-lock.json
+gate-specs/

@@ -42,6 +42,8 @@ argon2 = "0.5"
 rand = "0.8"
 bs58 = "0.5"
 base64 = "0.21"
+urlencoding = "2"
+sha1 = "0.10"
 hex = "0.4"
 zeroize = "1.3"
 

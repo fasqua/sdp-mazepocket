@@ -33,7 +33,7 @@ use sdp_mazepocket::{
     core::{lamports_to_sol, sol_to_lamports, generate_pocket_id},
     relay::{
         PocketDatabase, MazeGenerator, MazeGraph, MazeNode,
-        database::{MazePocket, PocketStatus, FundingRequest, P2pTransfer, Contact, MazePreferences, GateEndpoint, SendLink},
+        database::{MazePocket, PocketStatus, FundingRequest, P2pTransfer, Contact, MazePreferences, GateEndpoint, SendLink, XAccountLink},
     },
     error::{MazeError, Result},
     swap::{self, SwapQuoteRequest, SwapQuoteResponse, SwapResult},
@@ -91,6 +91,8 @@ struct AppState {
     config: Config,
     pool_lock: Arc<tokio::sync::Semaphore>,
     http_client: reqwest::Client,
+    kausa_prompt: String,
+    openrouter_api_key: String,
 }
 
 // ============ API TYPES ============
@@ -388,6 +390,7 @@ struct SendLinkEntry {
     created_at: i64,
     expires_at: i64,
     claimed_at: Option<i64>,
+    link_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3658,6 +3661,10 @@ async fn create_send_link(
     // Hash secret for storage (SHA-256)
     let secret_hash = hash_meta_address(&secret);
 
+    // Encrypt secret for recovery
+    let secret_encrypted = state.db.encrypt(secret.as_bytes())
+        .ok();
+
     // Generate link ID
     let link_id = format!("link_{}", &generate_pocket_id()[7..]);
 
@@ -3685,6 +3692,7 @@ async fn create_send_link(
         escrow_address: escrow_address.clone(),
         escrow_keypair_encrypted,
         secret_hash,
+        secret_encrypted,
         status: "active".to_string(),
         expires_at,
         claimed_by_meta_hash: None,
@@ -4225,14 +4233,28 @@ async fn list_send_links(
 
     let links = state.db.list_send_links(&owner_meta_hash)?;
 
-    let link_entries: Vec<SendLinkEntry> = links.iter().map(|l| SendLinkEntry {
-        id: l.id.clone(),
-        amount_sol: lamports_to_sol(l.amount_lamports),
-        label: l.label.clone(),
-        status: l.status.clone(),
-        created_at: l.created_at,
-        expires_at: l.expires_at,
-        claimed_at: l.claimed_at,
+    let link_entries: Vec<SendLinkEntry> = links.iter().map(|l| {
+        let link_url = if l.status == "active" {
+            l.secret_encrypted.as_ref().and_then(|enc| {
+                state.db.decrypt(enc).ok().and_then(|bytes| {
+                    String::from_utf8(bytes).ok().map(|secret| {
+                        format!("https://kausalayer.com/claim/{}?s={}", l.id, secret)
+                    })
+                })
+            })
+        } else {
+            None
+        };
+        SendLinkEntry {
+            id: l.id.clone(),
+            amount_sol: lamports_to_sol(l.amount_lamports),
+            label: l.label.clone(),
+            status: l.status.clone(),
+            created_at: l.created_at,
+            expires_at: l.expires_at,
+            claimed_at: l.claimed_at,
+            link_url,
+        }
     }).collect();
 
     let count = link_entries.len();
@@ -5739,166 +5761,92 @@ async fn kausa_pay_handler(
     }
 }
 
-// ============ KAUSAGATE PROXY ============
+// ============ KAUSAGATE SPEC GENERATOR ============
 
-/// Proxy request from Pay.sh gateway to upstream user API
-async fn gate_proxy(
-    State(state): State<Arc<AppState>>,
-    Path(endpoint_id): Path<String>,
-    req: axum::extract::Request,
-) -> axum::response::Response {
-    // Lookup endpoint in database
-    let endpoint = match state.db.list_all_gate_endpoints() {
-        Ok(endpoints) => endpoints.into_iter().find(|ep| ep.id == endpoint_id),
-        Err(e) => {
-            error!("KausaGate proxy: database error: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Internal server error"
-            }))).into_response();
-        }
-    };
-
-    let endpoint = match endpoint {
-        Some(ep) => ep,
-        None => {
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "error": "Endpoint not found"
-            }))).into_response();
-        }
-    };
-
-    if endpoint.status != "active" {
-        return (StatusCode::GONE, Json(serde_json::json!({
-            "error": "Endpoint is paused"
-        }))).into_response();
-    }
-
-    info!("KausaGate proxy: {} -> {}", endpoint_id, endpoint.endpoint_url);
-
-    // Extract method and body from incoming request
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("KausaGate proxy: failed to read request body: {}", e);
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "Failed to read request body"
-            }))).into_response();
-        }
-    };
-
-    // Build upstream request
-    let mut upstream_req = state.http_client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST),
-        &endpoint.endpoint_url,
+/// Generate individual Pay.sh YAML spec for a gate endpoint
+fn generate_gate_spec(endpoint: &GateEndpoint) -> String {
+    let recipient_key = endpoint.pocket_id.replace('-', "_");
+    
+    let yaml = format!(
+        r#"name: kausalayer-{}
+subdomain: kausalayer
+title: '{}'
+description: '{}'
+category: {}
+version: v1
+routing:
+  type: proxy
+  url: {}
+operator:
+  currencies:
+    usd: ['USDC']
+  network: mainnet
+  fee_payer: false
+recipients:
+  {}:
+    account: '{}'
+    label: '{}'
+endpoints:
+  - method: {}
+    path: /
+    resource: '{}'
+    description: '{}'
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: {}
+      splits:
+        - recipient: {}
+          percent: 100
+          memo: 'Revenue for {}'
+"#,
+        endpoint.id,
+        endpoint.description,
+        endpoint.description,
+        endpoint.category,
+        endpoint.endpoint_url,
+        recipient_key,
+        endpoint.pocket_address,
+        recipient_key,
+        endpoint.method,
+        endpoint.id,
+        endpoint.description,
+        endpoint.price_usdc,
+        recipient_key,
+        endpoint.id,
     );
+    yaml
+}
 
-    // Forward relevant headers (skip host and connection headers)
-    for (key, value) in headers.iter() {
-        let key_str = key.as_str().to_lowercase();
-        if key_str != "host" && key_str != "connection" && key_str != "transfer-encoding"
-            && !key_str.starts_with("x-pay-") {
-            if let Ok(v) = value.to_str() {
-                upstream_req = upstream_req.header(key.as_str(), v);
-            }
-        }
+/// Save gate spec YAML to disk
+fn save_gate_spec(endpoint: &GateEndpoint) {
+    let spec_dir = "/root/sdp-mazepocket/gate-specs";
+    
+    // Create directory if it doesn't exist
+    if let Err(e) = std::fs::create_dir_all(spec_dir) {
+        error!("KausaGate: failed to create spec dir: {}", e);
+        return;
     }
-
-    // Add body if present
-    if !body_bytes.is_empty() {
-        upstream_req = upstream_req.body(body_bytes.to_vec());
-    }
-
-    // Execute upstream request
-    let upstream_resp = match upstream_req.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            error!("KausaGate proxy: upstream request failed: {}", e);
-            return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                "error": format!("Upstream request failed: {}", e)
-            }))).into_response();
-        }
-    };
-
-    // Build response
-    let status = StatusCode::from_u16(upstream_resp.status().as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-    let resp_headers = upstream_resp.headers().clone();
-    let resp_body = match upstream_resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("KausaGate proxy: failed to read upstream response: {}", e);
-            return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                "error": "Failed to read upstream response"
-            }))).into_response();
-        }
-    };
-
-    let mut response = axum::response::Response::builder()
-        .status(status);
-
-    // Forward upstream response headers
-    for (key, value) in resp_headers.iter() {
-        let key_str = key.as_str().to_lowercase();
-        if key_str != "transfer-encoding" && key_str != "connection" {
-            response = response.header(key.as_str(), value.as_bytes());
-        }
-    }
-
-    match response.body(axum::body::Body::from(resp_body.to_vec())) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("KausaGate proxy: failed to build response: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to build response"
-            }))).into_response()
-        }
+    
+    let yaml_content = generate_gate_spec(endpoint);
+    let file_path = format!("{}/{}.yml", spec_dir, endpoint.id);
+    
+    match std::fs::write(&file_path, &yaml_content) {
+        Ok(_) => info!("KausaGate: spec saved to {}", file_path),
+        Err(e) => error!("KausaGate: failed to save spec: {}", e),
     }
 }
 
-/// Regenerate KausaGate YAML and restart gateway service
-fn regenerate_gate_yaml() {
-    std::thread::spawn(|| {
-        // Run YAML generator
-        match std::process::Command::new("python3")
-            .arg("/root/sdp-mazepocket/generate_gate_yaml.py")
-            .output()
-        {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("KausaGate: YAML regenerated");
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    error!("KausaGate: YAML generation failed: {}", stderr);
-                    return;
-                }
-            }
-            Err(e) => {
-                error!("KausaGate: failed to run YAML generator: {}", e);
-                return;
-            }
-        }
-
-        // Restart gateway service
-        match std::process::Command::new("systemctl")
-            .args(&["restart", "kausalayer-gate"])
-            .output()
-        {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("KausaGate: gateway service restarted");
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    error!("KausaGate: gateway restart failed: {}", stderr);
-                }
-            }
-            Err(e) => {
-                error!("KausaGate: failed to restart gateway: {}", e);
-            }
-        }
-    });
+/// Delete gate spec YAML from disk
+fn delete_gate_spec(endpoint_id: &str) {
+    let file_path = format!("/root/sdp-mazepocket/gate-specs/{}.yml", endpoint_id);
+    match std::fs::remove_file(&file_path) {
+        Ok(_) => info!("KausaGate: spec deleted: {}", file_path),
+        Err(e) => warn!("KausaGate: spec file not found or delete failed: {}", e),
+    }
 }
 
 // ============ KAUSAGATE HANDLERS ============
@@ -6072,8 +6020,8 @@ async fn gate_register(
         None,
     );
 
-    // Auto-regenerate YAML and restart gateway
-    regenerate_gate_yaml();
+    // Generate Pay.sh YAML spec for this endpoint
+    save_gate_spec(&gate_endpoint);
 
     Ok(Json(GateRegisterResponse {
         success: true,
@@ -6142,6 +6090,43 @@ async fn gate_list_all(
     }))
 }
 
+
+/// Get Pay.sh YAML spec for a gate endpoint
+async fn gate_get_yaml(
+    State(state): State<Arc<AppState>>,
+    Path(endpoint_id): Path<String>,
+) -> axum::response::Response {
+    // Find endpoint in database
+    let endpoint = match state.db.list_all_gate_endpoints() {
+        Ok(endpoints) => endpoints.into_iter().find(|ep| ep.id == endpoint_id),
+        Err(e) => {
+            error!("KausaGate: database error: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Internal server error"
+            }))).into_response();
+        }
+    };
+
+    let endpoint = match endpoint {
+        Some(ep) => ep,
+        None => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "error": "Endpoint not found"
+            }))).into_response();
+        }
+    };
+
+    let yaml_content = generate_gate_spec(&endpoint);
+    let filename = format!("{}.yml", endpoint.id);
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/yaml")
+        .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
+        .body(axum::body::Body::from(yaml_content))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response())
+}
+
 /// Delete a gate endpoint
 async fn gate_delete(
     State(state): State<Arc<AppState>>,
@@ -6154,13 +6139,21 @@ async fn gate_delete(
     let _pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
         .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
 
+    // Find endpoint_id before deleting (for spec file cleanup)
+    let endpoint_id = state.db.list_gate_endpoints_by_pocket(&pocket_id, &owner_meta_hash)?
+        .iter()
+        .find(|ep| ep.endpoint_url == req.endpoint_url)
+        .map(|ep| ep.id.clone());
+
     let deleted = state.db.delete_gate_endpoint(&req.endpoint_url, &owner_meta_hash)?;
 
     if deleted {
         info!("KausaGate: endpoint {} deleted from pocket {}", req.endpoint_url, pocket_id);
 
-        // Auto-regenerate YAML and restart gateway
-        regenerate_gate_yaml();
+        // Delete Pay.sh YAML spec file
+        if let Some(ref eid) = endpoint_id {
+            delete_gate_spec(eid);
+        }
 
         Ok(Json(GateDeleteResponse {
             success: true,
@@ -6596,6 +6589,954 @@ async fn verify_proof_handler(
     })
 }
 
+// ============ KAUSA AI CHAT ============
+
+#[derive(Debug, Deserialize)]
+struct KausaChatRequest {
+    messages: Vec<KausaChatMessage>,
+    message: String,
+    context: Option<KausaChatContext>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct KausaChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct KausaChatContext {
+    page: Option<String>,
+    connected: Option<bool>,
+    pocket_count: Option<u32>,
+    active_operation: Option<String>,
+    has_saved_wallets: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct KausaChatResponse {
+    success: bool,
+    reply: Option<String>,
+    error: Option<String>,
+}
+
+async fn kausa_chat_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<KausaChatRequest>,
+) -> Json<KausaChatResponse> {
+    // Check if Kausa is configured
+    if state.openrouter_api_key.is_empty() || state.kausa_prompt.is_empty() {
+        return Json(KausaChatResponse {
+            success: false,
+            reply: None,
+            error: Some("Kausa AI is not configured".to_string()),
+        });
+    }
+
+    // Build context string from user state
+    let context_str = if let Some(ref ctx) = req.context {
+        format!(
+            "\n\nUser context: page={}, connected={}, pocket_count={}, active_operation={}, has_saved_wallets={}",
+            ctx.page.as_deref().unwrap_or("unknown"),
+            ctx.connected.unwrap_or(false),
+            ctx.pocket_count.unwrap_or(0),
+            ctx.active_operation.as_deref().unwrap_or("null"),
+            ctx.has_saved_wallets.unwrap_or(false),
+        )
+    } else {
+        String::new()
+    };
+
+    // Build messages array for OpenRouter
+    let system_prompt = format!("{}{}", state.kausa_prompt, context_str);
+
+    let mut messages = Vec::new();
+    messages.push(serde_json::json!({
+        "role": "system",
+        "content": system_prompt,
+    }));
+
+    // Add conversation history
+    for msg in &req.messages {
+        messages.push(serde_json::json!({
+            "role": msg.role,
+            "content": msg.content,
+        }));
+    }
+
+    // Add current message
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": req.message,
+    }));
+
+    // Call OpenRouter API
+    let body = serde_json::json!({
+        "model": "anthropic/claude-sonnet-4",
+        "messages": messages,
+        "max_tokens": 1024,
+        "temperature": 0.7,
+    });
+
+    let response = match state.http_client
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", state.openrouter_api_key))
+        .header("Content-Type", "application/json")
+        .header("HTTP-Referer", "https://kausalayer.com")
+        .header("X-Title", "KausaLayer")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("Kausa chat: OpenRouter request failed: {}", e);
+            return Json(KausaChatResponse {
+                success: false,
+                reply: None,
+                error: Some("Failed to reach AI service".to_string()),
+            });
+        }
+    };
+
+    let status = response.status();
+    let response_text = match response.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Kausa chat: failed to read response: {}", e);
+            return Json(KausaChatResponse {
+                success: false,
+                reply: None,
+                error: Some("Failed to read AI response".to_string()),
+            });
+        }
+    };
+
+    if !status.is_success() {
+        error!("Kausa chat: OpenRouter returned {}: {}", status, &response_text[..200.min(response_text.len())]);
+        return Json(KausaChatResponse {
+            success: false,
+            reply: None,
+            error: Some(format!("AI service error ({})", status)),
+        });
+    }
+
+    // Parse OpenRouter response
+    let parsed: serde_json::Value = match serde_json::from_str(&response_text) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Kausa chat: failed to parse response: {}", e);
+            return Json(KausaChatResponse {
+                success: false,
+                reply: None,
+                error: Some("Failed to parse AI response".to_string()),
+            });
+        }
+    };
+
+    // Extract reply text
+    let reply = parsed["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    if reply.is_empty() {
+        return Json(KausaChatResponse {
+            success: false,
+            reply: None,
+            error: Some("AI returned empty response".to_string()),
+        });
+    }
+
+    Json(KausaChatResponse {
+        success: true,
+        reply: Some(reply),
+        error: None,
+    })
+}
+
+// ============ X ACCOUNT LINK HANDLERS ============
+
+#[derive(Debug, Deserialize)]
+struct LinkXAccountRequest {
+    meta_address: String,
+    x_user_id: String,
+    x_username: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LinkXAccountResponse {
+    success: bool,
+    x_user_id: String,
+    x_username: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct XLinkStatusResponse {
+    success: bool,
+    linked: bool,
+    x_user_id: Option<String>,
+    x_username: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XLinkStatusQuery {
+    meta_address: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnlinkXAccountRequest {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UnlinkXAccountResponse {
+    success: bool,
+    message: String,
+}
+
+/// Link X account to KausaLayer identity
+async fn link_x_account_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LinkXAccountRequest>,
+) -> std::result::Result<Json<LinkXAccountResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Check if this X user is already linked to another account
+    if let Some(existing) = state.db.get_x_link(&req.x_user_id)? {
+        if existing.owner_meta_hash != req.meta_address && existing.owner_meta_hash != owner_meta_hash {
+            return Ok(Json(LinkXAccountResponse {
+                success: false,
+                x_user_id: req.x_user_id,
+                x_username: req.x_username,
+                error: Some("This X account is already linked to another wallet".into()),
+            }));
+        }
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let link = XAccountLink {
+        x_user_id: req.x_user_id.clone(),
+        owner_meta_hash: req.meta_address.clone(),
+        x_username: req.x_username.clone(),
+        linked_at: now,
+        status: "active".to_string(),
+    };
+
+    state.db.link_x_account(&link)?;
+
+    info!("X account {} linked", req.x_user_id);
+
+    Ok(Json(LinkXAccountResponse {
+        success: true,
+        x_user_id: req.x_user_id,
+        x_username: req.x_username,
+        error: None,
+    }))
+}
+
+/// Check X link status for current user
+async fn x_link_status_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<XLinkStatusQuery>,
+) -> std::result::Result<Json<XLinkStatusResponse>, AppError> {
+    // Search by raw meta_address (stored as-is in x_account_links)
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    // Try hashed first, then raw (for bot-inserted records)
+    let link = state.db.get_x_link_by_owner(&owner_meta_hash)?
+        .or(state.db.get_x_link_by_owner(&query.meta_address)?);
+
+    match link {
+        Some(link) => Ok(Json(XLinkStatusResponse {
+            success: true,
+            linked: true,
+            x_user_id: Some(link.x_user_id),
+            x_username: link.x_username,
+        })),
+        None => Ok(Json(XLinkStatusResponse {
+            success: true,
+            linked: false,
+            x_user_id: None,
+            x_username: None,
+        })),
+    }
+}
+
+/// Unlink X account
+async fn unlink_x_account_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<UnlinkXAccountRequest>,
+) -> std::result::Result<Json<UnlinkXAccountResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Try hashed first, then raw (for bot-inserted records)
+    let link = state.db.get_x_link_by_owner(&owner_meta_hash)?
+        .or(state.db.get_x_link_by_owner(&req.meta_address)?);
+
+    match link {
+        Some(l) => {
+            state.db.unlink_x_account(&l.x_user_id)?;
+            info!("X account {} unlinked", l.x_user_id);
+            Ok(Json(UnlinkXAccountResponse {
+                success: true,
+                message: "X account unlinked".to_string(),
+            }))
+        }
+        None => Ok(Json(UnlinkXAccountResponse {
+            success: false,
+            message: "No X account linked".to_string(),
+        })),
+    }
+}
+
+
+
+// ============ X OAUTH 2.0 TOKEN EXCHANGE ============
+
+#[derive(Debug, Deserialize)]
+struct XOAuthTokenRequest {
+    code: String,
+    code_verifier: String,
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct XOAuthTokenResponse {
+    success: bool,
+    x_user_id: Option<String>,
+    x_username: Option<String>,
+    error: Option<String>,
+}
+
+/// Exchange X OAuth 2.0 authorization code for user info and link account
+async fn x_oauth_token_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<XOAuthTokenRequest>,
+) -> std::result::Result<Json<XOAuthTokenResponse>, AppError> {
+    let client_id = std::env::var("X_OAUTH2_CLIENT_ID").unwrap_or_default();
+    let client_secret = std::env::var("X_OAUTH2_CLIENT_SECRET").unwrap_or_default();
+    let callback_url = std::env::var("X_OAUTH2_CALLBACK_URL")
+        .unwrap_or_else(|_| "https://kausalayer.com/callback".to_string());
+
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Ok(Json(XOAuthTokenResponse {
+            success: false, x_user_id: None, x_username: None,
+            error: Some("X OAuth not configured".into()),
+        }));
+    }
+
+    info!("X OAuth token exchange request");
+
+    // Exchange code for access token
+    let token_resp = match state.http_client
+        .post("https://api.x.com/2/oauth2/token")
+        .basic_auth(&client_id, Some(&client_secret))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &req.code),
+            ("redirect_uri", &callback_url),
+            ("code_verifier", &req.code_verifier),
+        ])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("X OAuth token request failed: {}", e);
+            return Ok(Json(XOAuthTokenResponse {
+                success: false, x_user_id: None, x_username: None,
+                error: Some("Failed to contact X API".into()),
+            }));
+        }
+    };
+
+    let token_status = token_resp.status();
+    let token_body: serde_json::Value = match token_resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("X OAuth token parse failed: {}", e);
+            return Ok(Json(XOAuthTokenResponse {
+                success: false, x_user_id: None, x_username: None,
+                error: Some("Failed to parse X token response".into()),
+            }));
+        }
+    };
+
+    if !token_status.is_success() {
+        let err_desc = token_body["error_description"].as_str()
+            .or(token_body["error"].as_str())
+            .unwrap_or("Unknown error");
+        error!("X OAuth token error {}: {}", token_status, err_desc);
+        return Ok(Json(XOAuthTokenResponse {
+            success: false, x_user_id: None, x_username: None,
+            error: Some(format!("X auth failed: {}", err_desc)),
+        }));
+    }
+
+    let access_token = match token_body["access_token"].as_str() {
+        Some(t) => t.to_string(),
+        None => return Ok(Json(XOAuthTokenResponse {
+            success: false, x_user_id: None, x_username: None,
+            error: Some("No access token in response".into()),
+        })),
+    };
+
+    // Get user info
+    let user_body: serde_json::Value = match state.http_client
+        .get("https://api.x.com/2/users/me")
+        .bearer_auth(&access_token)
+        .send()
+        .await
+    {
+        Ok(r) => match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("X OAuth user parse failed: {}", e);
+                return Ok(Json(XOAuthTokenResponse {
+                    success: false, x_user_id: None, x_username: None,
+                    error: Some("Failed to parse X user info".into()),
+                }));
+            }
+        },
+        Err(e) => {
+            error!("X OAuth user info failed: {}", e);
+            return Ok(Json(XOAuthTokenResponse {
+                success: false, x_user_id: None, x_username: None,
+                error: Some("Failed to get X user info".into()),
+            }));
+        }
+    };
+
+    let x_user_id = match user_body["data"]["id"].as_str() {
+        Some(id) => id.to_string(),
+        None => return Ok(Json(XOAuthTokenResponse {
+            success: false, x_user_id: None, x_username: None,
+            error: Some("Could not get X user ID".into()),
+        })),
+    };
+    let x_username = user_body["data"]["username"].as_str().map(|s| s.to_string());
+
+    // Link X account
+    if let Some(existing) = state.db.get_x_link(&x_user_id)? {
+        let owner_meta_hash = hash_meta_address(&req.meta_address);
+        if existing.owner_meta_hash != req.meta_address && existing.owner_meta_hash != owner_meta_hash {
+            return Ok(Json(XOAuthTokenResponse {
+                success: false, x_user_id: Some(x_user_id), x_username,
+                error: Some("This X account is already linked to another wallet".into()),
+            }));
+        }
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let link = XAccountLink {
+        x_user_id: x_user_id.clone(),
+        owner_meta_hash: req.meta_address.clone(),
+        x_username: x_username.clone(),
+        linked_at: now,
+        status: "active".to_string(),
+    };
+    state.db.link_x_account(&link)?;
+
+    info!("X account {} (@{}) linked via OAuth", x_user_id, x_username.as_deref().unwrap_or("unknown"));
+
+    Ok(Json(XOAuthTokenResponse {
+        success: true,
+        x_user_id: Some(x_user_id),
+        x_username,
+        error: None,
+    }))
+}
+
+
+// ============ X OAUTH 2.0 SERVER-SIDE FLOW ============
+
+fn base64_url_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+#[derive(Debug, Deserialize)]
+struct XOAuthAuthorizeQuery {
+    meta_address: String,
+}
+
+/// Server-side: generate PKCE, store state, redirect user to X
+async fn x_oauth_authorize_handler(
+    Query(query): Query<XOAuthAuthorizeQuery>,
+) -> axum::response::Response {
+    let client_id = std::env::var("X_OAUTH2_CLIENT_ID").unwrap_or_default();
+    let callback_url = std::env::var("X_OAUTH2_CALLBACK_URL")
+        .unwrap_or_else(|_| "https://mazepocket.kausalayer.com/x/oauth/callback".to_string());
+
+    if client_id.is_empty() {
+        return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=not_configured").into_response();
+    }
+
+    // Generate PKCE
+    let verifier_bytes: [u8; 32] = rand::random();
+    let code_verifier = base64_url_encode(&verifier_bytes);
+
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(code_verifier.as_bytes());
+    let code_challenge = base64_url_encode(&hasher.finalize());
+
+    // Generate state
+    let state_bytes: [u8; 16] = rand::random();
+    let state = hex::encode(state_bytes);
+
+    // Store verifier + meta_address in temp file
+    let store_path = format!("/tmp/x_oauth_{}.json", state);
+    let store_data = serde_json::json!({
+        "code_verifier": code_verifier,
+        "meta_address": query.meta_address,
+        "created_at": chrono::Utc::now().timestamp()
+    });
+    let _ = std::fs::write(&store_path, store_data.to_string());
+
+    let authorize_url = format!(
+        "https://x.com/i/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        urlencoding::encode(&client_id),
+        urlencoding::encode(&callback_url),
+        urlencoding::encode("users.read tweet.read tweet.write offline.access"),
+        urlencoding::encode(&state),
+        urlencoding::encode(&code_challenge),
+    );
+
+    info!("X OAuth server-side authorize redirect, state={}", state);
+    axum::response::Redirect::temporary(&authorize_url).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct XOAuthCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// Server-side: X redirects here, exchange code for token, link account, redirect to frontend
+async fn x_oauth_callback_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<XOAuthCallbackQuery>,
+) -> axum::response::Response {
+    if let Some(ref err) = query.error {
+        let r = format!("https://kausalayer.com/callback?error={}", urlencoding::encode(err));
+        return axum::response::Redirect::temporary(&r).into_response();
+    }
+
+    let code = match &query.code {
+        Some(c) => c.clone(),
+        None => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=no_code").into_response(),
+    };
+    let state_param = match &query.state {
+        Some(s) => s.clone(),
+        None => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=no_state").into_response(),
+    };
+
+    // Load stored PKCE data
+    let store_path = format!("/tmp/x_oauth_{}.json", state_param);
+    let store_data = match std::fs::read_to_string(&store_path) {
+        Ok(d) => d,
+        Err(_) => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=invalid_state").into_response(),
+    };
+    let _ = std::fs::remove_file(&store_path);
+
+    let stored: serde_json::Value = match serde_json::from_str(&store_data) {
+        Ok(v) => v,
+        Err(_) => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=corrupt_state").into_response(),
+    };
+
+    let code_verifier = stored["code_verifier"].as_str().unwrap_or_default().to_string();
+    let meta_address = stored["meta_address"].as_str().unwrap_or_default().to_string();
+
+    if code_verifier.is_empty() || meta_address.is_empty() {
+        return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=missing_data").into_response();
+    }
+
+    let client_id = std::env::var("X_OAUTH2_CLIENT_ID").unwrap_or_default();
+    let client_secret = std::env::var("X_OAUTH2_CLIENT_SECRET").unwrap_or_default();
+    let callback_url = std::env::var("X_OAUTH2_CALLBACK_URL")
+        .unwrap_or_else(|_| "https://mazepocket.kausalayer.com/x/oauth/callback".to_string());
+
+    // Exchange code for token
+    let token_resp = match state.http_client
+        .post("https://api.x.com/2/oauth2/token")
+        .basic_auth(&client_id, Some(&client_secret))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", &callback_url),
+            ("code_verifier", &code_verifier),
+        ])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("X OAuth callback token request failed: {}", e);
+            return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=token_failed").into_response();
+        }
+    };
+
+    let token_body: serde_json::Value = match token_resp.json().await {
+        Ok(v) => v,
+        Err(_) => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=token_parse_failed").into_response(),
+    };
+
+    let access_token = match token_body["access_token"].as_str() {
+        Some(t) => t.to_string(),
+        None => {
+            let err = token_body["error_description"].as_str()
+                .or(token_body["error"].as_str())
+                .unwrap_or("unknown");
+            error!("X OAuth no access_token: {}", err);
+            let r = format!("https://kausalayer.com/callback?error={}", urlencoding::encode(err));
+            return axum::response::Redirect::temporary(&r).into_response();
+        }
+    };
+
+    // Get user info
+    let user_body: serde_json::Value = match state.http_client
+        .get("https://api.x.com/2/users/me")
+        .bearer_auth(&access_token)
+        .send()
+        .await
+    {
+        Ok(r) => match r.json().await {
+            Ok(v) => v,
+            Err(_) => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=user_parse_failed").into_response(),
+        },
+        Err(_) => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=user_fetch_failed").into_response(),
+    };
+
+    let x_user_id = match user_body["data"]["id"].as_str() {
+        Some(id) => id.to_string(),
+        None => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=no_user_id").into_response(),
+    };
+    let x_username = user_body["data"]["username"].as_str().map(|s| s.to_string());
+
+    // Check existing link
+    if let Some(existing) = state.db.get_x_link(&x_user_id).unwrap_or(None) {
+        let owner_meta_hash = hash_meta_address(&meta_address);
+        if existing.owner_meta_hash != meta_address && existing.owner_meta_hash != owner_meta_hash {
+            return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=already_linked_other").into_response();
+        }
+    }
+
+    // Link account
+    let now = chrono::Utc::now().timestamp();
+    let link = XAccountLink {
+        x_user_id: x_user_id.clone(),
+        owner_meta_hash: meta_address,
+        x_username: x_username.clone(),
+        linked_at: now,
+        status: "active".to_string(),
+    };
+
+    if let Err(e) = state.db.link_x_account(&link) {
+        error!("X OAuth link failed: {}", e);
+        return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=link_failed").into_response();
+    }
+
+    let uname = x_username.as_deref().unwrap_or(&x_user_id);
+    info!("X account {} (@{}) linked via server-side OAuth", x_user_id, uname);
+
+    let r = format!(
+        "https://kausalayer.com/callback?success=true&x_username={}&x_user_id={}",
+        urlencoding::encode(uname),
+        urlencoding::encode(&x_user_id),
+    );
+    axum::response::Redirect::temporary(&r).into_response()
+}
+
+
+// ============ X OAUTH 1.0a SERVER-SIDE FLOW ============
+
+#[derive(Debug, Deserialize)]
+struct XOAuth1AuthorizeQuery {
+    meta_address: String,
+}
+
+/// Step 1: Get request token from X, store it, redirect user to X authorize
+async fn x_oauth1_authorize_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<XOAuth1AuthorizeQuery>,
+) -> axum::response::Response {
+    let consumer_key = std::env::var("X_APP_KEY").unwrap_or_default();
+    let consumer_secret = std::env::var("X_APP_SECRET").unwrap_or_default();
+    let callback_url = std::env::var("X_OAUTH1_CALLBACK_URL")
+        .unwrap_or_else(|_| "https://mazepocket.kausalayer.com/x/oauth1/callback".to_string());
+
+    if consumer_key.is_empty() || consumer_secret.is_empty() {
+        return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=oauth1_not_configured").into_response();
+    }
+
+    // Build OAuth 1.0a request_token request
+    let nonce_bytes: [u8; 16] = rand::random();
+    let nonce = hex::encode(nonce_bytes);
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+
+    // Parameters for signature
+    let mut params = vec![
+        ("oauth_callback", callback_url.as_str()),
+        ("oauth_consumer_key", consumer_key.as_str()),
+        ("oauth_nonce", nonce.as_str()),
+        ("oauth_signature_method", "HMAC-SHA1"),
+        ("oauth_timestamp", timestamp.as_str()),
+        ("oauth_version", "1.0"),
+    ];
+    params.sort_by_key(|p| p.0);
+
+    let param_string: String = params.iter()
+        .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let base_string = format!(
+        "POST&{}&{}",
+        urlencoding::encode("https://api.x.com/oauth/request_token"),
+        urlencoding::encode(&param_string)
+    );
+
+    let signing_key = format!("{}&", urlencoding::encode(&consumer_secret));
+
+    // HMAC-SHA1
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    type HmacSha1 = Hmac<Sha1>;
+    let mut mac = HmacSha1::new_from_slice(signing_key.as_bytes()).unwrap();
+    mac.update(base_string.as_bytes());
+    let signature = base64_url_encode_standard(&mac.finalize().into_bytes());
+
+    let auth_header = format!(
+        r#"OAuth oauth_callback="{}", oauth_consumer_key="{}", oauth_nonce="{}", oauth_signature="{}", oauth_signature_method="HMAC-SHA1", oauth_timestamp="{}", oauth_version="1.0""#,
+        urlencoding::encode(&callback_url),
+        urlencoding::encode(&consumer_key),
+        urlencoding::encode(&nonce),
+        urlencoding::encode(&signature),
+        urlencoding::encode(&timestamp),
+    );
+
+    let resp = match state.http_client
+        .post("https://api.x.com/oauth/request_token")
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("OAuth 1.0a request_token failed: {}", e);
+            return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=request_token_failed").into_response();
+        }
+    };
+
+    let body = match resp.text().await {
+        Ok(t) => t,
+        Err(_) => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=request_token_parse").into_response(),
+    };
+
+    // Parse response: oauth_token=xxx&oauth_token_secret=xxx&oauth_callback_confirmed=true
+    let parsed: std::collections::HashMap<String, String> = body.split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            Some((parts.next()?.to_string(), parts.next()?.to_string()))
+        })
+        .collect();
+
+    let oauth_token = match parsed.get("oauth_token") {
+        Some(t) => t.clone(),
+        None => {
+            error!("OAuth 1.0a no oauth_token in response: {}", body);
+            return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=no_request_token").into_response();
+        }
+    };
+    let oauth_token_secret = parsed.get("oauth_token_secret").cloned().unwrap_or_default();
+
+    // Store token_secret + meta_address
+    let store_path = format!("/tmp/x_oauth1_{}.json", oauth_token);
+    let store_data = serde_json::json!({
+        "oauth_token_secret": oauth_token_secret,
+        "meta_address": query.meta_address,
+        "created_at": chrono::Utc::now().timestamp()
+    });
+    let _ = std::fs::write(&store_path, store_data.to_string());
+
+    let authorize_url = format!("https://api.x.com/oauth/authorize?oauth_token={}", urlencoding::encode(&oauth_token));
+    info!("OAuth 1.0a redirect to X authorize, token={}", &oauth_token[..10.min(oauth_token.len())]);
+
+    axum::response::Redirect::temporary(&authorize_url).into_response()
+}
+
+fn base64_url_encode_standard(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+#[derive(Debug, Deserialize)]
+struct XOAuth1CallbackQuery {
+    oauth_token: Option<String>,
+    oauth_verifier: Option<String>,
+    denied: Option<String>,
+}
+
+/// Step 2: X redirects here with oauth_token + oauth_verifier
+async fn x_oauth1_callback_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<XOAuth1CallbackQuery>,
+) -> axum::response::Response {
+    // User denied
+    if query.denied.is_some() {
+        return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=denied").into_response();
+    }
+
+    let oauth_token = match &query.oauth_token {
+        Some(t) => t.clone(),
+        None => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=no_token").into_response(),
+    };
+    let oauth_verifier = match &query.oauth_verifier {
+        Some(v) => v.clone(),
+        None => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=no_verifier").into_response(),
+    };
+
+    // Load stored data
+    let store_path = format!("/tmp/x_oauth1_{}.json", oauth_token);
+    let store_data = match std::fs::read_to_string(&store_path) {
+        Ok(d) => d,
+        Err(_) => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=invalid_token").into_response(),
+    };
+    let _ = std::fs::remove_file(&store_path);
+
+    let stored: serde_json::Value = match serde_json::from_str(&store_data) {
+        Ok(v) => v,
+        Err(_) => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=corrupt_data").into_response(),
+    };
+
+    let oauth_token_secret = stored["oauth_token_secret"].as_str().unwrap_or_default().to_string();
+    let meta_address = stored["meta_address"].as_str().unwrap_or_default().to_string();
+
+    if meta_address.is_empty() {
+        return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=no_meta").into_response();
+    }
+
+    let consumer_key = std::env::var("X_APP_KEY").unwrap_or_default();
+    let consumer_secret = std::env::var("X_APP_SECRET").unwrap_or_default();
+
+    // Exchange for access token
+    let nonce_bytes: [u8; 16] = rand::random();
+    let nonce = hex::encode(nonce_bytes);
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+
+    let mut params = vec![
+        ("oauth_consumer_key", consumer_key.as_str()),
+        ("oauth_nonce", nonce.as_str()),
+        ("oauth_signature_method", "HMAC-SHA1"),
+        ("oauth_timestamp", timestamp.as_str()),
+        ("oauth_token", oauth_token.as_str()),
+        ("oauth_verifier", oauth_verifier.as_str()),
+        ("oauth_version", "1.0"),
+    ];
+    params.sort_by_key(|p| p.0);
+
+    let param_string: String = params.iter()
+        .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let base_string = format!(
+        "POST&{}&{}",
+        urlencoding::encode("https://api.x.com/oauth/access_token"),
+        urlencoding::encode(&param_string)
+    );
+
+    let signing_key = format!("{}&{}", urlencoding::encode(&consumer_secret), urlencoding::encode(&oauth_token_secret));
+
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    type HmacSha1 = Hmac<Sha1>;
+    let mut mac = HmacSha1::new_from_slice(signing_key.as_bytes()).unwrap();
+    mac.update(base_string.as_bytes());
+    let signature = base64_url_encode_standard(&mac.finalize().into_bytes());
+
+    let auth_header = format!(
+        r#"OAuth oauth_consumer_key="{}", oauth_nonce="{}", oauth_signature="{}", oauth_signature_method="HMAC-SHA1", oauth_timestamp="{}", oauth_token="{}", oauth_verifier="{}", oauth_version="1.0""#,
+        urlencoding::encode(&consumer_key),
+        urlencoding::encode(&nonce),
+        urlencoding::encode(&signature),
+        urlencoding::encode(&timestamp),
+        urlencoding::encode(&oauth_token),
+        urlencoding::encode(&oauth_verifier),
+    );
+
+    let resp = match state.http_client
+        .post("https://api.x.com/oauth/access_token")
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("OAuth 1.0a access_token failed: {}", e);
+            return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=access_token_failed").into_response();
+        }
+    };
+
+    let body = match resp.text().await {
+        Ok(t) => t,
+        Err(_) => return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=access_token_parse").into_response(),
+    };
+
+    let parsed: std::collections::HashMap<String, String> = body.split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            Some((parts.next()?.to_string(), parts.next()?.to_string()))
+        })
+        .collect();
+
+    let x_user_id = match parsed.get("user_id") {
+        Some(id) => id.clone(),
+        None => {
+            error!("OAuth 1.0a no user_id: {}", body);
+            return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=no_user_id").into_response();
+        }
+    };
+    let x_username = parsed.get("screen_name").cloned();
+
+    // Check existing link
+    if let Some(existing) = state.db.get_x_link(&x_user_id).unwrap_or(None) {
+        let owner_meta_hash = hash_meta_address(&meta_address);
+        if existing.owner_meta_hash != meta_address && existing.owner_meta_hash != owner_meta_hash {
+            return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=already_linked_other").into_response();
+        }
+    }
+
+    // Link account
+    let now = chrono::Utc::now().timestamp();
+    let link = XAccountLink {
+        x_user_id: x_user_id.clone(),
+        owner_meta_hash: meta_address,
+        x_username: x_username.clone(),
+        linked_at: now,
+        status: "active".to_string(),
+    };
+
+    if let Err(e) = state.db.link_x_account(&link) {
+        error!("OAuth 1.0a link failed: {}", e);
+        return axum::response::Redirect::temporary("https://kausalayer.com/callback?error=link_failed").into_response();
+    }
+
+    let uname = x_username.as_deref().unwrap_or(&x_user_id);
+    info!("X account {} (@{}) linked via OAuth 1.0a", x_user_id, uname);
+
+    let r = format!(
+        "https://kausalayer.com/callback?success=true&x_username={}&x_user_id={}",
+        urlencoding::encode(uname),
+        urlencoding::encode(&x_user_id),
+    );
+    axum::response::Redirect::temporary(&r).into_response()
+}
+
 // ============ MAIN ============
 
 #[tokio::main]
@@ -6630,9 +7571,24 @@ async fn main() {
     let rpc_display = config.rpc_url.split('?').next().unwrap_or("unknown");
     info!("RPC client connected to {}", rpc_display);
 
+    // Load Kausa AI prompt
+    let kausa_prompt = std::fs::read_to_string("kausa-prompt.txt")
+        .unwrap_or_else(|e| {
+            warn!("Failed to load kausa-prompt.txt: {}, using empty prompt", e);
+            String::new()
+        });
+    info!("Kausa AI prompt loaded ({} bytes)", kausa_prompt.len());
+
+    // Load OpenRouter API key
+    let openrouter_api_key = std::env::var("OPENROUTER_API_KEY")
+        .unwrap_or_default();
+    if openrouter_api_key.is_empty() {
+        warn!("OPENROUTER_API_KEY not set, Kausa chat endpoint will be disabled");
+    }
+
     // Create app state
     let http_client = reqwest::Client::new();
-    let state = Arc::new(AppState { db, rpc, config: config.clone(), pool_lock: Arc::new(tokio::sync::Semaphore::new(1)), http_client });
+    let state = Arc::new(AppState { db, rpc, config: config.clone(), pool_lock: Arc::new(tokio::sync::Semaphore::new(1)), http_client, kausa_prompt, openrouter_api_key });
 
     // Start deposit monitor
     let monitor_state = state.clone();
@@ -6693,7 +7649,7 @@ async fn main() {
         .route("/pocket/:pocket_id/gate/endpoints", get(gate_list_by_pocket))
         .route("/pocket/:pocket_id/gate/endpoint", axum::routing::delete(gate_delete))
         .route("/gate/endpoints", get(gate_list_all))
-        .route("/gate/proxy/:endpoint_id", post(gate_proxy).get(gate_proxy))
+        .route("/gate/yaml/:endpoint_id", get(gate_get_yaml))
         .route("/pocket/:pocket_id/proof/:route_id", get(get_proof_handler))
         .route("/pocket/:pocket_id/proof/:route_id/download", get(download_proof_handler))
         .route("/history", get(get_history_handler))
@@ -6702,6 +7658,15 @@ async fn main() {
         .route("/send-link/:id", get(get_send_link_info))
         .route("/send-link/:id/claim", post(claim_send_link))
         .route("/send-links", get(list_send_links))
+        .route("/x/link", post(link_x_account_handler))
+        .route("/x/link-status", get(x_link_status_handler))
+        .route("/x/unlink", post(unlink_x_account_handler))
+        .route("/x/oauth/token", post(x_oauth_token_handler))
+        .route("/x/oauth/authorize", get(x_oauth_authorize_handler))
+        .route("/x/oauth/callback", get(x_oauth_callback_handler))
+        .route("/x/oauth1/authorize", get(x_oauth1_authorize_handler))
+        .route("/x/oauth1/callback", get(x_oauth1_callback_handler))
+        .route("/api/chat", post(kausa_chat_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)

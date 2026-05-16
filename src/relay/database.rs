@@ -204,6 +204,7 @@ pub struct SendLink {
     pub escrow_address: String,
     pub escrow_keypair_encrypted: Vec<u8>,
     pub secret_hash: String,
+    pub secret_encrypted: Option<Vec<u8>>,
     pub status: String,
     pub expires_at: i64,
     pub claimed_by_meta_hash: Option<String>,
@@ -214,6 +215,16 @@ pub struct SendLink {
     pub claim_maze_json: Option<String>,
     pub created_at: i64,
 }
+/// X account link for X Bot
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XAccountLink {
+    pub x_user_id: String,
+    pub owner_meta_hash: String,
+    pub x_username: Option<String>,
+    pub linked_at: i64,
+    pub status: String,
+}
+
 /// Database wrapper with Argon2id + AES-256-GCM encryption
 pub struct PocketDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -625,6 +636,9 @@ impl PocketDatabase {
             [],
         )?;
 
+        // Migration: add secret_encrypted column
+        let _ = conn.execute("ALTER TABLE send_links ADD COLUMN secret_encrypted BLOB", []);
+
         // Send links indexes
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_send_links_owner ON send_links(owner_meta_hash)",
@@ -632,6 +646,28 @@ impl PocketDatabase {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_send_links_status ON send_links(status)",
+            [],
+        )?;
+
+        // X account links table (for X Bot)
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS x_account_links (
+                x_user_id TEXT PRIMARY KEY,
+                owner_meta_hash TEXT NOT NULL,
+                x_username TEXT,
+                linked_at INTEGER NOT NULL,
+                status TEXT DEFAULT 'active'
+            )"#,
+            [],
+        )?;
+
+        // X account links indexes
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_xlinks_owner ON x_account_links(owner_meta_hash)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_xlinks_status ON x_account_links(status)",
             [],
         )?;
 
@@ -1643,6 +1679,34 @@ impl PocketDatabase {
             entries.push(row.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
         }
         
+		// Get send_links
+		let mut stmt4 = conn.prepare(
+			r#"SELECT id, amount_lamports, status, escrow_address,
+				  created_at, claimed_at
+			   FROM send_links
+			   WHERE owner_meta_hash = ?1
+			   ORDER BY created_at DESC
+			   LIMIT ?2"#
+		)?;
+
+		let link_rows = stmt4.query_map(params![owner_meta_hash, limit], |row| {
+			Ok(RouteHistoryEntry {
+				id: row.get(0)?,
+				route_type: "send_link".to_string(),
+				amount_lamports: row.get::<_, i64>(1)? as u64,
+				fee_lamports: 0,
+				status: row.get(2)?,
+				destination: row.get(3)?,
+				created_at: row.get(4)?,
+				completed_at: row.get(5)?,
+				tx_signature: None,
+			})
+		})?;
+
+		for row in link_rows {
+			entries.push(row.map_err(|e| MazeError::DatabaseError(e.to_string()))?);
+		}
+
         // Sort by created_at desc
         entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         entries.truncate(limit as usize);
@@ -1685,14 +1749,35 @@ impl PocketDatabase {
             params![owner_meta_hash],
             |row| row.get(0)
         ).unwrap_or(0);
+		// Add send_link stats
+		let link_routes_today: i64 = conn.query_row(
+			"SELECT COUNT(*) FROM send_links WHERE owner_meta_hash = ?1 AND created_at >= ?2",
+			params![owner_meta_hash, today_start],
+			|row| row.get(0)
+		).unwrap_or(0);
+		let link_routes_week: i64 = conn.query_row(
+			"SELECT COUNT(*) FROM send_links WHERE owner_meta_hash = ?1 AND created_at >= ?2",
+			params![owner_meta_hash, week_start],
+			|row| row.get(0)
+		).unwrap_or(0);
+		let link_routes_month: i64 = conn.query_row(
+			"SELECT COUNT(*) FROM send_links WHERE owner_meta_hash = ?1 AND created_at >= ?2",
+			params![owner_meta_hash, month_start],
+			|row| row.get(0)
+		).unwrap_or(0);
+		let link_volume: i64 = conn.query_row(
+			"SELECT COALESCE(SUM(amount_lamports), 0) FROM send_links WHERE owner_meta_hash = ?1 AND (status = 'active' OR status = 'claimed')",
+			params![owner_meta_hash],
+			|row| row.get(0)
+		).unwrap_or(0);
 
-        Ok(UsageStats {
-            routes_today,
-            routes_this_week,
-            routes_this_month,
-            total_volume_lamports: total_volume as u64,
-        })
-    }
+		Ok(UsageStats {
+			routes_today: routes_today + link_routes_today,
+			routes_this_week: routes_this_week + link_routes_week,
+			routes_this_month: routes_this_month + link_routes_month,
+			total_volume_lamports: (total_volume + link_volume) as u64,
+		})
+	    }
 
     // ============ CONTACT OPERATIONS ============
 
@@ -2489,6 +2574,41 @@ impl PocketDatabase {
             }
         }
 
+		// 5. Send link entries (has proof)
+		if tx_type_filter.is_none() || tx_type_filter == Some("all") || tx_type_filter == Some("send_link") {
+			let mut stmt = conn.prepare(
+				r#"SELECT id, status, amount_lamports, label, created_at, claimed_at
+				   FROM send_links
+				   WHERE owner_meta_hash = ?1
+				   ORDER BY created_at DESC LIMIT ?2"#
+			)?;
+			let rows = stmt.query_map(params![owner_meta_hash, limit], |row| {
+				let id: String = row.get(0)?;
+				let status: String = row.get(1)?;
+				let amount: i64 = row.get(2)?;
+				let label: Option<String> = row.get(3)?;
+				let created: i64 = row.get(4)?;
+				let claimed_at: Option<i64> = row.get(5)?;
+				let desc = format!("Send link{}", label.map(|l| format!(": {}", l)).unwrap_or_default());
+				let amount_display = format!("{:.4} SOL", amount as f64 / 1_000_000_000.0);
+				Ok((
+					id,
+					"send_link".to_string(),
+					status,
+					Some(amount),
+					Some(amount_display),
+					None::<String>,
+					Some(desc),
+					created,
+					claimed_at,
+					true, // has_proof
+				))
+			})?;
+			for row in rows {
+				if let Ok(r) = row { all_entries.push(r); }
+			}
+		}
+
         // Sort by created_at desc and truncate
         all_entries.sort_by(|a, b| b.7.cmp(&a.7));
         all_entries.truncate(limit as usize);
@@ -2505,9 +2625,9 @@ impl PocketDatabase {
         conn.execute(
             r#"INSERT INTO send_links
                (id, sender_pocket_id, owner_meta_hash, amount_lamports, label,
-                escrow_address, escrow_keypair_encrypted, secret_hash, status,
-                expires_at, funding_maze_json, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                escrow_address, escrow_keypair_encrypted, secret_hash, secret_encrypted,
+                status, expires_at, funding_maze_json, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
             params![
                 link.id,
                 link.sender_pocket_id,
@@ -2517,6 +2637,7 @@ impl PocketDatabase {
                 link.escrow_address,
                 link.escrow_keypair_encrypted,
                 link.secret_hash,
+                link.secret_encrypted,
                 link.status,
                 link.expires_at,
                 link.funding_maze_json,
@@ -2531,8 +2652,8 @@ impl PocketDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT id, sender_pocket_id, owner_meta_hash, amount_lamports, label,
-                      escrow_address, escrow_keypair_encrypted, secret_hash, status,
-                      expires_at, claimed_by_meta_hash, claimed_pocket_id, claimed_at,
+                      escrow_address, escrow_keypair_encrypted, secret_hash, secret_encrypted,
+                      status, expires_at, claimed_by_meta_hash, claimed_pocket_id, claimed_at,
                       refund_tx_signature, funding_maze_json, claim_maze_json, created_at
                FROM send_links WHERE id = ?1"#
         )?;
@@ -2547,15 +2668,16 @@ impl PocketDatabase {
                 escrow_address: row.get(5)?,
                 escrow_keypair_encrypted: row.get(6)?,
                 secret_hash: row.get(7)?,
-                status: row.get(8)?,
-                expires_at: row.get(9)?,
-                claimed_by_meta_hash: row.get(10)?,
-                claimed_pocket_id: row.get(11)?,
-                claimed_at: row.get(12)?,
-                refund_tx_signature: row.get(13)?,
-                funding_maze_json: row.get(14)?,
-                claim_maze_json: row.get(15)?,
-                created_at: row.get(16)?,
+                secret_encrypted: row.get(8)?,
+                status: row.get(9)?,
+                expires_at: row.get(10)?,
+                claimed_by_meta_hash: row.get(11)?,
+                claimed_pocket_id: row.get(12)?,
+                claimed_at: row.get(13)?,
+                refund_tx_signature: row.get(14)?,
+                funding_maze_json: row.get(15)?,
+                claim_maze_json: row.get(16)?,
+                created_at: row.get(17)?,
             })
         });
 
@@ -2571,8 +2693,8 @@ impl PocketDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT id, sender_pocket_id, owner_meta_hash, amount_lamports, label,
-                      escrow_address, escrow_keypair_encrypted, secret_hash, status,
-                      expires_at, claimed_by_meta_hash, claimed_pocket_id, claimed_at,
+                      escrow_address, escrow_keypair_encrypted, secret_hash, secret_encrypted,
+                      status, expires_at, claimed_by_meta_hash, claimed_pocket_id, claimed_at,
                       refund_tx_signature, funding_maze_json, claim_maze_json, created_at
                FROM send_links WHERE owner_meta_hash = ?1
                ORDER BY created_at DESC"#
@@ -2588,15 +2710,16 @@ impl PocketDatabase {
                 escrow_address: row.get(5)?,
                 escrow_keypair_encrypted: row.get(6)?,
                 secret_hash: row.get(7)?,
-                status: row.get(8)?,
-                expires_at: row.get(9)?,
-                claimed_by_meta_hash: row.get(10)?,
-                claimed_pocket_id: row.get(11)?,
-                claimed_at: row.get(12)?,
-                refund_tx_signature: row.get(13)?,
-                funding_maze_json: row.get(14)?,
-                claim_maze_json: row.get(15)?,
-                created_at: row.get(16)?,
+                secret_encrypted: row.get(8)?,
+                status: row.get(9)?,
+                expires_at: row.get(10)?,
+                claimed_by_meta_hash: row.get(11)?,
+                claimed_pocket_id: row.get(12)?,
+                claimed_at: row.get(13)?,
+                refund_tx_signature: row.get(14)?,
+                funding_maze_json: row.get(15)?,
+                claim_maze_json: row.get(16)?,
+                created_at: row.get(17)?,
             })
         })?;
 
@@ -2649,8 +2772,8 @@ impl PocketDatabase {
         let now = chrono::Utc::now().timestamp();
         let mut stmt = conn.prepare(
             r#"SELECT id, sender_pocket_id, owner_meta_hash, amount_lamports, label,
-                      escrow_address, escrow_keypair_encrypted, secret_hash, status,
-                      expires_at, claimed_by_meta_hash, claimed_pocket_id, claimed_at,
+                      escrow_address, escrow_keypair_encrypted, secret_hash, secret_encrypted,
+                      status, expires_at, claimed_by_meta_hash, claimed_pocket_id, claimed_at,
                       refund_tx_signature, funding_maze_json, claim_maze_json, created_at
                FROM send_links WHERE status = 'active' AND expires_at < ?1"#
         )?;
@@ -2665,15 +2788,16 @@ impl PocketDatabase {
                 escrow_address: row.get(5)?,
                 escrow_keypair_encrypted: row.get(6)?,
                 secret_hash: row.get(7)?,
-                status: row.get(8)?,
-                expires_at: row.get(9)?,
-                claimed_by_meta_hash: row.get(10)?,
-                claimed_pocket_id: row.get(11)?,
-                claimed_at: row.get(12)?,
-                refund_tx_signature: row.get(13)?,
-                funding_maze_json: row.get(14)?,
-                claim_maze_json: row.get(15)?,
-                created_at: row.get(16)?,
+                secret_encrypted: row.get(8)?,
+                status: row.get(9)?,
+                expires_at: row.get(10)?,
+                claimed_by_meta_hash: row.get(11)?,
+                claimed_pocket_id: row.get(12)?,
+                claimed_at: row.get(13)?,
+                refund_tx_signature: row.get(14)?,
+                funding_maze_json: row.get(15)?,
+                claim_maze_json: row.get(16)?,
+                created_at: row.get(17)?,
             })
         })?;
 
@@ -2692,6 +2816,86 @@ impl PocketDatabase {
             params![maze_json, link_id],
         )?;
         Ok(())
+    }
+
+    // ============ X ACCOUNT LINK OPERATIONS ============
+
+    /// Link an X account to a KausaLayer identity
+    pub fn link_x_account(&self, link: &XAccountLink) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT OR REPLACE INTO x_account_links
+               (x_user_id, owner_meta_hash, x_username, linked_at, status)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            params![
+                link.x_user_id,
+                link.owner_meta_hash,
+                link.x_username,
+                link.linked_at,
+                link.status,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get X account link by X user ID
+    pub fn get_x_link(&self, x_user_id: &str) -> Result<Option<XAccountLink>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT x_user_id, owner_meta_hash, x_username, linked_at, status
+               FROM x_account_links WHERE x_user_id = ?1 AND status = 'active'"#
+        )?;
+
+        let result = stmt.query_row(params![x_user_id], |row| {
+            Ok(XAccountLink {
+                x_user_id: row.get(0)?,
+                owner_meta_hash: row.get(1)?,
+                x_username: row.get(2)?,
+                linked_at: row.get(3)?,
+                status: row.get(4)?,
+            })
+        });
+
+        match result {
+            Ok(link) => Ok(Some(link)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
+    }
+
+    /// Get X account link by owner_meta_hash
+    pub fn get_x_link_by_owner(&self, owner_meta_hash: &str) -> Result<Option<XAccountLink>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT x_user_id, owner_meta_hash, x_username, linked_at, status
+               FROM x_account_links WHERE owner_meta_hash = ?1 AND status = 'active'"#
+        )?;
+
+        let result = stmt.query_row(params![owner_meta_hash], |row| {
+            Ok(XAccountLink {
+                x_user_id: row.get(0)?,
+                owner_meta_hash: row.get(1)?,
+                x_username: row.get(2)?,
+                linked_at: row.get(3)?,
+                status: row.get(4)?,
+            })
+        });
+
+        match result {
+            Ok(link) => Ok(Some(link)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
+    }
+
+    /// Unlink X account (soft delete)
+    pub fn unlink_x_account(&self, x_user_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE x_account_links SET status = 'inactive' WHERE x_user_id = ?1",
+            params![x_user_id],
+        )?;
+        Ok(rows > 0)
     }
 }
 

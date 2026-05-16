@@ -467,7 +467,7 @@ pub async fn execute_x402_payment(
         };
         retry_req = retry_req
             .header("PAYMENT-SIGNATURE", &payment_b64)
-            .timeout(std::time::Duration::from_secs(30));
+            .timeout(std::time::Duration::from_secs(300));
         if let Some(body) = request_body {
             retry_req = retry_req.header("Content-Type", "application/json").body(body.to_string());
         }
@@ -613,7 +613,7 @@ pub async fn execute_x402_payment(
         };
         retry_req2 = retry_req2
             .header("PAYMENT-SIGNATURE", &payment_b64)
-            .timeout(std::time::Duration::from_secs(30));
+            .timeout(std::time::Duration::from_secs(300));
         if let Some(body) = request_body {
             retry_req2 = retry_req2.header("Content-Type", "application/json").body(body.to_string());
         }
