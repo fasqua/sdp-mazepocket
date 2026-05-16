@@ -40,6 +40,7 @@ use sdp_mazepocket::{
     tokens::{self, TokenInfo},
     printr::{self, PrintrCreateRequest},
     payment_router,
+    evm,
 };
 
 
@@ -601,6 +602,8 @@ async fn create_pocket(
         status: PocketStatus::Active,
         label: None,
         archived: false,
+        evm_address: None,
+        evm_keypair_encrypted: None,
     };
 
     state.db.create_pocket(&pocket)
@@ -730,6 +733,8 @@ async fn create_route(
         status: PocketStatus::Active,
         label: None,
         archived: false,
+        evm_address: None,
+        evm_keypair_encrypted: None,
     };
     state.db.create_pocket(&pocket)?;
     // Create funding request with destination (direct route)
@@ -4020,6 +4025,8 @@ async fn claim_send_link(
         status: PocketStatus::Active,
         label: link.label.clone(),
         archived: false,
+        evm_address: None,
+        evm_keypair_encrypted: None,
     };
 
     state.db.create_pocket(&pocket)?;
@@ -7667,6 +7674,11 @@ async fn main() {
         .route("/x/oauth1/authorize", get(x_oauth1_authorize_handler))
         .route("/x/oauth1/callback", get(x_oauth1_callback_handler))
         .route("/api/chat", post(kausa_chat_handler))
+        .route("/pocket/:pocket_id/evm-info", get(evm_info_handler))
+        .route("/pocket/:pocket_id/evm-export", post(evm_export_handler))
+        .route("/pocket/:pocket_id/cross-swap", post(cross_swap_handler))
+        .route("/pocket/:pocket_id/cross-swap-sell", post(cross_swap_sell_handler))
+        .route("/pocket/:pocket_id/cross-swap-status", get(cross_swap_status_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -8544,4 +8556,553 @@ async fn delete_partner_handler(
             message: "Partner not found".to_string(),
         }))
     }
+}
+
+
+// ============ CROSS-CHAIN EVM TYPES ============
+
+#[derive(Debug, Deserialize)]
+struct EvmInfoQuery {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EvmInfoResponse {
+    success: bool,
+    evm_address: Option<String>,
+    eth_balance: Option<String>,
+    tokens: Vec<serde_json::Value>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvmExportRequest {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EvmExportResponse {
+    success: bool,
+    evm_address: Option<String>,
+    evm_private_key: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossSwapRequest {
+    meta_address: String,
+    target_token: String,
+    amount_sol: f64,
+    target_chain: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CrossSwapResponse {
+    success: bool,
+    order_id: Option<String>,
+    estimated_output: Option<serde_json::Value>,
+    tx_signature: Option<String>,
+    error: Option<String>,
+}
+
+// ============ CROSS-CHAIN EVM HANDLERS ============
+
+/// Get EVM wallet info for a pocket (lazy-generates if needed)
+async fn evm_info_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Query(query): Query<EvmInfoQuery>,
+) -> std::result::Result<Json<EvmInfoResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    // Lazy generate EVM keypair if not exists
+    let evm_address = if let Some(addr) = pocket.evm_address.clone() {
+        addr
+    } else {
+        // Generate new EVM keypair
+        let evm_kp = evm::generate_keypair().await
+            .map_err(|e| AppError(e))?;
+
+        // Encrypt EVM private key with same encryption as Solana keypairs
+        let evm_encrypted = state.db.encrypt(evm_kp.private_key.as_bytes())?;
+
+        // Store in database
+        state.db.update_pocket_evm(&pocket_id, &owner_meta_hash, &evm_kp.address, &evm_encrypted)?;
+
+        info!("Generated EVM wallet {} for pocket {}", evm_kp.address, pocket_id);
+        evm_kp.address
+    };
+
+    // Get EVM balance
+    match evm::get_balance(&evm_address, None).await {
+        Ok(balance_info) => {
+            let tokens: Vec<serde_json::Value> = balance_info.tokens.iter()
+                .map(|t| serde_json::json!({
+                    "address": t.address,
+                    "symbol": t.symbol,
+                    "balance": t.balance,
+                }))
+                .collect();
+
+            Ok(Json(EvmInfoResponse {
+                success: true,
+                evm_address: Some(evm_address),
+                eth_balance: Some(balance_info.eth_balance),
+                tokens,
+                error: None,
+            }))
+        }
+        Err(e) => {
+            // Return address even if balance check fails
+            Ok(Json(EvmInfoResponse {
+                success: true,
+                evm_address: Some(evm_address),
+                eth_balance: None,
+                tokens: vec![],
+                error: Some(format!("Balance check failed: {}", e)),
+            }))
+        }
+    }
+}
+
+/// Export EVM private key for a pocket
+async fn evm_export_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<EvmExportRequest>,
+) -> std::result::Result<Json<EvmExportResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    match (pocket.evm_address, pocket.evm_keypair_encrypted) {
+        (Some(addr), Some(encrypted)) => {
+            let decrypted = state.db.decrypt(&encrypted)?;
+            let private_key = String::from_utf8(decrypted)
+                .map_err(|e| MazeError::DecryptionError(format!("Invalid UTF-8: {}", e)))?;
+
+            Ok(Json(EvmExportResponse {
+                success: true,
+                evm_address: Some(addr),
+                evm_private_key: Some(private_key),
+                error: None,
+            }))
+        }
+        _ => {
+            Ok(Json(EvmExportResponse {
+                success: false,
+                evm_address: None,
+                evm_private_key: None,
+                error: Some("No EVM wallet generated for this pocket. Call evm-info first.".to_string()),
+            }))
+        }
+    }
+}
+
+/// Execute cross-chain swap (Solana SOL -> Base token via deBridge)
+async fn cross_swap_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<CrossSwapRequest>,
+) -> std::result::Result<Json<CrossSwapResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(CrossSwapResponse {
+            success: false,
+            order_id: None,
+            estimated_output: None,
+            tx_signature: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    // Validate minimum amount
+    if req.amount_sol < 0.5 {
+        return Ok(Json(CrossSwapResponse {
+            success: false,
+            order_id: None,
+            estimated_output: None,
+            tx_signature: None,
+            error: Some("Minimum 0.5 SOL for cross-chain swap".to_string()),
+        }));
+    }
+
+    // Validate target token is EVM address
+    if !req.target_token.starts_with("0x") || req.target_token.len() != 42 {
+        return Ok(Json(CrossSwapResponse {
+            success: false,
+            order_id: None,
+            estimated_output: None,
+            tx_signature: None,
+            error: Some("Invalid EVM token address. Must start with 0x and be 42 characters.".to_string()),
+        }));
+    }
+
+    // Get pocket balance
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let balance = state.rpc.get_balance(&pocket_keypair.pubkey())
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+
+    let amount_lamports = sol_to_lamports(req.amount_sol);
+    let buffer = 10_000; // reserve for tx fee
+    if balance < amount_lamports + buffer {
+        return Ok(Json(CrossSwapResponse {
+            success: false,
+            order_id: None,
+            estimated_output: None,
+            tx_signature: None,
+            error: Some(format!("Insufficient balance. Have {} SOL, need {} SOL + fees",
+                lamports_to_sol(balance), req.amount_sol)),
+        }));
+    }
+
+    // Lazy generate EVM wallet if needed
+    let evm_address = if let Some(addr) = pocket.evm_address.clone() {
+        addr
+    } else {
+        let evm_kp = evm::generate_keypair().await.map_err(|e| AppError(e))?;
+        let evm_encrypted = state.db.encrypt(evm_kp.private_key.as_bytes())?;
+        state.db.update_pocket_evm(&pocket_id, &owner_meta_hash, &evm_kp.address, &evm_encrypted)?;
+        info!("Generated EVM wallet {} for pocket {} (cross-swap)", evm_kp.address, pocket_id);
+        evm_kp.address
+    };
+
+    // Get deBridge quote + create-tx
+    let quote = evm::debridge_quote(
+        &req.target_token,
+        amount_lamports,
+        &evm_address,
+        &pocket.stealth_pubkey,
+        Some(0.5), // affiliate fee 0.5%
+        Some("Cu6mYBnL6T4J8tsaCC3XPU68Z7VwLZaXSTzp8v5v9aZA"), // Jupiter referral key
+        None, // deBridge referral code (optional)
+    ).await.map_err(|e| AppError(e))?;
+
+    // Get the Solana transaction from deBridge response
+    let tx_data = match &quote.tx {
+        Some(tx) => tx.get("data").and_then(|d| d.as_str()),
+        None => None,
+    };
+
+    let tx_data_hex = match tx_data {
+        Some(hex) => hex,
+        None => {
+            return Ok(Json(CrossSwapResponse {
+                success: false,
+                order_id: quote.order_id,
+                estimated_output: quote.estimation.clone(),
+                tx_signature: None,
+                error: Some("deBridge did not return transaction data".to_string()),
+            }));
+        }
+    };
+
+    // Decode hex -> VersionedTransaction -> sign -> submit
+    let tx_bytes = hex::decode(tx_data_hex.trim_start_matches("0x"))
+        .map_err(|e| MazeError::RpcError(format!("Failed to decode tx hex: {}", e)))?;
+
+    let mut versioned_tx: solana_sdk::transaction::VersionedTransaction = bincode::deserialize(&tx_bytes)
+        .map_err(|e| MazeError::RpcError(format!("Failed to deserialize tx: {}", e)))?;
+
+    // Sign the transaction
+    let message_bytes = versioned_tx.message.serialize();
+    let signature = pocket_keypair.sign_message(&message_bytes);
+    versioned_tx.signatures[0] = signature;
+
+    // Submit with retry logic (same pattern as swap.rs)
+    let mut last_err = String::new();
+    let mut tx_sig = None;
+
+    for attempt in 1..=3u8 {
+        let config = RpcSendTransactionConfig {
+            skip_preflight: true,
+            preflight_commitment: None,
+            encoding: None,
+            max_retries: Some(3),
+            min_context_slot: None,
+        };
+
+        match state.rpc.send_transaction_with_config(&versioned_tx, config) {
+            Ok(sig) => {
+                if attempt > 1 {
+                    info!("Cross-swap TX succeeded on attempt {}/3", attempt);
+                }
+                tx_sig = Some(sig);
+                break;
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                    warn!("Cross-swap TX attempt {}/3: {}", attempt, err_str);
+                    last_err = err_str;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                last_err = err_str;
+                break;
+            }
+        }
+    }
+
+    let sig = match tx_sig {
+        Some(s) => s,
+        None => {
+            return Ok(Json(CrossSwapResponse {
+                success: false,
+                order_id: quote.order_id.clone(),
+                estimated_output: quote.estimation.clone(),
+                tx_signature: None,
+                error: Some(format!("TX send failed after retries: {}", last_err)),
+            }));
+        }
+    };
+
+    let tx_signature = sig.to_string();
+    info!("Cross-chain swap submitted: {} (pocket {} -> {} on Base)", tx_signature, pocket_id, req.target_token);
+
+    // Wait for confirmation (up to 20s)
+    let mut confirmed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+            if result.is_ok() {
+                confirmed = true;
+                break;
+            } else if let Err(e) = result {
+                return Ok(Json(CrossSwapResponse {
+                    success: false,
+                    order_id: quote.order_id.clone(),
+                    estimated_output: quote.estimation.clone(),
+                    tx_signature: Some(tx_signature),
+                    error: Some(format!("TX failed on-chain: {:?}", e)),
+                }));
+            }
+        }
+    }
+
+    let status = if confirmed { "completed" } else { "pending" };
+
+    // Log transaction
+    let _ = state.db.insert_transaction_log(
+        &format!("xswap_{}", &tx_signature[..16.min(tx_signature.len())]),
+        &owner_meta_hash,
+        "cross_swap",
+        status,
+        Some(amount_lamports as i64),
+        Some(&format!("{} SOL -> {} (Base)", req.amount_sol, &req.target_token[..10.min(req.target_token.len())])),
+        Some(&format!("Cross-chain swap to Base token {}", req.target_token)),
+        Some(&tx_signature),
+        Some(&serde_json::json!({
+            "order_id": quote.order_id,
+            "target_token": req.target_token,
+            "evm_address": evm_address,
+            "target_chain": req.target_chain.unwrap_or_else(|| "base".to_string()),
+            "confirmed": confirmed,
+        }).to_string()),
+    );
+
+    Ok(Json(CrossSwapResponse {
+        success: true,
+        order_id: quote.order_id,
+        estimated_output: quote.estimation,
+        tx_signature: Some(tx_signature),
+        error: if !confirmed { Some("TX submitted but confirmation pending".to_string()) } else { None },
+    }))
+}
+
+
+// ============ CROSS-CHAIN SELL + STATUS ============
+
+#[derive(Debug, Deserialize)]
+struct CrossSwapSellRequest {
+    meta_address: String,
+    input_token: String,
+    amount_raw: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CrossSwapSellResponse {
+    success: bool,
+    order_id: Option<String>,
+    estimated_sol: Option<serde_json::Value>,
+    tx_hash: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossSwapStatusQuery {
+    meta_address: String,
+    order_id: Option<String>,
+    tx_hash: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CrossSwapStatusResponse {
+    success: bool,
+    status: Option<String>,
+    data: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+/// Execute reverse cross-chain swap (Base token -> SOL via deBridge)
+async fn cross_swap_sell_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<CrossSwapSellRequest>,
+) -> std::result::Result<Json<CrossSwapSellResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(CrossSwapSellResponse {
+            success: false,
+            order_id: None,
+            estimated_sol: None,
+            tx_hash: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    // Validate input token is EVM address
+    if !req.input_token.starts_with("0x") || req.input_token.len() != 42 {
+        return Ok(Json(CrossSwapSellResponse {
+            success: false,
+            order_id: None,
+            estimated_sol: None,
+            tx_hash: None,
+            error: Some("Invalid EVM token address. Must start with 0x and be 42 characters.".to_string()),
+        }));
+    }
+
+    // Check EVM wallet exists
+    let (evm_address, evm_encrypted) = match (pocket.evm_address.clone(), pocket.evm_keypair_encrypted.clone()) {
+        (Some(addr), Some(enc)) => (addr, enc),
+        _ => {
+            return Ok(Json(CrossSwapSellResponse {
+                success: false,
+                order_id: None,
+                estimated_sol: None,
+                tx_hash: None,
+                error: Some("No EVM wallet for this pocket. Buy tokens first via cross-swap.".to_string()),
+            }));
+        }
+    };
+
+    // Decrypt EVM private key
+    let evm_pk_bytes = state.db.decrypt(&evm_encrypted)?;
+    let evm_private_key = String::from_utf8(evm_pk_bytes)
+        .map_err(|e| MazeError::DecryptionError(format!("Invalid UTF-8: {}", e)))?;
+
+    // Get deBridge reverse quote (Base -> Solana)
+    let quote = evm::debridge_quote_reverse(
+        &req.input_token,
+        &req.amount_raw,
+        &pocket.stealth_pubkey,
+        &evm_address,
+        Some(0.5),
+        Some("0x8E61077Af8BF9564210ecb52D3a27FC17591AF9c"), // EVM fee wallet (Base)
+        None,
+    ).await.map_err(|e| AppError(e))?;
+
+    // Get tx fields from deBridge response
+    let (tx_to, tx_data, tx_value) = match &quote.tx {
+        Some(tx) => {
+            let to = tx.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            let data = tx.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            let value = tx.get("value").and_then(|v| v.as_str()).unwrap_or("0");
+            (to.to_string(), data.to_string(), value.to_string())
+        }
+        None => {
+            return Ok(Json(CrossSwapSellResponse {
+                success: false,
+                order_id: quote.order_id,
+                estimated_sol: quote.estimation.clone(),
+                tx_hash: None,
+                error: Some("deBridge did not return transaction data".to_string()),
+            }));
+        }
+    };
+
+    // Get approve info from estimation
+    let approve_to = tx_to.clone();
+    let approve_token = req.input_token.clone();
+    let approve_amount = req.amount_raw.clone();
+
+    // Execute approve + send on Base via sidecar
+    let evm_result = evm::evm_approve_and_send(
+        &evm_private_key,
+        Some(&approve_to),
+        Some(&approve_token),
+        Some(&approve_amount),
+        &tx_to,
+        &tx_data,
+        &tx_value,
+    ).await.map_err(|e| AppError(e))?;
+
+    info!("Cross-chain sell submitted: {} (pocket {} -> SOL from Base token {})",
+        evm_result.tx_hash, pocket_id, req.input_token);
+
+    // Log transaction
+    let _ = state.db.insert_transaction_log(
+        &format!("xsell_{}", &evm_result.tx_hash[..16.min(evm_result.tx_hash.len())]),
+        &owner_meta_hash,
+        "cross_swap_sell",
+        "pending",
+        None,
+        Some(&format!("{} {} (Base) -> SOL", req.amount_raw, &req.input_token[..10.min(req.input_token.len())])),
+        Some(&format!("Cross-chain sell Base token {} -> SOL", req.input_token)),
+        Some(&evm_result.tx_hash),
+        Some(&serde_json::json!({
+            "order_id": quote.order_id,
+            "input_token": req.input_token,
+            "evm_address": evm_address,
+            "amount_raw": req.amount_raw,
+        }).to_string()),
+    );
+
+    Ok(Json(CrossSwapSellResponse {
+        success: true,
+        order_id: quote.order_id,
+        estimated_sol: quote.estimation,
+        tx_hash: Some(evm_result.tx_hash),
+        error: None,
+    }))
+}
+
+/// Check cross-chain swap order status
+async fn cross_swap_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Query(query): Query<CrossSwapStatusQuery>,
+) -> std::result::Result<Json<CrossSwapStatusResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    // Verify pocket ownership
+    let _pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let status_result = evm::debridge_order_status(
+        query.order_id.as_deref(),
+        query.tx_hash.as_deref(),
+    ).await.map_err(|e| AppError(e))?;
+
+    Ok(Json(CrossSwapStatusResponse {
+        success: true,
+        status: status_result.status,
+        data: Some(status_result.data),
+        error: None,
+    }))
 }

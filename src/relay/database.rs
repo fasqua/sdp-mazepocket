@@ -60,6 +60,8 @@ pub struct MazePocket {
     pub status: PocketStatus,
     pub label: Option<String>,
     pub archived: bool,
+    pub evm_address: Option<String>,
+    pub evm_keypair_encrypted: Option<Vec<u8>>,
 }
 
 /// Funding request for creating a pocket
@@ -307,6 +309,10 @@ impl PocketDatabase {
         // Migration: add label and archived columns if not exist
         let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN label TEXT", []);
         let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN archived INTEGER DEFAULT 0", []);
+
+        // Migration: add EVM wallet columns if not exist
+        let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN evm_address TEXT", []);
+        let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN evm_keypair_encrypted BLOB", []);
 
         // Funding requests table (for tracking maze routing to pocket)
         conn.execute(
@@ -741,7 +747,8 @@ impl PocketDatabase {
         let mut stmt = conn.prepare(
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
-                      last_sweep_at, status, label, archived
+                      last_sweep_at, status, label, archived,
+                      evm_address, evm_keypair_encrypted
                FROM maze_pockets WHERE id = ?1"#
         )?;
 
@@ -758,6 +765,8 @@ impl PocketDatabase {
                 status: PocketStatus::from_str(&row.get::<_, String>(8)?),
                 label: row.get(9)?,
                 archived: row.get::<_, i32>(10)? != 0,
+                evm_address: row.get(11)?,
+                evm_keypair_encrypted: row.get(12)?,
             })
         });
 
@@ -774,7 +783,8 @@ impl PocketDatabase {
         let mut stmt = conn.prepare(
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
-                      last_sweep_at, status, label, archived
+                      last_sweep_at, status, label, archived,
+                      evm_address, evm_keypair_encrypted
                FROM maze_pockets
                WHERE id = ?1 AND owner_meta_hash = ?2"#
         )?;
@@ -792,6 +802,8 @@ impl PocketDatabase {
                 status: PocketStatus::from_str(&row.get::<_, String>(8)?),
                 label: row.get(9)?,
                 archived: row.get::<_, i32>(10)? != 0,
+                evm_address: row.get(11)?,
+                evm_keypair_encrypted: row.get(12)?,
             })
         });
 
@@ -808,7 +820,8 @@ impl PocketDatabase {
         let mut stmt = conn.prepare(
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
-                      last_sweep_at, status, label, archived
+                      last_sweep_at, status, label, archived,
+                      evm_address, evm_keypair_encrypted
                FROM maze_pockets
                WHERE owner_meta_hash = ?1 AND status != 'deleted' AND id NOT LIKE 'route_%' AND (archived = 0 OR archived IS NULL)
                ORDER BY created_at DESC"#
@@ -827,6 +840,8 @@ impl PocketDatabase {
                 status: PocketStatus::from_str(&row.get::<_, String>(8)?),
                 label: row.get(9)?,
                 archived: row.get::<_, Option<i32>>(10)?.unwrap_or(0) != 0,
+                evm_address: row.get(11)?,
+                evm_keypair_encrypted: row.get(12)?,
             })
         })?;
 
@@ -888,13 +903,24 @@ impl PocketDatabase {
         Ok(rows > 0)
     }
 
+    /// Update pocket with EVM wallet info (lazy generation)
+    pub fn update_pocket_evm(&self, pocket_id: &str, owner_meta_hash: &str, evm_address: &str, evm_keypair_encrypted: &[u8]) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE maze_pockets SET evm_address = ?1, evm_keypair_encrypted = ?2 WHERE id = ?3 AND owner_meta_hash = ?4",
+            params![evm_address, evm_keypair_encrypted, pocket_id, owner_meta_hash],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// List archived pockets for an owner
     pub fn list_archived_pockets(&self, owner_meta_hash: &str) -> Result<Vec<MazePocket>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
-                      last_sweep_at, status, label, archived
+                      last_sweep_at, status, label, archived,
+                      evm_address, evm_keypair_encrypted
                FROM maze_pockets
                WHERE owner_meta_hash = ?1 AND status != 'deleted' AND id NOT LIKE 'route_%' AND archived = 1
                ORDER BY created_at DESC"#
@@ -913,6 +939,8 @@ impl PocketDatabase {
                 status: PocketStatus::from_str(&row.get::<_, String>(8)?),
                 label: row.get(9)?,
                 archived: row.get::<_, Option<i32>>(10)?.unwrap_or(0) != 0,
+                evm_address: row.get(11)?,
+                evm_keypair_encrypted: row.get(12)?,
             })
         })?;
 
@@ -2936,6 +2964,8 @@ mod tests {
             status: PocketStatus::Active,
             label: None,
             archived: false,
+            evm_address: None,
+            evm_keypair_encrypted: None,
         };
 
         db.create_pocket(&pocket).unwrap();
