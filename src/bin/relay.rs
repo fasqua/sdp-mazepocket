@@ -8725,13 +8725,13 @@ async fn cross_swap_handler(
     }
 
     // Validate minimum amount
-    if req.amount_sol < 0.5 {
+    if req.amount_sol < 0.05 {
         return Ok(Json(CrossSwapResponse {
             success: false,
             order_id: None,
             estimated_output: None,
             tx_signature: None,
-            error: Some("Minimum 0.5 SOL for cross-chain swap".to_string()),
+            error: Some("Minimum 0.05 SOL for cross-chain swap".to_string()),
         }));
     }
 
@@ -8778,147 +8778,118 @@ async fn cross_swap_handler(
         evm_kp.address
     };
 
-    // Get deBridge quote + create-tx
-    let quote = evm::debridge_quote(
-        &req.target_token,
+    // Step 1: Swap SOL -> USDC via Jupiter (proven reliable)
+    let usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    info!("Cross-swap step 1: Jupiter swap {} lamports SOL -> USDC for pocket {}", amount_lamports, pocket_id);
+
+    let swap_result = swap::execute_swap(
+        &state.http_client,
+        &state.rpc,
+        &pocket_keypair,
+        &tokens::SOL_MINT.to_string(),
+        usdc_mint,
         amount_lamports,
+        Some(100), // 1% slippage for SOL->USDC
+    ).await;
+
+    let usdc_amount = match swap_result {
+        Ok(ref sr) if sr.success => {
+            let out = sr.out_amount.parse::<u64>().unwrap_or(0);
+            info!("Cross-swap step 1 done: got {} USDC raw units", out);
+            out
+        }
+        Ok(ref sr) => {
+            return Ok(Json(CrossSwapResponse {
+                success: false,
+                order_id: None,
+                estimated_output: None,
+                tx_signature: None,
+                error: Some(format!("Jupiter swap SOL->USDC failed: {}", sr.error.as_deref().unwrap_or("unknown"))),
+            }));
+        }
+        Err(e) => {
+            return Ok(Json(CrossSwapResponse {
+                success: false,
+                order_id: None,
+                estimated_output: None,
+                tx_signature: None,
+                error: Some(format!("Jupiter swap SOL->USDC error: {}", e)),
+            }));
+        }
+    };
+
+    if usdc_amount == 0 {
+        return Ok(Json(CrossSwapResponse {
+            success: false,
+            order_id: None,
+            estimated_output: None,
+            tx_signature: None,
+            error: Some("Jupiter swap returned 0 USDC".to_string()),
+        }));
+    }
+
+    // Step 2: Bridge USDC (Solana) -> target token (Base) via deBridge
+    let pocket_key_b58 = bs58::encode(&keypair_bytes).into_string();
+    info!("Cross-swap step 2: deBridge bridge {} USDC -> {} on Base for pocket {}", usdc_amount, req.target_token, pocket_id);
+
+    let exec_result = evm::debridge_execute(
+        &req.target_token,
+        usdc_amount,
         &evm_address,
         &pocket.stealth_pubkey,
+        &pocket_key_b58,
+        &state.config.rpc_url,
         Some(0.5), // affiliate fee 0.5%
         Some("Cu6mYBnL6T4J8tsaCC3XPU68Z7VwLZaXSTzp8v5v9aZA"), // Jupiter referral key
         None, // deBridge referral code (optional)
-    ).await.map_err(|e| AppError(e))?;
+    ).await;
 
-    // Get the Solana transaction from deBridge response
-    let tx_data = match &quote.tx {
-        Some(tx) => tx.get("data").and_then(|d| d.as_str()),
-        None => None,
-    };
+    match exec_result {
+        Ok(result) => {
+            let tx_signature = result.tx_signature.clone().unwrap_or_default();
+            let confirmed = result.confirmed;
+            let status = if confirmed { "completed" } else { "pending" };
 
-    let tx_data_hex = match tx_data {
-        Some(hex) => hex,
-        None => {
-            return Ok(Json(CrossSwapResponse {
-                success: false,
-                order_id: quote.order_id,
-                estimated_output: quote.estimation.clone(),
-                tx_signature: None,
-                error: Some("deBridge did not return transaction data".to_string()),
-            }));
+            // Log transaction
+            let _ = state.db.insert_transaction_log(
+                &format!("xswap_{}", &tx_signature[..16.min(tx_signature.len())]),
+                &owner_meta_hash,
+                "cross_swap",
+                status,
+                Some(amount_lamports as i64),
+                Some(&format!("{} SOL -> {} (Base)", req.amount_sol, &req.target_token[..10.min(req.target_token.len())])),
+                Some(&format!("Cross-chain swap to Base token {}", req.target_token)),
+                Some(&tx_signature),
+                Some(&serde_json::json!({
+                    "order_id": result.order_id,
+                    "target_token": req.target_token,
+                    "evm_address": evm_address,
+                    "target_chain": req.target_chain.unwrap_or_else(|| "base".to_string()),
+                    "confirmed": confirmed,
+                }).to_string()),
+            );
+
+            info!("Cross-chain swap {}: {} (pocket {} -> {} on Base)", status, tx_signature, pocket_id, req.target_token);
+
+            Ok(Json(CrossSwapResponse {
+                success: true,
+                order_id: result.order_id,
+                estimated_output: result.estimation,
+                tx_signature: result.tx_signature,
+                error: if !confirmed { Some("TX submitted but confirmation pending".to_string()) } else { None },
+            }))
         }
-    };
-
-    // Decode hex -> VersionedTransaction -> sign -> submit
-    let tx_bytes = hex::decode(tx_data_hex.trim_start_matches("0x"))
-        .map_err(|e| MazeError::RpcError(format!("Failed to decode tx hex: {}", e)))?;
-
-    let mut versioned_tx: solana_sdk::transaction::VersionedTransaction = bincode::deserialize(&tx_bytes)
-        .map_err(|e| MazeError::RpcError(format!("Failed to deserialize tx: {}", e)))?;
-
-    // Sign the transaction
-    let message_bytes = versioned_tx.message.serialize();
-    let signature = pocket_keypair.sign_message(&message_bytes);
-    versioned_tx.signatures[0] = signature;
-
-    // Submit with retry logic (same pattern as swap.rs)
-    let mut last_err = String::new();
-    let mut tx_sig = None;
-
-    for attempt in 1..=3u8 {
-        let config = RpcSendTransactionConfig {
-            skip_preflight: true,
-            preflight_commitment: None,
-            encoding: None,
-            max_retries: Some(3),
-            min_context_slot: None,
-        };
-
-        match state.rpc.send_transaction_with_config(&versioned_tx, config) {
-            Ok(sig) => {
-                if attempt > 1 {
-                    info!("Cross-swap TX succeeded on attempt {}/3", attempt);
-                }
-                tx_sig = Some(sig);
-                break;
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
-                    warn!("Cross-swap TX attempt {}/3: {}", attempt, err_str);
-                    last_err = err_str;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-                last_err = err_str;
-                break;
-            }
+        Err(e) => {
+            warn!("Cross-chain swap failed for pocket {}: {}", pocket_id, e);
+            Ok(Json(CrossSwapResponse {
+                success: false,
+                order_id: None,
+                estimated_output: None,
+                tx_signature: None,
+                error: Some(format!("{}", e)),
+            }))
         }
     }
-
-    let sig = match tx_sig {
-        Some(s) => s,
-        None => {
-            return Ok(Json(CrossSwapResponse {
-                success: false,
-                order_id: quote.order_id.clone(),
-                estimated_output: quote.estimation.clone(),
-                tx_signature: None,
-                error: Some(format!("TX send failed after retries: {}", last_err)),
-            }));
-        }
-    };
-
-    let tx_signature = sig.to_string();
-    info!("Cross-chain swap submitted: {} (pocket {} -> {} on Base)", tx_signature, pocket_id, req.target_token);
-
-    // Wait for confirmation (up to 20s)
-    let mut confirmed = false;
-    for _ in 0..40 {
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
-            if result.is_ok() {
-                confirmed = true;
-                break;
-            } else if let Err(e) = result {
-                return Ok(Json(CrossSwapResponse {
-                    success: false,
-                    order_id: quote.order_id.clone(),
-                    estimated_output: quote.estimation.clone(),
-                    tx_signature: Some(tx_signature),
-                    error: Some(format!("TX failed on-chain: {:?}", e)),
-                }));
-            }
-        }
-    }
-
-    let status = if confirmed { "completed" } else { "pending" };
-
-    // Log transaction
-    let _ = state.db.insert_transaction_log(
-        &format!("xswap_{}", &tx_signature[..16.min(tx_signature.len())]),
-        &owner_meta_hash,
-        "cross_swap",
-        status,
-        Some(amount_lamports as i64),
-        Some(&format!("{} SOL -> {} (Base)", req.amount_sol, &req.target_token[..10.min(req.target_token.len())])),
-        Some(&format!("Cross-chain swap to Base token {}", req.target_token)),
-        Some(&tx_signature),
-        Some(&serde_json::json!({
-            "order_id": quote.order_id,
-            "target_token": req.target_token,
-            "evm_address": evm_address,
-            "target_chain": req.target_chain.unwrap_or_else(|| "base".to_string()),
-            "confirmed": confirmed,
-        }).to_string()),
-    );
-
-    Ok(Json(CrossSwapResponse {
-        success: true,
-        order_id: quote.order_id,
-        estimated_output: quote.estimation,
-        tx_signature: Some(tx_signature),
-        error: if !confirmed { Some("TX submitted but confirmation pending".to_string()) } else { None },
-    }))
 }
 
 

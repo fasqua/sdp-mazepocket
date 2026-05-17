@@ -55,6 +55,13 @@ pub struct DebridgeOrderStatus {
     pub data: serde_json::Value,
 }
 
+pub struct DebridgeExecuteResult {
+    pub estimation: Option<serde_json::Value>,
+    pub order_id: Option<String>,
+    pub tx_signature: Option<String>,
+    pub confirmed: bool,
+}
+
 // ============ SIDECAR CALL ============
 
 /// Call EVM sidecar and parse JSON output
@@ -167,7 +174,7 @@ pub async fn debridge_quote(
     let mut payload = serde_json::json!({
         "src_chain_id": 7565164,
         "dst_chain_id": 8453,
-        "src_token_in": "So11111111111111111111111111111111111111112",
+        "src_token_in": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
         "dst_token_out": dst_token_out,
         "src_amount": src_amount_lamports.to_string(),
         "dst_recipient": dst_recipient,
@@ -201,6 +208,62 @@ pub async fn debridge_quote(
         tx: data.get("tx").cloned(),
         order_id: data.get("order_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
         order: data.get("order").cloned(),
+    })
+}
+
+/// Execute deBridge cross-chain swap (full flow in sidecar: quote + blockhash + sign + submit)
+pub async fn debridge_execute(
+    dst_token_out: &str,
+    src_amount_lamports: u64,
+    dst_recipient: &str,
+    src_authority: &str,
+    pocket_private_key: &str,
+    solana_rpc_url: &str,
+    affiliate_fee_percent: Option<f64>,
+    affiliate_fee_recipient: Option<&str>,
+    referral_code: Option<u32>,
+) -> Result<DebridgeExecuteResult> {
+    info!("EVM: deBridge execute for {} lamports -> {} on Base", src_amount_lamports, dst_token_out);
+
+    let mut payload = serde_json::json!({
+        "src_chain_id": 7565164,
+        "dst_chain_id": 8453,
+        "src_token_in": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "dst_token_out": dst_token_out,
+        "src_amount": src_amount_lamports.to_string(),
+        "dst_recipient": dst_recipient,
+        "src_authority": src_authority,
+        "dst_authority": dst_recipient,
+        "pocket_private_key": pocket_private_key,
+        "solana_rpc_url": solana_rpc_url,
+    });
+
+    if let Some(fee) = affiliate_fee_percent {
+        payload["affiliate_fee_percent"] = serde_json::json!(fee);
+    }
+    if let Some(recipient) = affiliate_fee_recipient {
+        payload["affiliate_fee_recipient"] = serde_json::json!(recipient);
+    }
+    if let Some(code) = referral_code {
+        payload["referral_code"] = serde_json::json!(code);
+    }
+
+    let result = call_sidecar("debridge-execute", &payload).await?;
+
+    let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !success {
+        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+        let data = result.get("data").cloned().unwrap_or(serde_json::Value::Null);
+        return Err(MazeError::RpcError(format!("deBridge execute failed: {} | data: {}", error, data)));
+    }
+
+    let data = result.get("data").cloned().unwrap_or(serde_json::Value::Null);
+
+    Ok(DebridgeExecuteResult {
+        estimation: data.get("estimation").cloned(),
+        order_id: data.get("order_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        tx_signature: data.get("tx_signature").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        confirmed: data.get("confirmed").and_then(|v| v.as_bool()).unwrap_or(false),
     })
 }
 

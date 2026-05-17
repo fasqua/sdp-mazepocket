@@ -282,6 +282,182 @@ async function main() {
                 result = { success: true, data: statusData };
                 break;
             }
+            case 'debridge-execute': {
+                // Full flow following official deBridge example:
+                // 1. Fetch quote+TX from deBridge API
+                // 2. Deserialize, simulate, update CU, replace blockhash, sign, submit
+                const { Connection, VersionedTransaction, Keypair } = await import('@solana/web3.js');
+                const bs58 = (await import('bs58')).default;
+
+                const {
+                    src_chain_id,
+                    dst_chain_id,
+                    src_token_in,
+                    dst_token_out,
+                    src_amount,
+                    dst_recipient,
+                    src_authority,
+                    dst_authority,
+                    affiliate_fee_percent,
+                    affiliate_fee_recipient,
+                    referral_code,
+                    pocket_private_key,
+                    solana_rpc_url,
+                } = payload;
+
+                if (!pocket_private_key || !solana_rpc_url) {
+                    result = { success: false, error: 'pocket_private_key and solana_rpc_url required' };
+                    break;
+                }
+
+                const conn = new Connection(solana_rpc_url, { commitment: 'confirmed' });
+                const secretKey = bs58.decode(pocket_private_key);
+                const signer = Keypair.fromSecretKey(secretKey);
+
+                // 1. Fetch quote + TX from deBridge
+                const execParams = new URLSearchParams({
+                    srcChainId: String(src_chain_id || 7565164),
+                    dstChainId: String(dst_chain_id || 8453),
+                    srcChainTokenIn: src_token_in || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+                    dstChainTokenOut: dst_token_out,
+                    srcChainTokenInAmount: String(src_amount),
+                    dstChainTokenOutAmount: 'auto',
+                    dstChainTokenOutRecipient: dst_recipient,
+                    srcChainOrderAuthorityAddress: src_authority,
+                    dstChainOrderAuthorityAddress: dst_authority || dst_recipient,
+                    prependOperatingExpenses: 'true',
+                });
+
+                if (affiliate_fee_percent) {
+                    execParams.set('affiliateFeePercent', String(affiliate_fee_percent));
+                }
+                if (affiliate_fee_recipient) {
+                    execParams.set('affiliateFeeRecipient', affiliate_fee_recipient);
+                }
+                if (referral_code) {
+                    execParams.set('referralCode', String(referral_code));
+                }
+
+                const execUrl = `${DEBRIDGE_API_URL}/dln/order/create-tx?${execParams.toString()}`;
+                const execResp = await fetch(execUrl);
+                const execData = await execResp.json();
+
+                if (execData.errorId || execData.error) {
+                    result = { success: false, error: execData.errorId || execData.error, details: execData };
+                    break;
+                }
+
+                if (!execData.tx || !execData.tx.data) {
+                    result = { success: false, error: 'deBridge did not return transaction data', details: { keys: Object.keys(execData) } };
+                    break;
+                }
+
+                // 2. Deserialize TX
+                const txHex = execData.tx.data.replace('0x', '');
+                const txBuf = Buffer.from(txHex, 'hex');
+                let tx = VersionedTransaction.deserialize(txBuf);
+
+                // 3. prepareSolanaTransaction (following official deBridge example)
+                // Step A: Replace blockhash + sign for simulation
+                let latestBh = await conn.getLatestBlockhash('confirmed');
+                tx.message.recentBlockhash = latestBh.blockhash;
+                tx.sign([signer]);
+
+                // Step B: Simulate to get unitsConsumed
+                const simulatedTx = await conn.simulateTransaction(tx);
+                const used = simulatedTx.value.unitsConsumed || 200000;
+                const NEW_CU_LIMIT = Math.ceil(used * 1.1);
+
+                // Step C: Get priority fee
+                const feeHistory = await conn.getRecentPrioritizationFees();
+                const fees = feeHistory.map(f => f.prioritizationFee);
+                let suggestedFee;
+                if (fees.length === 0) {
+                    suggestedFee = 2000;
+                } else {
+                    fees.sort((a, b) => a - b);
+                    suggestedFee = fees[Math.floor(fees.length / 2)];
+                }
+
+                // Step D: Update priority fee in TX
+                function encodeLE(num, size) {
+                    const r = new Uint8Array(size);
+                    for (let i = 0; i < size; i++) { r[i] = num & 0xff; num >>= 8; }
+                    return r;
+                }
+                try {
+                    const offset = 1;
+                    const priceData = tx.message.compiledInstructions[1].data;
+                    const encodedPrice = encodeLE(suggestedFee, 8);
+                    for (let i = 0; i < encodedPrice.length; i++) priceData[i + offset] = encodedPrice[i];
+                    const limitData = tx.message.compiledInstructions[0].data;
+                    const encodedLimit = encodeLE(NEW_CU_LIMIT, 4);
+                    for (let i = 0; i < encodedLimit.length; i++) limitData[i + offset] = encodedLimit[i];
+                } catch (e) { /* non-fatal */ }
+
+                // Step E: Fresh blockhash again + re-sign (official pattern)
+                latestBh = await conn.getLatestBlockhash('confirmed');
+                tx.message.recentBlockhash = latestBh.blockhash;
+                tx.sign([signer]);
+
+                // 4. Submit
+                let txSignature = null;
+                let submitErr = null;
+                try {
+                    const raw = tx.serialize();
+                    txSignature = await conn.sendRawTransaction(raw, { skipPreflight: false });
+                } catch (sendErr) {
+                    submitErr = sendErr.message || String(sendErr);
+                }
+
+                if (!txSignature) {
+                    result = {
+                        success: false,
+                        error: `TX submit failed: ${submitErr}`,
+                        data: {
+                            estimation: execData.estimation,
+                            order_id: execData.orderId,
+                        }
+                    };
+                    break;
+                }
+
+                // 5. Wait for confirmation
+                let confirmed = false;
+                try {
+                    const confirmation = await conn.confirmTransaction({
+                        signature: txSignature,
+                        blockhash: latestBh.blockhash,
+                        lastValidBlockHeight: latestBh.lastValidBlockHeight,
+                    }, 'confirmed');
+                    confirmed = !confirmation.value.err;
+                    if (confirmation.value.err) {
+                        result = {
+                            success: false,
+                            error: `TX failed on-chain: ${JSON.stringify(confirmation.value.err)}`,
+                            data: {
+                                estimation: execData.estimation,
+                                order_id: execData.orderId,
+                                tx_signature: txSignature,
+                            }
+                        };
+                        break;
+                    }
+                } catch (confErr) {
+                    confirmed = false;
+                }
+
+                result = {
+                    success: true,
+                    data: {
+                        estimation: execData.estimation,
+                        order_id: execData.orderId,
+                        tx_signature: txSignature,
+                        confirmed: confirmed,
+                    }
+                };
+                break;
+            }
             default:
                 result = { success: false, error: `Unknown command: ${command}` };
         }
