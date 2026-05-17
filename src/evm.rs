@@ -351,6 +351,46 @@ pub async fn debridge_quote_reverse(
 }
 
 /// Approve ERC-20 token + send deBridge transaction on Base (for reverse flow)
+/// Swap tokens on Base via ParaSwap/Velora REST API
+pub async fn evm_swap(
+    private_key: &str,
+    src_token: &str,
+    dest_token: &str,
+    amount: &str,
+    src_decimals: u8,
+    dest_decimals: u8,
+    slippage: Option<u32>,
+) -> Result<EvmTxResult> {
+    info!("EVM: ParaSwap swap {} {} -> {} on Base", amount, src_token, dest_token);
+
+    let payload = serde_json::json!({
+        "private_key": private_key,
+        "src_token": src_token,
+        "dest_token": dest_token,
+        "amount": amount,
+        "src_decimals": src_decimals,
+        "dest_decimals": dest_decimals,
+        "slippage": slippage.unwrap_or(100),
+    });
+
+    let result = call_sidecar("evm-swap", &payload).await?;
+
+    let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !success {
+        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+        return Err(MazeError::RpcError(format!("EVM swap failed: {}", error)));
+    }
+
+    let data = result.get("data").cloned().unwrap_or(serde_json::Value::Null);
+
+    Ok(EvmTxResult {
+        tx_hash: data.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        block_number: data.get("block_number").and_then(|v| v.as_u64()),
+        gas_used: data.get("gas_used").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        status: data.get("status").and_then(|v| v.as_u64()),
+    })
+}
+
 pub async fn evm_approve_and_send(
     private_key: &str,
     approve_to: Option<&str>,

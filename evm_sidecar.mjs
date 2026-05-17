@@ -282,6 +282,117 @@ async function main() {
                 result = { success: true, data: statusData };
                 break;
             }
+            case 'evm-swap': {
+                // Swap tokens on Base via ParaSwap/Velora REST API (no SDK needed)
+                const {
+                    private_key,
+                    src_token,
+                    dest_token,
+                    amount,
+                    src_decimals,
+                    dest_decimals,
+                    slippage,
+                } = payload;
+
+                if (!private_key || !src_token || !dest_token || !amount) {
+                    result = { success: false, error: 'private_key, src_token, dest_token, amount required' };
+                    break;
+                }
+
+                const swapProvider = new ethers.JsonRpcProvider(BASE_RPC_URL);
+                const swapWallet = new ethers.Wallet(private_key, swapProvider);
+                const swapUserAddress = swapWallet.address;
+
+                // 1. Get quote + TX from ParaSwap
+                const swapParams = new URLSearchParams({
+                    srcToken: src_token,
+                    destToken: dest_token,
+                    amount: String(amount),
+                    srcDecimals: String(src_decimals || 18),
+                    destDecimals: String(dest_decimals || 18),
+                    side: 'SELL',
+                    network: '8453',
+                    version: '6.2',
+                    userAddress: swapUserAddress,
+                    slippage: String(slippage || 100),
+                });
+
+                const swapUrl = `https://api.paraswap.io/swap?${swapParams.toString()}`;
+                const swapResp = await fetch(swapUrl);
+                const swapData = await swapResp.json();
+
+                if (swapData.error) {
+                    result = { success: false, error: `ParaSwap quote failed: ${swapData.error}` };
+                    break;
+                }
+
+                if (!swapData.txParams) {
+                    result = { success: false, error: 'ParaSwap did not return txParams' };
+                    break;
+                }
+
+                const destAmount = swapData.priceRoute?.destAmount || '0';
+                const contractAddr = swapData.txParams.to;
+
+                // 2. Approve ERC-20 if src_token is not native ETH
+                const nativeEth = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+                if (src_token.toLowerCase() !== nativeEth.toLowerCase()) {
+                    try {
+                        const erc20 = new ethers.Contract(src_token, [
+                            'function approve(address spender, uint256 amount) returns (bool)',
+                            'function allowance(address owner, address spender) view returns (uint256)',
+                        ], swapWallet);
+
+                        const currentAllowance = await erc20.allowance(swapUserAddress, contractAddr);
+                        const needed = BigInt(amount);
+
+                        if (currentAllowance < needed) {
+                            const approveTx = await erc20.approve(contractAddr, needed);
+                            const approveReceipt = await approveTx.wait();
+                            if (!approveReceipt || approveReceipt.status !== 1) {
+                                result = { success: false, error: 'ERC-20 approve failed for ParaSwap' };
+                                break;
+                            }
+                        }
+                    } catch (e) {
+                        result = { success: false, error: `ERC-20 approve failed: ${e.message}` };
+                        break;
+                    }
+                }
+
+                // 3. Send swap TX
+                try {
+                    const txReq = {
+                        to: swapData.txParams.to,
+                        data: swapData.txParams.data,
+                        value: swapData.txParams.value || '0',
+                        gasPrice: swapData.txParams.gasPrice,
+                    };
+
+                    try {
+                        const gasEstimate = await swapProvider.estimateGas({ ...txReq, from: swapUserAddress });
+                        txReq.gasLimit = gasEstimate * 130n / 100n;
+                    } catch (e) {
+                        txReq.gasLimit = 500000n;
+                    }
+
+                    const txResponse = await swapWallet.sendTransaction(txReq);
+                    const receipt = await txResponse.wait();
+
+                    result = {
+                        success: receipt.status === 1,
+                        data: {
+                            tx_hash: receipt.hash,
+                            dest_amount: destAmount,
+                            block_number: receipt.blockNumber,
+                            gas_used: receipt.gasUsed.toString(),
+                        }
+                    };
+                } catch (e) {
+                    result = { success: false, error: `Swap TX failed: ${e.message}` };
+                }
+                break;
+            }
             case 'debridge-execute': {
                 // Full flow following official deBridge example:
                 // 1. Fetch quote+TX from deBridge API
@@ -325,7 +436,7 @@ async function main() {
                     dstChainTokenOutRecipient: dst_recipient,
                     srcChainOrderAuthorityAddress: src_authority,
                     dstChainOrderAuthorityAddress: dst_authority || dst_recipient,
-                    prependOperatingExpenses: 'true',
+                    prependOperatingExpenses: 'false',
                 });
 
                 if (affiliate_fee_percent) {

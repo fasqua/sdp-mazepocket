@@ -8594,6 +8594,7 @@ struct CrossSwapRequest {
     target_token: String,
     amount_sol: f64,
     target_chain: Option<String>,
+    target_decimals: Option<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -8828,13 +8829,26 @@ async fn cross_swap_handler(
         }));
     }
 
-    // Step 2: Bridge USDC (Solana) -> target token (Base) via deBridge
+    // Get actual USDC balance in pocket (Jupiter out_amount may differ slightly from actual balance)
+    let usdc_pubkey = solana_sdk::pubkey::Pubkey::from_str(usdc_mint)
+        .map_err(|e| MazeError::RpcError(format!("Invalid USDC mint: {}", e)))?;
+    let usdc_ata = spl_associated_token_account::get_associated_token_address(
+        &pocket_keypair.pubkey(),
+        &usdc_pubkey,
+    );
+    let actual_usdc = match state.rpc.get_token_account_balance(&usdc_ata) {
+        Ok(bal) => bal.amount.parse::<u64>().unwrap_or(usdc_amount),
+        Err(_) => usdc_amount,
+    };
+
+    // Step 2: Bridge USDC (Solana) -> ETH (Base) via deBridge (always bridge to ETH for gas)
+    let eth_base = "0x0000000000000000000000000000000000000000";
     let pocket_key_b58 = bs58::encode(&keypair_bytes).into_string();
-    info!("Cross-swap step 2: deBridge bridge {} USDC -> {} on Base for pocket {}", usdc_amount, req.target_token, pocket_id);
+    info!("Cross-swap step 2: deBridge bridge {} USDC (actual: {}) -> ETH on Base for pocket {}", usdc_amount, actual_usdc, pocket_id);
 
     let exec_result = evm::debridge_execute(
-        &req.target_token,
-        usdc_amount,
+        eth_base,
+        actual_usdc,
         &evm_address,
         &pocket.stealth_pubkey,
         &pocket_key_b58,
@@ -8844,52 +8858,109 @@ async fn cross_swap_handler(
         None, // deBridge referral code (optional)
     ).await;
 
-    match exec_result {
-        Ok(result) => {
-            let tx_signature = result.tx_signature.clone().unwrap_or_default();
-            let confirmed = result.confirmed;
-            let status = if confirmed { "completed" } else { "pending" };
-
-            // Log transaction
-            let _ = state.db.insert_transaction_log(
-                &format!("xswap_{}", &tx_signature[..16.min(tx_signature.len())]),
-                &owner_meta_hash,
-                "cross_swap",
-                status,
-                Some(amount_lamports as i64),
-                Some(&format!("{} SOL -> {} (Base)", req.amount_sol, &req.target_token[..10.min(req.target_token.len())])),
-                Some(&format!("Cross-chain swap to Base token {}", req.target_token)),
-                Some(&tx_signature),
-                Some(&serde_json::json!({
-                    "order_id": result.order_id,
-                    "target_token": req.target_token,
-                    "evm_address": evm_address,
-                    "target_chain": req.target_chain.unwrap_or_else(|| "base".to_string()),
-                    "confirmed": confirmed,
-                }).to_string()),
-            );
-
-            info!("Cross-chain swap {}: {} (pocket {} -> {} on Base)", status, tx_signature, pocket_id, req.target_token);
-
-            Ok(Json(CrossSwapResponse {
-                success: true,
-                order_id: result.order_id,
-                estimated_output: result.estimation,
-                tx_signature: result.tx_signature,
-                error: if !confirmed { Some("TX submitted but confirmation pending".to_string()) } else { None },
-            }))
-        }
+    let bridge_result = match exec_result {
+        Ok(result) => result,
         Err(e) => {
-            warn!("Cross-chain swap failed for pocket {}: {}", pocket_id, e);
-            Ok(Json(CrossSwapResponse {
+            warn!("Cross-chain swap bridge failed for pocket {}: {}", pocket_id, e);
+            return Ok(Json(CrossSwapResponse {
                 success: false,
                 order_id: None,
                 estimated_output: None,
                 tx_signature: None,
-                error: Some(format!("{}", e)),
-            }))
+                error: Some(format!("Bridge USDC->ETH failed: {}", e)),
+            }));
+        }
+    };
+
+    let bridge_tx = bridge_result.tx_signature.clone().unwrap_or_default();
+    info!("Cross-swap step 2 done: bridge TX {}", bridge_tx);
+
+    // Step 3: If target token is not ETH, swap ETH -> target token via ParaSwap on Base
+    let eth_native_addr = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+    let is_target_eth = req.target_token.to_lowercase() == eth_native_addr.to_lowercase()
+        || req.target_token == eth_base;
+
+    if !is_target_eth {
+        // Wait for bridge to be fulfilled (solver ~4-10 seconds)
+        info!("Cross-swap step 3: waiting for bridge fulfillment before swap...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+
+        // Get ETH balance on Base
+        let evm_bal = evm::get_balance(&evm_address, None).await
+            .map_err(|e| AppError(e))?;
+        let eth_wei: u128 = evm_bal.eth_balance_wei.parse().unwrap_or(0);
+        let gas_reserve: u128 = 1_500_000_000_000_000; // 0.0015 ETH reserve for gas + future txs
+        let swap_amount = if eth_wei > gas_reserve { eth_wei - gas_reserve } else { 0 };
+
+        if swap_amount == 0 {
+            return Ok(Json(CrossSwapResponse {
+                success: true,
+                order_id: bridge_result.order_id,
+                estimated_output: bridge_result.estimation,
+                tx_signature: bridge_result.tx_signature,
+                error: Some("Bridge succeeded but no ETH available for swap to target token. ETH is in your Base wallet.".to_string()),
+            }));
+        }
+
+        info!("Cross-swap step 3: ParaSwap swap {} wei ETH -> {} on Base", swap_amount, req.target_token);
+
+        // Decrypt EVM private key for ParaSwap swap
+        let evm_pk_bytes = state.db.decrypt(&pocket.evm_keypair_encrypted.clone().unwrap_or_default())?;
+        let evm_private_key = String::from_utf8(evm_pk_bytes)
+            .map_err(|e| MazeError::DecryptionError(format!("Invalid UTF-8: {}", e)))?;
+
+        let swap_result = evm::evm_swap(
+            &evm_private_key,
+            eth_native_addr,
+            &req.target_token,
+            &swap_amount.to_string(),
+            18, // ETH decimals
+            req.target_decimals.unwrap_or(18),
+            Some(100), // 1% slippage
+        ).await;
+
+        match swap_result {
+            Ok(sr) => {
+                info!("Cross-swap step 3 done: ParaSwap TX {}", sr.tx_hash);
+            }
+            Err(e) => {
+                warn!("Cross-swap step 3 ParaSwap swap failed: {}. ETH is in Base wallet.", e);
+                return Ok(Json(CrossSwapResponse {
+                    success: true,
+                    order_id: bridge_result.order_id,
+                    estimated_output: bridge_result.estimation,
+                    tx_signature: bridge_result.tx_signature,
+                    error: Some(format!("Bridge succeeded but swap ETH->target failed: {}. ETH is in your Base wallet.", e)),
+                }));
+            }
         }
     }
+
+    // Log transaction
+    let _ = state.db.insert_transaction_log(
+        &format!("xswap_{}", &bridge_tx[..16.min(bridge_tx.len())]),
+        &owner_meta_hash,
+        "cross_swap",
+        "completed",
+        Some(amount_lamports as i64),
+        Some(&format!("{} SOL -> {} (Base)", req.amount_sol, &req.target_token[..10.min(req.target_token.len())])),
+        Some(&format!("Cross-chain swap to Base token {}", req.target_token)),
+        Some(&bridge_tx),
+        Some(&serde_json::json!({
+            "order_id": bridge_result.order_id,
+            "target_token": req.target_token,
+            "evm_address": evm_address,
+            "target_chain": req.target_chain.unwrap_or_else(|| "base".to_string()),
+        }).to_string()),
+    );
+
+    Ok(Json(CrossSwapResponse {
+        success: true,
+        order_id: bridge_result.order_id,
+        estimated_output: bridge_result.estimation,
+        tx_signature: bridge_result.tx_signature,
+        error: None,
+    }))
 }
 
 
@@ -8900,6 +8971,7 @@ struct CrossSwapSellRequest {
     meta_address: String,
     input_token: String,
     amount_raw: String,
+    src_decimals: Option<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -8977,18 +9049,76 @@ async fn cross_swap_sell_handler(
     let evm_private_key = String::from_utf8(evm_pk_bytes)
         .map_err(|e| MazeError::DecryptionError(format!("Invalid UTF-8: {}", e)))?;
 
-    // Get deBridge reverse quote (Base -> Solana)
+    let eth_native = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+    let is_eth_input = req.input_token.to_lowercase() == eth_native.to_lowercase()
+        || req.input_token == "0x0000000000000000000000000000000000000000";
+
+    // Step 1: If input is not ETH, swap token -> ETH via ParaSwap on Base
+    let _eth_amount_for_bridge: Option<u128> = if !is_eth_input {
+        info!("Cross-sell step 1: ParaSwap swap {} {} -> ETH on Base for pocket {}", req.amount_raw, req.input_token, pocket_id);
+
+        let src_decimals: u8 = req.src_decimals.unwrap_or(18);
+        let swap_result = evm::evm_swap(
+            &evm_private_key,
+            &req.input_token,
+            eth_native,
+            &req.amount_raw,
+            src_decimals,
+            18,
+            Some(100), // 1% slippage
+        ).await;
+
+        match swap_result {
+            Ok(ref sr) => {
+                info!("Cross-sell step 1 done: swap TX {}", sr.tx_hash);
+                // Wait for balance to settle after ParaSwap swap
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                None // will use full ETH balance
+            }
+            Err(e) => {
+                return Ok(Json(CrossSwapSellResponse {
+                    success: false,
+                    order_id: None,
+                    estimated_sol: None,
+                    tx_hash: None,
+                    error: Some(format!("ParaSwap swap failed: {}", e)),
+                }));
+            }
+        }
+    } else {
+        None // already ETH, use amount_raw directly
+    };
+
+    // Step 2: Get ETH balance to bridge (leave small amount for future gas)
+    let evm_balance = evm::get_balance(&evm_address, None).await
+        .map_err(|e| AppError(e))?;
+    let eth_wei: u128 = evm_balance.eth_balance_wei.parse().unwrap_or(0);
+    let gas_reserve: u128 = 1_500_000_000_000_000; // 0.0015 ETH reserve for gas + future txs
+    let bridge_amount = if eth_wei > gas_reserve { eth_wei - gas_reserve } else { 0 };
+
+    if bridge_amount == 0 {
+        return Ok(Json(CrossSwapSellResponse {
+            success: false,
+            order_id: None,
+            estimated_sol: None,
+            tx_hash: None,
+            error: Some("Insufficient ETH balance for bridge after swap".to_string()),
+        }));
+    }
+
+    // Step 3: Bridge ETH (Base) -> SOL (Solana) via deBridge
+    let eth_zero = "0x0000000000000000000000000000000000000000";
+    info!("Cross-sell step 2: deBridge bridge {} wei ETH -> SOL for pocket {}", bridge_amount, pocket_id);
     let quote = evm::debridge_quote_reverse(
-        &req.input_token,
-        &req.amount_raw,
+        eth_zero,
+        &bridge_amount.to_string(),
         &pocket.stealth_pubkey,
         &evm_address,
         Some(0.5),
-        Some("0x8E61077Af8BF9564210ecb52D3a27FC17591AF9c"), // EVM fee wallet (Base)
+        Some("0x8E61077Af8BF9564210ecb52D3a27FC17591AF9c"),
         None,
     ).await.map_err(|e| AppError(e))?;
 
-    // Get tx fields from deBridge response
     let (tx_to, tx_data, tx_value) = match &quote.tx {
         Some(tx) => {
             let to = tx.get("to").and_then(|v| v.as_str()).unwrap_or("");
@@ -9007,17 +9137,12 @@ async fn cross_swap_sell_handler(
         }
     };
 
-    // Get approve info from estimation
-    let approve_to = tx_to.clone();
-    let approve_token = req.input_token.clone();
-    let approve_amount = req.amount_raw.clone();
-
-    // Execute approve + send on Base via sidecar
+    // ETH native doesn't need approve, just send bridge TX
     let evm_result = evm::evm_approve_and_send(
         &evm_private_key,
-        Some(&approve_to),
-        Some(&approve_token),
-        Some(&approve_amount),
+        None, // no approve needed for native ETH
+        None,
+        None,
         &tx_to,
         &tx_data,
         &tx_value,
@@ -9043,6 +9168,39 @@ async fn cross_swap_sell_handler(
             "amount_raw": req.amount_raw,
         }).to_string()),
     );
+
+    // Background task: auto-unwrap WSOL -> native SOL after solver fulfills
+    let unwrap_keypair = state.db.decrypt(&pocket.keypair_encrypted).unwrap_or_default();
+    let unwrap_rpc_url = state.config.rpc_url.clone();
+    let unwrap_pocket_id = pocket_id.clone();
+    tokio::spawn(async move {
+        let wsol_mint = solana_sdk::pubkey::Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        if let Ok(kp) = Keypair::from_bytes(&unwrap_keypair) {
+            let wsol_ata = spl_associated_token_account::get_associated_token_address(&kp.pubkey(), &wsol_mint);
+            let unwrap_rpc = solana_client::rpc_client::RpcClient::new(unwrap_rpc_url);
+            for attempt in 1..=2 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                if let Ok(bal) = unwrap_rpc.get_token_account_balance(&wsol_ata) {
+                    let amount: u64 = bal.amount.parse().unwrap_or(0);
+                    if amount > 0 {
+                        if let Ok(close_ix) = spl_token::instruction::close_account(
+                            &spl_token::id(), &wsol_ata, &kp.pubkey(), &kp.pubkey(), &[],
+                        ) {
+                            if let Ok(bh) = unwrap_rpc.get_latest_blockhash() {
+                                let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+                                    &[close_ix], Some(&kp.pubkey()), &[&kp], bh,
+                                );
+                                match unwrap_rpc.send_and_confirm_transaction(&tx) {
+                                    Ok(sig) => { info!("Auto-unwrap WSOL attempt {}: {} (pocket {})", attempt, sig, unwrap_pocket_id); break; }
+                                    Err(e) => { warn!("Auto-unwrap WSOL attempt {} failed: {} (pocket {})", attempt, e, unwrap_pocket_id); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     Ok(Json(CrossSwapSellResponse {
         success: true,
