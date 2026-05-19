@@ -126,12 +126,13 @@ pub async fn generate_keypair() -> Result<EvmKeypair> {
 }
 
 /// Get EVM balance for an address
-pub async fn get_balance(address: &str, tokens: Option<Vec<String>>) -> Result<EvmBalanceInfo> {
+pub async fn get_balance(address: &str, tokens: Option<Vec<String>>, chain_id: Option<u32>) -> Result<EvmBalanceInfo> {
     info!("EVM: getting balance for {}", address);
 
     let payload = serde_json::json!({
         "address": address,
         "tokens": tokens.unwrap_or_default(),
+        "chain_id": chain_id.unwrap_or(8453),
     });
 
     let result = call_sidecar("balance", &payload).await?;
@@ -159,7 +160,7 @@ pub async fn get_balance(address: &str, tokens: Option<Vec<String>>) -> Result<E
     })
 }
 
-/// Get deBridge quote + create-tx for cross-chain swap (Solana -> Base)
+/// Get deBridge quote + create-tx for cross-chain swap (Solana -> EVM)
 pub async fn debridge_quote(
     dst_token_out: &str,
     src_amount_lamports: u64,
@@ -168,12 +169,15 @@ pub async fn debridge_quote(
     affiliate_fee_percent: Option<f64>,
     affiliate_fee_recipient: Option<&str>,
     referral_code: Option<u32>,
+    dst_chain_id: Option<u32>,
 ) -> Result<DebridgeQuoteResult> {
-    info!("EVM: deBridge quote for {} lamports -> {} on Base", src_amount_lamports, dst_token_out);
+    let dst_cid = dst_chain_id.unwrap_or(8453);
+    let chain_name = if dst_cid == 56 { "BSC" } else { "Base" };
+    info!("EVM: deBridge quote for {} lamports -> {} on {}", src_amount_lamports, dst_token_out, chain_name);
 
     let mut payload = serde_json::json!({
         "src_chain_id": 7565164,
-        "dst_chain_id": 8453,
+        "dst_chain_id": dst_cid,
         "src_token_in": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
         "dst_token_out": dst_token_out,
         "src_amount": src_amount_lamports.to_string(),
@@ -222,12 +226,15 @@ pub async fn debridge_execute(
     affiliate_fee_percent: Option<f64>,
     affiliate_fee_recipient: Option<&str>,
     referral_code: Option<u32>,
+    dst_chain_id: Option<u32>,
 ) -> Result<DebridgeExecuteResult> {
-    info!("EVM: deBridge execute for {} lamports -> {} on Base", src_amount_lamports, dst_token_out);
+    let dst_cid = dst_chain_id.unwrap_or(8453);
+    let chain_name = if dst_cid == 56 { "BSC" } else { "Base" };
+    info!("EVM: deBridge execute for {} lamports -> {} on {}", src_amount_lamports, dst_token_out, chain_name);
 
     let mut payload = serde_json::json!({
         "src_chain_id": 7565164,
-        "dst_chain_id": 8453,
+        "dst_chain_id": dst_cid,
         "src_token_in": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
         "dst_token_out": dst_token_out,
         "src_amount": src_amount_lamports.to_string(),
@@ -301,7 +308,7 @@ pub struct EvmTxResult {
     pub status: Option<u64>,
 }
 
-/// Get deBridge quote + create-tx for reverse cross-chain swap (Base -> Solana)
+/// Get deBridge quote + create-tx for reverse cross-chain swap (EVM -> Solana)
 pub async fn debridge_quote_reverse(
     src_token_in: &str,
     src_amount: &str,
@@ -310,10 +317,14 @@ pub async fn debridge_quote_reverse(
     affiliate_fee_percent: Option<f64>,
     affiliate_fee_recipient: Option<&str>,
     referral_code: Option<u32>,
+    src_chain_id: Option<u32>,
 ) -> Result<DebridgeQuoteResult> {
-    info!("EVM: deBridge reverse quote for {} {} -> SOL on Solana", src_amount, src_token_in);
+    let src_cid = src_chain_id.unwrap_or(8453);
+    let chain_name = if src_cid == 56 { "BSC" } else { "Base" };
+    info!("EVM: deBridge reverse quote for {} {} -> SOL on Solana from {}", src_amount, src_token_in, chain_name);
 
     let mut payload = serde_json::json!({
+        "src_chain_id": src_cid,
         "src_token_in": src_token_in,
         "src_amount": src_amount,
         "dst_recipient": dst_recipient,
@@ -350,8 +361,7 @@ pub async fn debridge_quote_reverse(
     })
 }
 
-/// Approve ERC-20 token + send deBridge transaction on Base (for reverse flow)
-/// Swap tokens on Base via ParaSwap/Velora REST API
+/// Swap tokens via 1inch Aggregation Router (Base + BSC)
 pub async fn evm_swap(
     private_key: &str,
     src_token: &str,
@@ -360,8 +370,11 @@ pub async fn evm_swap(
     src_decimals: u8,
     dest_decimals: u8,
     slippage: Option<u32>,
+    chain_id: Option<u32>,
 ) -> Result<EvmTxResult> {
-    info!("EVM: ParaSwap swap {} {} -> {} on Base", amount, src_token, dest_token);
+    let cid = chain_id.unwrap_or(8453);
+    let chain_name = if cid == 56 { "BSC" } else { "Base" };
+    info!("EVM: 1inch swap {} {} -> {} on {}", amount, src_token, dest_token, chain_name);
 
     let payload = serde_json::json!({
         "private_key": private_key,
@@ -371,6 +384,7 @@ pub async fn evm_swap(
         "src_decimals": src_decimals,
         "dest_decimals": dest_decimals,
         "slippage": slippage.unwrap_or(100),
+        "chain_id": cid,
     });
 
     let result = call_sidecar("evm-swap", &payload).await?;
@@ -399,6 +413,7 @@ pub async fn evm_approve_and_send(
     tx_to: &str,
     tx_data: &str,
     tx_value: &str,
+    chain_id: Option<u32>,
 ) -> Result<EvmTxResult> {
     info!("EVM: approve + send tx to {}", tx_to);
 
@@ -407,6 +422,7 @@ pub async fn evm_approve_and_send(
         "tx_to": tx_to,
         "tx_data": tx_data,
         "tx_value": tx_value,
+        "chain_id": chain_id.unwrap_or(8453),
     });
 
     if let Some(to) = approve_to {
@@ -434,5 +450,72 @@ pub async fn evm_approve_and_send(
         block_number: data.get("block_number").and_then(|v| v.as_u64()),
         gas_used: data.get("gas_used").and_then(|v| v.as_str()).map(|s| s.to_string()),
         status: data.get("status").and_then(|v| v.as_u64()),
+    })
+}
+
+
+// ============ TOKEN RESOLVER ============
+
+/// Resolved EVM token info (auto-detected chain + metadata)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvmTokenResolved {
+    pub chain_id: u32,
+    pub chain_name: String,
+    pub address: String,
+    pub symbol: String,
+    pub name: String,
+    pub decimals: u8,
+}
+
+/// Token resolution result (may exist on multiple chains)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvmTokenResolveResult {
+    pub token: EvmTokenResolved,
+    pub all_chains: Vec<EvmTokenResolved>,
+}
+
+/// Resolve EVM token: auto-detect chain (Base/BSC) + name, symbol, decimals
+pub async fn resolve_evm_token(address: &str) -> Result<EvmTokenResolveResult> {
+    info!("EVM: resolving token {}", address);
+
+    let payload = serde_json::json!({
+        "address": address,
+    });
+
+    let result = call_sidecar("resolve-token", &payload).await?;
+
+    let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !success {
+        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+        return Err(MazeError::RpcError(format!("Token resolve failed: {}", error)));
+    }
+
+    let data = result.get("data").ok_or_else(|| MazeError::RpcError("No data in resolve response".into()))?;
+
+    let token = EvmTokenResolved {
+        chain_id: data.get("chain_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        chain_name: data.get("chain_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        address: data.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        symbol: data.get("symbol").and_then(|v| v.as_str()).unwrap_or("UNKNOWN").to_string(),
+        name: data.get("name").and_then(|v| v.as_str()).unwrap_or("Unknown Token").to_string(),
+        decimals: data.get("decimals").and_then(|v| v.as_u64()).unwrap_or(18) as u8,
+    };
+
+    // Parse all_chains array
+    let all_chains_arr = result.get("all_chains").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let all_chains: Vec<EvmTokenResolved> = all_chains_arr.into_iter().filter_map(|v| {
+        Some(EvmTokenResolved {
+            chain_id: v.get("chain_id")?.as_u64()? as u32,
+            chain_name: v.get("chain_name")?.as_str()?.to_string(),
+            address: v.get("address")?.as_str()?.to_string(),
+            symbol: v.get("symbol")?.as_str()?.to_string(),
+            name: v.get("name")?.as_str()?.to_string(),
+            decimals: v.get("decimals")?.as_u64()? as u8,
+        })
+    }).collect();
+
+    Ok(EvmTokenResolveResult {
+        token,
+        all_chains,
     })
 }

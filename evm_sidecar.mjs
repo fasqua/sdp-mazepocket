@@ -2,6 +2,8 @@
 import { ethers } from 'ethers';
 
 const BASE_RPC_URL = process.env.BASE_RPC_URL || 'https://mainnet.base.org';
+const BSC_RPC_URL = process.env.BSC_RPC_URL || 'https://bsc-dataseed.binance.org';
+const ONEINCH_API_KEY = process.env.ONEINCH_API_KEY || '';
 const DEBRIDGE_API_URL = process.env.DEBRIDGE_API_URL || 'https://dln.debridge.finance/v1.0';
 const DEBRIDGE_STATS_API = 'https://stats-api.dln.trade';
 
@@ -29,8 +31,10 @@ async function main() {
                 break;
             }
             case 'balance': {
-                // Get ETH balance + ERC-20 token balances on Base
-                const provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
+                // Get ETH/BNB balance + ERC-20 token balances on EVM chain
+                const balChainId = payload.chain_id || 8453;
+                const balRpcUrl = balChainId === 56 ? BSC_RPC_URL : BASE_RPC_URL;
+                const provider = new ethers.JsonRpcProvider(balRpcUrl);
                 const address = payload.address;
                 if (!address) {
                     result = { success: false, error: 'address required' };
@@ -43,10 +47,31 @@ async function main() {
                     tokens: [],
                 };
 
-                // If token addresses provided, fetch their balances
-                if (payload.tokens && Array.isArray(payload.tokens)) {
+                // Auto-discover tokens: use provided list or scan common Base tokens
+                let tokenList = (payload.tokens && Array.isArray(payload.tokens) && payload.tokens.length > 0) ? payload.tokens : [];
+                if (tokenList.length === 0) {
+                    // Common Base tokens to scan for balances
+                    tokenList = [
+                        '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC
+                        '0x4200000000000000000000000000000000000006', // WETH
+                        '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', // DAI
+                        '0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b', // VIRTUAL
+                        '0xfA980cEd6895AC314E7dE34Ef1bFAE90a5AdD21b', // PRIME
+                        '0x532f27101965dd16442E59d40670FaF5eBB142E4', // BRETT
+                        '0x940181a94A35A4569E4529A3CDfB74e38FD98631', // AERO
+                        '0xB1a03EdA10342529bBF8EB700a06C60441fEf25d', // MIGGLES
+                        '0x768BE13e1680b5Ebe0024C42c896E3dB59ec0149', // MOCHI
+                        '0xAC1Bd2486aAf3B5C0fc3Fd868558b082a531B2B4', // TOSHI
+                        '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed', // DEGEN
+                        '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf', // cbBTC
+                        '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22', // cbETH
+                        '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA', // USDbC
+                    ];
+                }
+                if (tokenList.length > 0) {
                     const erc20Abi = ['function balanceOf(address) view returns (uint256)', 'function symbol() view returns (string)', 'function decimals() view returns (uint8)'];
-                    for (const tokenAddr of payload.tokens) {
+                    // Query all tokens in parallel for speed
+                    const tokenPromises = tokenList.map(async (tokenAddr) => {
                         try {
                             const contract = new ethers.Contract(tokenAddr, erc20Abi, provider);
                             const [balance, symbol, decimals] = await Promise.all([
@@ -54,20 +79,24 @@ async function main() {
                                 contract.symbol().catch(() => 'UNKNOWN'),
                                 contract.decimals().catch(() => 18),
                             ]);
-                            balanceData.tokens.push({
-                                address: tokenAddr,
-                                symbol,
-                                decimals: Number(decimals),
-                                balance: ethers.formatUnits(balance, decimals),
-                                balance_raw: balance.toString(),
-                            });
+                            if (balance > 0n) {
+                                return {
+                                    address: tokenAddr,
+                                    symbol,
+                                    decimals: Number(decimals),
+                                    balance: ethers.formatUnits(balance, decimals),
+                                    balance_raw: balance.toString(),
+                                };
+                            }
+                            return null;
                         } catch (e) {
-                            balanceData.tokens.push({
-                                address: tokenAddr,
-                                symbol: 'ERROR',
-                                balance: '0',
-                                error: e.message,
-                            });
+                            return null; // Skip errored tokens silently
+                        }
+                    });
+                    const results = await Promise.allSettled(tokenPromises);
+                    for (const r of results) {
+                        if (r.status === 'fulfilled' && r.value) {
+                            balanceData.tokens.push(r.value);
                         }
                     }
                 }
@@ -133,9 +162,10 @@ async function main() {
                 break;
             }
             case 'debridge-quote-reverse': {
-                // Get quote + create-tx from deBridge DLN API (Base → Solana)
+                // Get quote + create-tx from deBridge DLN API (EVM -> Solana)
                 const {
-                    src_token_in,       // 0x... Base token to sell
+                    src_chain_id,       // EVM chain ID (8453=Base, 56=BSC)
+                    src_token_in,       // 0x... EVM token to sell
                     src_amount,         // amount in token's smallest unit
                     dst_recipient,      // pocket Solana pubkey
                     src_authority,      // pocket EVM address
@@ -146,7 +176,7 @@ async function main() {
                 } = payload;
 
                 const params = new URLSearchParams({
-                    srcChainId: '8453',
+                    srcChainId: String(src_chain_id || 8453),
                     dstChainId: '7565164',
                     srcChainTokenIn: src_token_in,
                     dstChainTokenOut: 'So11111111111111111111111111111111111111112',
@@ -188,11 +218,13 @@ async function main() {
                 break;
             }
             case 'evm-approve-and-send': {
-                // Approve ERC-20 token + send deBridge tx on Base
-                // Required for reverse flow: sell Base token -> SOL
-                const { private_key, approve_to, approve_token, approve_amount, tx_to, tx_data, tx_value } = payload;
+                // Approve ERC-20 token + send deBridge tx on EVM chain
+                // Required for reverse flow: sell EVM token -> SOL
+                const { private_key, approve_to, approve_token, approve_amount, tx_to, tx_data, tx_value, chain_id } = payload;
 
-                const provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
+                const aasChainId = chain_id || 8453;
+                const aasRpcUrl = aasChainId === 56 ? BSC_RPC_URL : BASE_RPC_URL;
+                const provider = new ethers.JsonRpcProvider(aasRpcUrl);
                 const wallet = new ethers.Wallet(private_key, provider);
 
                 // Step 1: Approve ERC-20 if needed
@@ -283,7 +315,7 @@ async function main() {
                 break;
             }
             case 'evm-swap': {
-                // Swap tokens on Base via ParaSwap/Velora REST API (no SDK needed)
+                // Swap tokens via 1inch Aggregation Router (Base + BSC)
                 const {
                     private_key,
                     src_token,
@@ -292,6 +324,7 @@ async function main() {
                     src_decimals,
                     dest_decimals,
                     slippage,
+                    chain_id,
                 } = payload;
 
                 if (!private_key || !src_token || !dest_token || !amount) {
@@ -299,42 +332,46 @@ async function main() {
                     break;
                 }
 
-                const swapProvider = new ethers.JsonRpcProvider(BASE_RPC_URL);
+                // Dynamic RPC based on chain
+                const swapChainId = chain_id || 8453;
+                const swapRpcUrl = swapChainId === 56 ? BSC_RPC_URL : BASE_RPC_URL;
+                const swapProvider = new ethers.JsonRpcProvider(swapRpcUrl);
                 const swapWallet = new ethers.Wallet(private_key, swapProvider);
                 const swapUserAddress = swapWallet.address;
 
-                // 1. Get quote + TX from ParaSwap
+                // Convert slippage from basis points to percent (100 bps = 1%)
+                const slippagePct = (slippage || 100) / 100;
+
+                // 1. Get swap TX from 1inch API
                 const swapParams = new URLSearchParams({
-                    srcToken: src_token,
-                    destToken: dest_token,
+                    src: src_token,
+                    dst: dest_token,
                     amount: String(amount),
-                    srcDecimals: String(src_decimals || 18),
-                    destDecimals: String(dest_decimals || 18),
-                    side: 'SELL',
-                    network: '8453',
-                    version: '6.2',
-                    userAddress: swapUserAddress,
-                    slippage: String(slippage || 100),
+                    from: swapUserAddress,
+                    slippage: String(slippagePct),
+                    disableEstimate: 'true',
+                    includeGas: 'true',
                 });
 
-                const swapUrl = `https://api.paraswap.io/swap?${swapParams.toString()}`;
-                const swapResp = await fetch(swapUrl);
+                const swapUrl = `https://api.1inch.dev/swap/v6.0/${swapChainId}/swap?${swapParams.toString()}`;
+                const swapHeaders = { 'Authorization': `Bearer ${ONEINCH_API_KEY}` };
+                const swapResp = await fetch(swapUrl, { headers: swapHeaders });
                 const swapData = await swapResp.json();
 
-                if (swapData.error) {
-                    result = { success: false, error: `ParaSwap quote failed: ${swapData.error}` };
+                if (swapData.error || swapData.statusCode) {
+                    result = { success: false, error: `1inch swap failed: ${swapData.error || swapData.description || 'Unknown error'}` };
                     break;
                 }
 
-                if (!swapData.txParams) {
-                    result = { success: false, error: 'ParaSwap did not return txParams' };
+                if (!swapData.tx) {
+                    result = { success: false, error: '1inch did not return tx data' };
                     break;
                 }
 
-                const destAmount = swapData.priceRoute?.destAmount || '0';
-                const contractAddr = swapData.txParams.to;
+                const destAmount = swapData.dstAmount || '0';
+                const routerAddr = swapData.tx.to;
 
-                // 2. Approve ERC-20 if src_token is not native ETH
+                // 2. Approve ERC-20 if src_token is not native ETH/BNB
                 const nativeEth = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
                 if (src_token.toLowerCase() !== nativeEth.toLowerCase()) {
                     try {
@@ -343,14 +380,14 @@ async function main() {
                             'function allowance(address owner, address spender) view returns (uint256)',
                         ], swapWallet);
 
-                        const currentAllowance = await erc20.allowance(swapUserAddress, contractAddr);
+                        const currentAllowance = await erc20.allowance(swapUserAddress, routerAddr);
                         const needed = BigInt(amount);
 
                         if (currentAllowance < needed) {
-                            const approveTx = await erc20.approve(contractAddr, needed);
+                            const approveTx = await erc20.approve(routerAddr, needed);
                             const approveReceipt = await approveTx.wait();
                             if (!approveReceipt || approveReceipt.status !== 1) {
-                                result = { success: false, error: 'ERC-20 approve failed for ParaSwap' };
+                                result = { success: false, error: 'ERC-20 approve failed for 1inch' };
                                 break;
                             }
                         }
@@ -363,10 +400,10 @@ async function main() {
                 // 3. Send swap TX
                 try {
                     const txReq = {
-                        to: swapData.txParams.to,
-                        data: swapData.txParams.data,
-                        value: swapData.txParams.value || '0',
-                        gasPrice: swapData.txParams.gasPrice,
+                        to: swapData.tx.to,
+                        data: swapData.tx.data,
+                        value: swapData.tx.value || '0',
+                        gasPrice: swapData.tx.gasPrice,
                     };
 
                     try {
@@ -567,6 +604,77 @@ async function main() {
                         confirmed: confirmed,
                     }
                 };
+                break;
+            }
+            case 'resolve-token': {
+                // Auto-detect chain + token metadata from contract address
+                const { address } = payload;
+                if (!address) {
+                    result = { success: false, error: 'address required' };
+                    break;
+                }
+
+                // If not 0x prefix, it's Solana — skip (handled by Rust side)
+                if (!address.startsWith('0x')) {
+                    result = { success: false, error: 'Not an EVM address. Solana tokens resolved separately.' };
+                    break;
+                }
+
+                const erc20Abi = [
+                    'function symbol() view returns (string)',
+                    'function name() view returns (string)',
+                    'function decimals() view returns (uint8)',
+                ];
+
+                const chains = [
+                    { chain_id: 8453, name: 'base', rpc: BASE_RPC_URL },
+                    { chain_id: 56, name: 'bsc', rpc: BSC_RPC_URL },
+                ];
+
+                const results = await Promise.allSettled(chains.map(async (chain) => {
+                    const provider = new ethers.JsonRpcProvider(chain.rpc);
+                    const contract = new ethers.Contract(address, erc20Abi, provider);
+
+                    const [symbol, name, decimals, code] = await Promise.all([
+                        contract.symbol(),
+                        contract.name(),
+                        contract.decimals(),
+                        provider.getCode(address),
+                    ]);
+
+                    // No contract deployed at this address
+                    if (!code || code === '0x') {
+                        throw new Error('No contract at address');
+                    }
+
+                    return {
+                        chain_id: chain.chain_id,
+                        chain_name: chain.name,
+                        address: address,
+                        symbol: symbol,
+                        name: name,
+                        decimals: Number(decimals),
+                    };
+                }));
+
+                // Collect successful resolutions
+                const resolved = [];
+                for (const r of results) {
+                    if (r.status === 'fulfilled' && r.value) {
+                        resolved.push(r.value);
+                    }
+                }
+
+                if (resolved.length === 0) {
+                    result = { success: false, error: 'Token not found on Base or BSC' };
+                } else {
+                    // Return first match (Base prioritized since it's checked first)
+                    result = {
+                        success: true,
+                        data: resolved[0],
+                        all_chains: resolved,
+                    };
+                }
                 break;
             }
             default:

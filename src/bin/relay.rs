@@ -7679,6 +7679,7 @@ async fn main() {
         .route("/pocket/:pocket_id/cross-swap", post(cross_swap_handler))
         .route("/pocket/:pocket_id/cross-swap-sell", post(cross_swap_sell_handler))
         .route("/pocket/:pocket_id/cross-swap-status", get(cross_swap_status_handler))
+        .route("/resolve-token/:address", get(resolve_token_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -8638,13 +8639,16 @@ async fn evm_info_handler(
     };
 
     // Get EVM balance
-    match evm::get_balance(&evm_address, None).await {
+    match evm::get_balance(&evm_address, None, None).await {
         Ok(balance_info) => {
             let tokens: Vec<serde_json::Value> = balance_info.tokens.iter()
+                .filter(|t| t.balance != "0" && t.balance != "0.0")
                 .map(|t| serde_json::json!({
                     "address": t.address,
                     "symbol": t.symbol,
                     "balance": t.balance,
+                    "decimals": t.decimals,
+                    "balance_raw": t.balance_raw,
                 }))
                 .collect();
 
@@ -8747,6 +8751,23 @@ async fn cross_swap_handler(
         }));
     }
 
+    // Auto-resolve token chain + decimals from CA
+    let resolved = evm::resolve_evm_token(&req.target_token).await.ok();
+    let target_chain_id: u32 = resolved.as_ref()
+        .map(|r| r.token.chain_id)
+        .or_else(|| req.target_chain.as_ref().and_then(|c| match c.as_str() {
+            "bsc" => Some(56),
+            _ => Some(8453),
+        }))
+        .unwrap_or(8453);
+    let target_decimals: u8 = resolved.as_ref()
+        .map(|r| r.token.decimals)
+        .or(req.target_decimals)
+        .unwrap_or(18);
+    let target_chain_name = if target_chain_id == 56 { "BSC" } else { "Base" };
+    info!("Cross-swap: resolved target {} -> chain {} ({}), decimals {}", 
+        req.target_token, target_chain_id, target_chain_name, target_decimals);
+
     // Get pocket balance
     let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
     let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
@@ -8779,45 +8800,65 @@ async fn cross_swap_handler(
         evm_kp.address
     };
 
-    // Step 1: Swap SOL -> USDC via Jupiter (proven reliable)
+    // Step 1: Swap SOL -> USDC via Jupiter (with retry on timeout)
     let usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     info!("Cross-swap step 1: Jupiter swap {} lamports SOL -> USDC for pocket {}", amount_lamports, pocket_id);
 
-    let swap_result = swap::execute_swap(
-        &state.http_client,
-        &state.rpc,
-        &pocket_keypair,
-        &tokens::SOL_MINT.to_string(),
-        usdc_mint,
-        amount_lamports,
-        Some(100), // 1% slippage for SOL->USDC
-    ).await;
+    let mut usdc_amount: u64 = 0;
+    let mut last_jup_error: Option<String> = None;
+    for jup_attempt in 1..=3u8 {
+        let swap_result = swap::execute_swap(
+            &state.http_client,
+            &state.rpc,
+            &pocket_keypair,
+            &tokens::SOL_MINT.to_string(),
+            usdc_mint,
+            amount_lamports,
+            Some(100), // 1% slippage for SOL->USDC
+        ).await;
 
-    let usdc_amount = match swap_result {
-        Ok(ref sr) if sr.success => {
-            let out = sr.out_amount.parse::<u64>().unwrap_or(0);
-            info!("Cross-swap step 1 done: got {} USDC raw units", out);
-            out
+        match swap_result {
+            Ok(ref sr) if sr.success => {
+                let out = sr.out_amount.parse::<u64>().unwrap_or(0);
+                info!("Cross-swap step 1 done (attempt {}): got {} USDC raw units", jup_attempt, out);
+                usdc_amount = out;
+                last_jup_error = None;
+                break;
+            }
+            Ok(ref sr) => {
+                let err = format!("Jupiter swap SOL->USDC failed: {}", sr.error.as_deref().unwrap_or("unknown"));
+                if err.contains("timeout") && jup_attempt < 3 {
+                    warn!("Cross-swap step 1 attempt {}/3 timeout, retrying...", jup_attempt);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    last_jup_error = Some(err);
+                    continue;
+                }
+                last_jup_error = Some(err);
+                break;
+            }
+            Err(e) => {
+                let err = format!("Jupiter swap SOL->USDC error: {}", e);
+                if err.contains("timeout") && jup_attempt < 3 {
+                    warn!("Cross-swap step 1 attempt {}/3 timeout, retrying...", jup_attempt);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    last_jup_error = Some(err);
+                    continue;
+                }
+                last_jup_error = Some(err);
+                break;
+            }
         }
-        Ok(ref sr) => {
-            return Ok(Json(CrossSwapResponse {
-                success: false,
-                order_id: None,
-                estimated_output: None,
-                tx_signature: None,
-                error: Some(format!("Jupiter swap SOL->USDC failed: {}", sr.error.as_deref().unwrap_or("unknown"))),
-            }));
-        }
-        Err(e) => {
-            return Ok(Json(CrossSwapResponse {
-                success: false,
-                order_id: None,
-                estimated_output: None,
-                tx_signature: None,
-                error: Some(format!("Jupiter swap SOL->USDC error: {}", e)),
-            }));
-        }
-    };
+    }
+
+    if let Some(err) = last_jup_error {
+        return Ok(Json(CrossSwapResponse {
+            success: false,
+            order_id: None,
+            estimated_output: None,
+            tx_signature: None,
+            error: Some(err),
+        }));
+    }
 
     if usdc_amount == 0 {
         return Ok(Json(CrossSwapResponse {
@@ -8844,7 +8885,7 @@ async fn cross_swap_handler(
     // Step 2: Bridge USDC (Solana) -> ETH (Base) via deBridge (always bridge to ETH for gas)
     let eth_base = "0x0000000000000000000000000000000000000000";
     let pocket_key_b58 = bs58::encode(&keypair_bytes).into_string();
-    info!("Cross-swap step 2: deBridge bridge {} USDC (actual: {}) -> ETH on Base for pocket {}", usdc_amount, actual_usdc, pocket_id);
+    info!("Cross-swap step 2: deBridge bridge {} USDC (actual: {}) -> {} on {} for pocket {}", usdc_amount, actual_usdc, if target_chain_id == 56 { "BNB" } else { "ETH" }, target_chain_name, pocket_id);
 
     let exec_result = evm::debridge_execute(
         eth_base,
@@ -8856,6 +8897,7 @@ async fn cross_swap_handler(
         Some(0.5), // affiliate fee 0.5%
         Some("Cu6mYBnL6T4J8tsaCC3XPU68Z7VwLZaXSTzp8v5v9aZA"), // Jupiter referral key
         None, // deBridge referral code (optional)
+        Some(target_chain_id), // dst_chain_id from token resolver
     ).await;
 
     let bridge_result = match exec_result {
@@ -8875,7 +8917,7 @@ async fn cross_swap_handler(
     let bridge_tx = bridge_result.tx_signature.clone().unwrap_or_default();
     info!("Cross-swap step 2 done: bridge TX {}", bridge_tx);
 
-    // Step 3: If target token is not ETH, swap ETH -> target token via ParaSwap on Base
+    // Step 3: If target token is not ETH/BNB, swap ETH/BNB -> target token via 1inch
     let eth_native_addr = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
     let is_target_eth = req.target_token.to_lowercase() == eth_native_addr.to_lowercase()
         || req.target_token == eth_base;
@@ -8886,10 +8928,11 @@ async fn cross_swap_handler(
         tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
 
         // Get ETH balance on Base
-        let evm_bal = evm::get_balance(&evm_address, None).await
+        let evm_bal = evm::get_balance(&evm_address, None, Some(target_chain_id)).await
             .map_err(|e| AppError(e))?;
         let eth_wei: u128 = evm_bal.eth_balance_wei.parse().unwrap_or(0);
-        let gas_reserve: u128 = 1_500_000_000_000_000; // 0.0015 ETH reserve for gas + future txs
+        // Dynamic gas reserve: BSC gas is more expensive than Base
+        let gas_reserve: u128 = if target_chain_id == 56 { 15_000_000_000_000_000 } else { 1_500_000_000_000_000 }; // 0.015 BNB or 0.0015 ETH
         let swap_amount = if eth_wei > gas_reserve { eth_wei - gas_reserve } else { 0 };
 
         if swap_amount == 0 {
@@ -8902,9 +8945,9 @@ async fn cross_swap_handler(
             }));
         }
 
-        info!("Cross-swap step 3: ParaSwap swap {} wei ETH -> {} on Base", swap_amount, req.target_token);
+        info!("Cross-swap step 3: 1inch swap {} wei ETH -> {} on {}", swap_amount, req.target_token, target_chain_name);
 
-        // Decrypt EVM private key for ParaSwap swap
+        // Decrypt EVM private key for 1inch swap
         let evm_pk_bytes = state.db.decrypt(&pocket.evm_keypair_encrypted.clone().unwrap_or_default())?;
         let evm_private_key = String::from_utf8(evm_pk_bytes)
             .map_err(|e| MazeError::DecryptionError(format!("Invalid UTF-8: {}", e)))?;
@@ -8915,16 +8958,17 @@ async fn cross_swap_handler(
             &req.target_token,
             &swap_amount.to_string(),
             18, // ETH decimals
-            req.target_decimals.unwrap_or(18),
+            target_decimals,
             Some(100), // 1% slippage
+            Some(target_chain_id), // chain_id from token resolver
         ).await;
 
         match swap_result {
             Ok(sr) => {
-                info!("Cross-swap step 3 done: ParaSwap TX {}", sr.tx_hash);
+                info!("Cross-swap step 3 done: 1inch TX {}", sr.tx_hash);
             }
             Err(e) => {
-                warn!("Cross-swap step 3 ParaSwap swap failed: {}. ETH is in Base wallet.", e);
+                warn!("Cross-swap step 3 1inch swap failed: {}. ETH/BNB is in EVM wallet.", e);
                 return Ok(Json(CrossSwapResponse {
                     success: true,
                     order_id: bridge_result.order_id,
@@ -8943,8 +8987,8 @@ async fn cross_swap_handler(
         "cross_swap",
         "completed",
         Some(amount_lamports as i64),
-        Some(&format!("{} SOL -> {} (Base)", req.amount_sol, &req.target_token[..10.min(req.target_token.len())])),
-        Some(&format!("Cross-chain swap to Base token {}", req.target_token)),
+        Some(&format!("{} SOL -> {} ({})", req.amount_sol, &req.target_token[..10.min(req.target_token.len())], target_chain_name)),
+        Some(&format!("Cross-chain swap to {} token {}", target_chain_name, req.target_token)),
         Some(&bridge_tx),
         Some(&serde_json::json!({
             "order_id": bridge_result.order_id,
@@ -8972,6 +9016,7 @@ struct CrossSwapSellRequest {
     input_token: String,
     amount_raw: String,
     src_decimals: Option<u8>,
+    chain: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -9049,15 +9094,36 @@ async fn cross_swap_sell_handler(
     let evm_private_key = String::from_utf8(evm_pk_bytes)
         .map_err(|e| MazeError::DecryptionError(format!("Invalid UTF-8: {}", e)))?;
 
+    // Auto-resolve token chain + decimals from CA
+    // For native tokens (0x000...0), resolver can't detect chain — use req.chain field
+    let is_native_addr = req.input_token == "0x0000000000000000000000000000000000000000"
+        || req.input_token.to_lowercase() == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let resolved_sell = if is_native_addr { None } else { evm::resolve_evm_token(&req.input_token).await.ok() };
+    let sell_chain_id: u32 = resolved_sell.as_ref()
+        .map(|r| r.token.chain_id)
+        .or_else(|| req.chain.as_ref().and_then(|c| match c.as_str() {
+            "bsc" | "BSC" => Some(56),
+            "base" | "Base" => Some(8453),
+            _ => c.parse::<u32>().ok(),
+        }))
+        .unwrap_or(8453);
+    let sell_decimals: u8 = resolved_sell.as_ref()
+        .map(|r| r.token.decimals)
+        .or(req.src_decimals)
+        .unwrap_or(18);
+    let sell_chain_name = if sell_chain_id == 56 { "BSC" } else { "Base" };
+    info!("Cross-sell: resolved input {} -> chain {} ({}), decimals {}",
+        req.input_token, sell_chain_id, sell_chain_name, sell_decimals);
+
     let eth_native = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
     let is_eth_input = req.input_token.to_lowercase() == eth_native.to_lowercase()
         || req.input_token == "0x0000000000000000000000000000000000000000";
 
-    // Step 1: If input is not ETH, swap token -> ETH via ParaSwap on Base
+    // Step 1: If input is not ETH/BNB, swap token -> ETH/BNB via 1inch
     let _eth_amount_for_bridge: Option<u128> = if !is_eth_input {
-        info!("Cross-sell step 1: ParaSwap swap {} {} -> ETH on Base for pocket {}", req.amount_raw, req.input_token, pocket_id);
+        info!("Cross-sell step 1: 1inch swap {} {} -> ETH/BNB on {} for pocket {}", req.amount_raw, req.input_token, sell_chain_name, pocket_id);
 
-        let src_decimals: u8 = req.src_decimals.unwrap_or(18);
+        let src_decimals: u8 = sell_decimals;
         let swap_result = evm::evm_swap(
             &evm_private_key,
             &req.input_token,
@@ -9066,12 +9132,13 @@ async fn cross_swap_sell_handler(
             src_decimals,
             18,
             Some(100), // 1% slippage
+            Some(sell_chain_id), // chain_id from token resolver
         ).await;
 
         match swap_result {
             Ok(ref sr) => {
-                info!("Cross-sell step 1 done: swap TX {}", sr.tx_hash);
-                // Wait for balance to settle after ParaSwap swap
+                info!("Cross-sell step 1 done: 1inch TX {}", sr.tx_hash);
+                // Wait for balance to settle after 1inch swap
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                 None // will use full ETH balance
             }
@@ -9081,7 +9148,7 @@ async fn cross_swap_sell_handler(
                     order_id: None,
                     estimated_sol: None,
                     tx_hash: None,
-                    error: Some(format!("ParaSwap swap failed: {}", e)),
+                    error: Some(format!("1inch swap failed: {}", e)),
                 }));
             }
         }
@@ -9090,10 +9157,11 @@ async fn cross_swap_sell_handler(
     };
 
     // Step 2: Get ETH balance to bridge (leave small amount for future gas)
-    let evm_balance = evm::get_balance(&evm_address, None).await
+    let evm_balance = evm::get_balance(&evm_address, None, Some(sell_chain_id)).await
         .map_err(|e| AppError(e))?;
     let eth_wei: u128 = evm_balance.eth_balance_wei.parse().unwrap_or(0);
-    let gas_reserve: u128 = 1_500_000_000_000_000; // 0.0015 ETH reserve for gas + future txs
+    // Dynamic gas reserve: BSC gas is more expensive than Base
+    let gas_reserve: u128 = if sell_chain_id == 56 { 15_000_000_000_000_000 } else { 1_500_000_000_000_000 }; // 0.015 BNB or 0.0015 ETH
     let bridge_amount = if eth_wei > gas_reserve { eth_wei - gas_reserve } else { 0 };
 
     if bridge_amount == 0 {
@@ -9117,6 +9185,7 @@ async fn cross_swap_sell_handler(
         Some(0.5),
         Some("0x8E61077Af8BF9564210ecb52D3a27FC17591AF9c"),
         None,
+        Some(sell_chain_id), // src_chain_id from token resolver
     ).await.map_err(|e| AppError(e))?;
 
     let (tx_to, tx_data, tx_value) = match &quote.tx {
@@ -9146,6 +9215,7 @@ async fn cross_swap_sell_handler(
         &tx_to,
         &tx_data,
         &tx_value,
+        Some(sell_chain_id), // chain_id from token resolver
     ).await.map_err(|e| AppError(e))?;
 
     info!("Cross-chain sell submitted: {} (pocket {} -> SOL from Base token {})",
@@ -9234,4 +9304,117 @@ async fn cross_swap_status_handler(
         data: Some(status_result.data),
         error: None,
     }))
+}
+
+
+// ============ TOKEN RESOLVER ============
+
+#[derive(Debug, Serialize)]
+struct ResolveTokenResponse {
+    success: bool,
+    chain_id: Option<u32>,
+    chain_name: Option<String>,
+    address: Option<String>,
+    symbol: Option<String>,
+    name: Option<String>,
+    decimals: Option<u8>,
+    all_chains: Option<Vec<serde_json::Value>>,
+    error: Option<String>,
+}
+
+/// Resolve token metadata + chain from contract address
+async fn resolve_token_handler(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> std::result::Result<Json<ResolveTokenResponse>, AppError> {
+    let address = address.trim().to_string();
+
+    // If it's a Solana address (not 0x prefix), resolve via DexScreener
+    if !address.starts_with("0x") {
+        // Try curated list first
+        if let Some(token) = tokens::resolve_token(&address) {
+            return Ok(Json(ResolveTokenResponse {
+                success: true,
+                chain_id: Some(0), // 0 = Solana (not EVM)
+                chain_name: Some("solana".to_string()),
+                address: Some(token.mint),
+                symbol: Some(token.symbol),
+                name: Some(token.name),
+                decimals: Some(token.decimals),
+                all_chains: None,
+                error: None,
+            }));
+        }
+
+        // Try DexScreener
+        match swap::resolve_token_dexscreener(&state.http_client, &address).await {
+            Some(token) => {
+                return Ok(Json(ResolveTokenResponse {
+                    success: true,
+                    chain_id: Some(0),
+                    chain_name: Some("solana".to_string()),
+                    address: Some(token.mint),
+                    symbol: Some(token.symbol),
+                    name: Some(token.name),
+                    decimals: Some(token.decimals),
+                    all_chains: None,
+                    error: None,
+                }));
+            }
+            None => {
+                return Ok(Json(ResolveTokenResponse {
+                    success: false,
+                    chain_id: None,
+                    chain_name: None,
+                    address: None,
+                    symbol: None,
+                    name: None,
+                    decimals: None,
+                    all_chains: None,
+                    error: Some("Token not found on Solana".to_string()),
+                }));
+            }
+        }
+    }
+
+    // EVM address — resolve via sidecar (checks Base + BSC)
+    match evm::resolve_evm_token(&address).await {
+        Ok(resolved) => {
+            let all_chains: Vec<serde_json::Value> = resolved.all_chains.iter().map(|c| {
+                serde_json::json!({
+                    "chain_id": c.chain_id,
+                    "chain_name": c.chain_name,
+                    "address": c.address,
+                    "symbol": c.symbol,
+                    "name": c.name,
+                    "decimals": c.decimals,
+                })
+            }).collect();
+
+            Ok(Json(ResolveTokenResponse {
+                success: true,
+                chain_id: Some(resolved.token.chain_id),
+                chain_name: Some(resolved.token.chain_name),
+                address: Some(resolved.token.address),
+                symbol: Some(resolved.token.symbol),
+                name: Some(resolved.token.name),
+                decimals: Some(resolved.token.decimals),
+                all_chains: Some(all_chains),
+                error: None,
+            }))
+        }
+        Err(e) => {
+            Ok(Json(ResolveTokenResponse {
+                success: false,
+                chain_id: None,
+                chain_name: None,
+                address: None,
+                symbol: None,
+                name: None,
+                decimals: None,
+                all_chains: None,
+                error: Some(format!("{}", e)),
+            }))
+        }
+    }
 }
