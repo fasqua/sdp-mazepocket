@@ -2925,6 +2925,29 @@ impl PocketDatabase {
         )?;
         Ok(rows > 0)
     }
+
+    /// Get unique EVM token addresses from cross-swap history for a given EVM address
+    pub fn get_cross_swap_tokens(&self, evm_address: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT DISTINCT LOWER(json_extract(metadata_json, '$.target_token'))
+               FROM transaction_log
+               WHERE tx_type = 'cross_swap'
+                 AND json_extract(metadata_json, '$.evm_address') = ?1
+                 AND json_extract(metadata_json, '$.target_token') IS NOT NULL
+                 AND json_extract(metadata_json, '$.target_token') != '0x0000000000000000000000000000000000000000'"#,
+        )?;
+        let rows = stmt.query_map(params![evm_address], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut tokens = Vec::new();
+        for row in rows {
+            if let Ok(token) = row {
+                tokens.push(token);
+            }
+        }
+        Ok(tokens)
+    }
 }
 
 impl Drop for PocketDatabase {

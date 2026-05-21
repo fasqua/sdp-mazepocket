@@ -37,6 +37,7 @@ pub struct EvmTokenBalance {
     pub balance: String,
     pub balance_raw: Option<String>,
     pub error: Option<String>,
+    pub logo_uri: Option<String>,
 }
 
 /// deBridge quote/create-tx result
@@ -158,6 +159,73 @@ pub async fn get_balance(address: &str, tokens: Option<Vec<String>>, chain_id: O
         eth_balance_wei,
         tokens,
     })
+}
+
+/// Per-chain balance info
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvmChainBalance {
+    pub chain: String,
+    pub chain_id: u32,
+    pub native_symbol: String,
+    pub native_balance: String,
+    pub tokens: Vec<EvmTokenBalance>,
+}
+
+/// Get EVM balance across all supported chains (Base + BSC)
+pub async fn get_balance_all_chains(address: &str, token_addresses: Vec<String>) -> Result<Vec<EvmChainBalance>> {
+    info!("EVM: getting balance for {} across Base + BSC ({} tokens to scan)", address, token_addresses.len());
+
+    let tokens_opt = if token_addresses.is_empty() { None } else { Some(token_addresses) };
+
+    // Query Base and BSC in parallel
+    let base_fut = get_balance(address, tokens_opt.clone(), Some(8453));
+    let bsc_fut = get_balance(address, tokens_opt, Some(56));
+
+    let (base_result, bsc_result) = tokio::join!(base_fut, bsc_fut);
+
+    let mut chains = Vec::new();
+
+    // Base
+    match base_result {
+        Ok(info) => {
+            let has_balance = info.eth_balance != "0" && info.eth_balance != "0.0";
+            let has_tokens = !info.tokens.is_empty();
+            if has_balance || has_tokens {
+                chains.push(EvmChainBalance {
+                    chain: "Base".to_string(),
+                    chain_id: 8453,
+                    native_symbol: "ETH".to_string(),
+                    native_balance: info.eth_balance,
+                    tokens: info.tokens,
+                });
+            }
+        }
+        Err(e) => {
+            info!("EVM: Base balance check failed (non-fatal): {}", e);
+        }
+    }
+
+    // BSC
+    match bsc_result {
+        Ok(info) => {
+            let has_balance = info.eth_balance != "0" && info.eth_balance != "0.0";
+            let has_tokens = !info.tokens.is_empty();
+            if has_balance || has_tokens {
+                chains.push(EvmChainBalance {
+                    chain: "BSC".to_string(),
+                    chain_id: 56,
+                    native_symbol: "BNB".to_string(),
+                    native_balance: info.eth_balance,
+                    tokens: info.tokens,
+                });
+            }
+        }
+        Err(e) => {
+            info!("EVM: BSC balance check failed (non-fatal): {}", e);
+        }
+    }
+
+    Ok(chains)
 }
 
 /// Get deBridge quote + create-tx for cross-chain swap (Solana -> EVM)

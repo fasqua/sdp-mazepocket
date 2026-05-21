@@ -8571,8 +8571,7 @@ struct EvmInfoQuery {
 struct EvmInfoResponse {
     success: bool,
     evm_address: Option<String>,
-    eth_balance: Option<String>,
-    tokens: Vec<serde_json::Value>,
+    chains: Vec<serde_json::Value>,
     error: Option<String>,
 }
 
@@ -8638,25 +8637,39 @@ async fn evm_info_handler(
         evm_kp.address
     };
 
-    // Get EVM balance
-    match evm::get_balance(&evm_address, None, None).await {
-        Ok(balance_info) => {
-            let tokens: Vec<serde_json::Value> = balance_info.tokens.iter()
-                .filter(|t| t.balance != "0" && t.balance != "0.0")
-                .map(|t| serde_json::json!({
-                    "address": t.address,
-                    "symbol": t.symbol,
-                    "balance": t.balance,
-                    "decimals": t.decimals,
-                    "balance_raw": t.balance_raw,
-                }))
+    // Get token list from cross-swap history for this EVM address
+    let swap_tokens = state.db.get_cross_swap_tokens(&evm_address).unwrap_or_default();
+    info!("EVM info for {}: {} tokens from swap history", evm_address, swap_tokens.len());
+
+    // Get EVM balance across all chains (Base + BSC)
+    match evm::get_balance_all_chains(&evm_address, swap_tokens).await {
+        Ok(chain_balances) => {
+            let chains: Vec<serde_json::Value> = chain_balances.iter()
+                .map(|c| {
+                    let tokens: Vec<serde_json::Value> = c.tokens.iter()
+                        .map(|t| serde_json::json!({
+                            "address": t.address,
+                            "symbol": t.symbol,
+                            "balance": t.balance,
+                            "decimals": t.decimals,
+                            "balance_raw": t.balance_raw,
+                            "logo_uri": t.logo_uri,
+                        }))
+                        .collect();
+                    serde_json::json!({
+                        "chain": c.chain,
+                        "chain_id": c.chain_id,
+                        "native_symbol": c.native_symbol,
+                        "native_balance": c.native_balance,
+                        "tokens": tokens,
+                    })
+                })
                 .collect();
 
             Ok(Json(EvmInfoResponse {
                 success: true,
                 evm_address: Some(evm_address),
-                eth_balance: Some(balance_info.eth_balance),
-                tokens,
+                chains,
                 error: None,
             }))
         }
@@ -8665,8 +8678,7 @@ async fn evm_info_handler(
             Ok(Json(EvmInfoResponse {
                 success: true,
                 evm_address: Some(evm_address),
-                eth_balance: None,
-                tokens: vec![],
+                chains: vec![],
                 error: Some(format!("Balance check failed: {}", e)),
             }))
         }

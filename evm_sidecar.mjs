@@ -100,6 +100,22 @@ async function main() {
                         }
                     }
                 }
+                // Fetch logos from DexScreener for tokens with balance
+                if (balanceData.tokens.length > 0) {
+                    const dexChain = balChainId === 56 ? 'bsc' : 'base';
+                    const logoPromises = balanceData.tokens.map(async (t) => {
+                        try {
+                            const resp = await fetch(`https://api.dexscreener.com/tokens/v1/${dexChain}/${t.address}`, { signal: AbortSignal.timeout(5000) });
+                            if (resp.ok) {
+                                const pairs = await resp.json();
+                                if (Array.isArray(pairs) && pairs.length > 0 && pairs[0].info?.imageUrl) {
+                                    t.logo_uri = pairs[0].info.imageUrl;
+                                }
+                            }
+                        } catch { /* non-fatal */ }
+                    });
+                    await Promise.allSettled(logoPromises);
+                }
                 result = { success: true, data: balanceData };
                 break;
             }
