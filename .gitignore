@@ -20,3 +20,4 @@ kausa-prompt.txt
 .agents/
 skills-lock.json
 gate-specs/
+.env.devnet

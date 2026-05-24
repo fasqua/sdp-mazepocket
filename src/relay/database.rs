@@ -677,6 +677,43 @@ impl PocketDatabase {
             [],
         )?;
 
+        // Perps positions tracking
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS perps_positions (
+                id TEXT PRIMARY KEY,
+                pocket_id TEXT NOT NULL,
+                owner_meta_hash TEXT NOT NULL,
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                leverage REAL NOT NULL,
+                collateral_usdc REAL NOT NULL,
+                size_usd REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                liquidation_price REAL NOT NULL,
+                position_pubkey TEXT NOT NULL,
+                status TEXT DEFAULT 'open',
+                opened_at INTEGER NOT NULL,
+                closed_at INTEGER,
+                realized_pnl REAL,
+                tx_signature TEXT,
+                close_tx_signature TEXT,
+                error_message TEXT
+            )"#,
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_perps_pocket ON perps_positions(pocket_id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_perps_owner ON perps_positions(owner_meta_hash)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_perps_status ON perps_positions(status)",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -2947,6 +2984,159 @@ impl PocketDatabase {
             }
         }
         Ok(tokens)
+    }
+
+    // ============ PERPS POSITIONS ============
+
+    /// Create a perps position record
+    pub fn create_perps_position(
+        &self,
+        id: &str,
+        pocket_id: &str,
+        owner_meta_hash: &str,
+        market: &str,
+        side: &str,
+        leverage: f64,
+        collateral_usdc: f64,
+        size_usd: f64,
+        entry_price: f64,
+        liquidation_price: f64,
+        position_pubkey: &str,
+        tx_signature: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            r#"INSERT INTO perps_positions (id, pocket_id, owner_meta_hash, market, side, leverage, collateral_usdc, size_usd, entry_price, liquidation_price, position_pubkey, status, opened_at, tx_signature)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?13)"#,
+            params![id, pocket_id, owner_meta_hash, market, side, leverage, collateral_usdc, size_usd, entry_price, liquidation_price, position_pubkey, now, tx_signature],
+        ).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Update perps position status to closed
+    pub fn close_perps_position(
+        &self,
+        id: &str,
+        realized_pnl: Option<f64>,
+        close_tx_signature: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE perps_positions SET status = 'closed', closed_at = ?1, realized_pnl = ?2, close_tx_signature = ?3 WHERE id = ?4",
+            params![now, realized_pnl, close_tx_signature, id],
+        ).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Update perps position status
+    pub fn update_perps_position_status(
+        &self,
+        id: &str,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        conn.execute(
+            "UPDATE perps_positions SET status = ?1, error_message = ?2 WHERE id = ?3",
+            params![status, error_message, id],
+        ).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Get open perps positions for a pocket
+    pub fn get_perps_positions_by_pocket(&self, pocket_id: &str) -> Result<Vec<(String, String, String, f64, f64, f64, f64, f64, String, i64, Option<String>)>> {
+        let conn = self.conn.lock().map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, market, side, leverage, collateral_usdc, size_usd, entry_price, liquidation_price, position_pubkey, opened_at, tx_signature FROM perps_positions WHERE pocket_id = ?1 AND status = 'open' ORDER BY opened_at DESC"
+        ).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let rows = stmt.query_map(params![pocket_id], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?,
+                row.get(3)?, row.get(4)?, row.get(5)?,
+                row.get(6)?, row.get(7)?, row.get(8)?,
+                row.get(9)?, row.get(10)?,
+            ))
+        }).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let mut positions = Vec::new();
+        for row in rows {
+            if let Ok(p) = row {
+                positions.push(p);
+            }
+        }
+        Ok(positions)
+    }
+
+    /// Get all open perps positions for a user
+    pub fn get_perps_positions_by_owner(&self, owner_meta_hash: &str) -> Result<Vec<(String, String, String, String, f64, f64, f64, f64, f64, String, String, i64)>> {
+        let conn = self.conn.lock().map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, pocket_id, market, side, leverage, collateral_usdc, size_usd, entry_price, liquidation_price, position_pubkey, status, opened_at FROM perps_positions WHERE owner_meta_hash = ?1 AND status = 'open' ORDER BY opened_at DESC"
+        ).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let rows = stmt.query_map(params![owner_meta_hash], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?,
+                row.get(7)?, row.get(8)?, row.get(9)?,
+                row.get(10)?, row.get(11)?,
+            ))
+        }).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let mut positions = Vec::new();
+        for row in rows {
+            if let Ok(p) = row {
+                positions.push(p);
+            }
+        }
+        Ok(positions)
+    }
+
+    /// Find open perps position by pocket + market + side
+    pub fn find_perps_position(&self, pocket_id: &str, market: &str, side: &str) -> Result<Option<(String, String, f64, f64, f64, i64)>> {
+        let conn = self.conn.lock().map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, position_pubkey, collateral_usdc, size_usd, entry_price, opened_at FROM perps_positions WHERE pocket_id = ?1 AND market = ?2 AND side = ?3 AND status = 'open' LIMIT 1"
+        ).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let result = stmt.query_row(params![pocket_id, market, side], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+        });
+        match result {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MazeError::DatabaseError(e.to_string())),
+        }
+    }
+
+    /// Get all open perps positions (for background monitor)
+    pub fn get_all_open_perps_positions(&self) -> Result<Vec<(String, String, String, String, String, f64, f64, String, String)>> {
+        let conn = self.conn.lock().map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, pocket_id, owner_meta_hash, market, side, entry_price, liquidation_price, position_pubkey, status FROM perps_positions WHERE status = 'open' ORDER BY opened_at DESC"
+        ).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                row.get(8)?,
+            ))
+        }).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        let mut positions = Vec::new();
+        for row in rows {
+            if let Ok(p) = row {
+                positions.push(p);
+            }
+        }
+        Ok(positions)
+    }
+
+    /// Update entry price and liquidation price for a perps position
+    pub fn update_perps_position_prices(&self, id: &str, entry_price: f64, liquidation_price: f64) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        conn.execute(
+            "UPDATE perps_positions SET entry_price = ?1, liquidation_price = ?2 WHERE id = ?3",
+            params![entry_price, liquidation_price, id],
+        ).map_err(|e| MazeError::DatabaseError(e.to_string()))?;
+        Ok(())
     }
 }
 

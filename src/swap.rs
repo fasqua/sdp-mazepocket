@@ -16,7 +16,7 @@ use crate::error::{MazeError, Result};
 use base64::Engine;
 
 /// Jupiter Ultra API base URL
-const JUPITER_ULTRA_BASE: &str = "https://lite-api.jup.ag/ultra/v1";
+const JUPITER_ULTRA_BASE: &str = "https://api.jup.ag/ultra/v1";
 
 /// Swap quote request
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,7 +107,7 @@ pub async fn get_swap_quote(
     let slippage = req.slippage_bps.unwrap_or(50); // Default 0.5%
 
     let url = format!(
-        "{}/order?inputMint={}&outputMint={}&amount={}&taker={}&slippageBps={}",
+        "{}/order?inputMint={}&outputMint={}&amount={}&taker={}&slippageBps={}&prioritizationFeeLamports=auto",
         JUPITER_ULTRA_BASE,
         req.input_mint,
         req.output_mint,
@@ -118,8 +118,10 @@ pub async fn get_swap_quote(
 
     info!("Jupiter quote: {} -> {}, amount={}", req.input_mint, req.output_mint, req.amount);
 
+    let jup_api_key = std::env::var("JUPITER_API_KEY").unwrap_or_default();
     let response = http_client
         .get(&url)
+        .header("x-api-key", &jup_api_key)
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
@@ -189,14 +191,16 @@ pub async fn execute_swap(
 
     // 1. Get order (quote + transaction) from Jupiter Ultra
     let url = format!(
-        "{}/order?inputMint={}&outputMint={}&amount={}&taker={}&slippageBps={}",
+        "{}/order?inputMint={}&outputMint={}&amount={}&taker={}&slippageBps={}&prioritizationFeeLamports=auto",
         JUPITER_ULTRA_BASE, input_mint, output_mint, amount, taker, slippage,
     );
 
     info!("Jupiter swap order: {} -> {}, amount={}, taker={}", input_mint, output_mint, amount, &taker[..20.min(taker.len())]);
 
+    let jup_api_key = std::env::var("JUPITER_API_KEY").unwrap_or_default();
     let response = http_client
         .get(&url)
+        .header("x-api-key", &jup_api_key)
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
@@ -257,110 +261,87 @@ pub async fn execute_swap(
     let out_amount = jup.out_amount.clone().unwrap_or("0".into());
     let request_id = jup.request_id.clone();
 
-    // 2. Deserialize the transaction
-    let tx_bytes = base64::engine::general_purpose::STANDARD.decode(&tx_base64)
-        .map_err(|e| MazeError::CryptoError(format!("Base64 decode failed: {}", e)))?;
+    // 2. Sign and execute via swap sidecar (Node.js + Jupiter /execute)
+    let private_key_b58 = bs58::encode(&pocket_keypair.to_bytes()).into_string();
+    let jup_api_key = std::env::var("JUPITER_API_KEY").unwrap_or_default();
 
-    let mut versioned_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
-        .map_err(|e| MazeError::CryptoError(format!("Transaction deserialize failed: {}", e)))?;
+    let sidecar_payload = serde_json::json!({
+        "private_key": private_key_b58,
+        "transaction_base64": tx_base64,
+        "request_id": request_id,
+        "api_key": jup_api_key,
+    });
 
-    // 3. Sign the transaction with pocket keypair
-    let message_bytes = versioned_tx.message.serialize();
-    let signature = pocket_keypair.sign_message(&message_bytes);
-    versioned_tx.signatures[0] = signature;
+    let sidecar_payload_str = serde_json::to_string(&sidecar_payload)
+        .map_err(|e| MazeError::RpcError(format!("Sidecar JSON failed: {}", e)))?;
 
-    // 4. Send the signed transaction with retries
-    let mut last_err = String::new();
-    let mut tx_sig = None;
+    let mut child = tokio::process::Command::new("node")
+        .arg("/root/sdp-mazepocket/swap_sidecar.mjs")
+        .arg("sign-execute")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| MazeError::RpcError(format!("Swap sidecar failed to start: {}", e)))?;
 
-    for attempt in 1..=3u8 {
-        let config = solana_client::rpc_config::RpcSendTransactionConfig {
-            skip_preflight: true,
-            preflight_commitment: None,
-            encoding: None,
-            max_retries: Some(3),
-            min_context_slot: None,
-        };
-
-        match rpc_client.send_transaction_with_config(&versioned_tx, config) {
-            Ok(sig) => {
-                if attempt > 1 {
-                    info!("Swap TX succeeded on attempt {}/3", attempt);
-                }
-                tx_sig = Some(sig);
-                break;
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
-                    warn!("Swap TX attempt {}/3: {}", attempt, err_str);
-                    last_err = err_str;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-                last_err = err_str;
-                break;
-            }
-        }
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(sidecar_payload_str.as_bytes()).await
+            .map_err(|e| MazeError::RpcError(format!("Failed to write to swap sidecar: {}", e)))?;
+        drop(stdin);
     }
 
-    let sig = match tx_sig {
-        Some(s) => s,
-        None => {
-            return Ok(SwapResult {
-                success: false,
-                tx_signature: None,
-                in_amount,
-                out_amount,
-                input_mint: input_mint.into(),
-                output_mint: output_mint.into(),
-                request_id,
-                error: Some(format!("TX send failed: {}", last_err)),
-            });
-        }
-    };
+    let output = child.wait_with_output().await
+        .map_err(|e| MazeError::RpcError(format!("Swap sidecar failed: {}", e)))?;
 
-    // 5. Wait for confirmation
-    let mut confirmed = false;
-    for _ in 0..40 {
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        if let Ok(Some(result)) = rpc_client.get_signature_status(&sig) {
-            if result.is_ok() {
-                confirmed = true;
-                break;
-            } else if let Err(e) = result {
-                return Ok(SwapResult {
-                    success: false,
-                    tx_signature: Some(sig.to_string()),
-                    in_amount,
-                    out_amount,
-                    input_mint: input_mint.into(),
-                    output_mint: output_mint.into(),
-                    request_id,
-                    error: Some(format!("TX failed on-chain: {:?}", e)),
-                });
-            }
-        }
-    }
-
-    if !confirmed {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Ok(SwapResult {
             success: false,
-            tx_signature: Some(sig.to_string()),
+            tx_signature: None,
             in_amount,
             out_amount,
             input_mint: input_mint.into(),
             output_mint: output_mint.into(),
             request_id,
-            error: Some("TX confirmation timeout (20s)".into()),
+            error: Some(format!("Swap sidecar error: {}", stderr)),
         });
     }
 
-    info!("Swap completed: {} {} -> {} ({})", in_amount, input_mint, output_mint, sig);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sidecar_result: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| MazeError::RpcError(format!("Swap sidecar parse failed: {} | output: {}", e, &stdout[..200.min(stdout.len())])))?;
+
+    let sidecar_success = sidecar_result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let data = sidecar_result.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    let data_success = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if !sidecar_success || !data_success {
+        let err_msg = data.get("error").and_then(|v| v.as_str())
+            .or_else(|| sidecar_result.get("error").and_then(|v| v.as_str()))
+            .unwrap_or("Swap execution failed")
+            .to_string();
+        return Ok(SwapResult {
+            success: false,
+            tx_signature: data.get("tx_signature").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            in_amount,
+            out_amount,
+            input_mint: input_mint.into(),
+            output_mint: output_mint.into(),
+            request_id,
+            error: Some(err_msg),
+        });
+    }
+
+    let sig_str = data.get("tx_signature").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let final_in = data.get("in_amount").and_then(|v| v.as_str()).unwrap_or(&in_amount).to_string();
+    let final_out = data.get("out_amount").and_then(|v| v.as_str()).unwrap_or(&out_amount).to_string();
+
+    info!("Swap completed via sidecar: {} {} -> {} ({})", final_in, input_mint, output_mint, sig_str);
 
     Ok(SwapResult {
         success: true,
-        tx_signature: Some(sig.to_string()),
+        tx_signature: Some(sig_str.clone()),
         in_amount,
         out_amount,
         input_mint: input_mint.into(),

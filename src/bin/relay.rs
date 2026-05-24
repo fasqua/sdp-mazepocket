@@ -41,6 +41,8 @@ use sdp_mazepocket::{
     printr::{self, PrintrCreateRequest},
     payment_router,
     evm,
+    perps,
+    genesis,
 };
 
 
@@ -325,6 +327,29 @@ struct P2pStatusResponse {
     status: String,
     progress: Option<MazeProgress>,
     error: Option<String>,
+}
+
+// ============ SPAWN POCKET TYPES ============
+
+#[derive(Debug, Deserialize)]
+struct SpawnPocketRequest {
+    meta_address: String,
+    amount_sol: f64,
+    label: Option<String>,
+    maze_config: Option<CustomMazeConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct SpawnPocketResponse {
+    success: bool,
+    new_pocket_id: String,
+    new_pocket_address: String,
+    source_pocket_id: String,
+    transfer_id: String,
+    amount_lamports: u64,
+    fee_lamports: u64,
+    status: String,
+    maze_info: MazeInfo,
 }
 
 // ============ SEND LINK TYPES (KausaLink) ============
@@ -3185,6 +3210,270 @@ async fn get_p2p_status(
             error: Some("P2P transfer not found".to_string()),
         })),
     }
+}
+
+
+/// Spawn a new pocket funded from an existing pocket via maze routing
+async fn spawn_pocket(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<SpawnPocketRequest>,
+) -> std::result::Result<Json<SpawnPocketResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Validate amount
+    if req.amount_sol < MIN_AMOUNT_SOL {
+        return Err(MazeError::InvalidParameters(format!("Minimum amount is {} SOL", MIN_AMOUNT_SOL)).into());
+    }
+
+    // Get source pocket and verify ownership
+    let source_pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?;
+    let source_pocket = match source_pocket {
+        Some(p) => p,
+        None => return Err(MazeError::PocketNotFound(format!("Source pocket not found or access denied: {}", pocket_id)).into()),
+    };
+
+    if source_pocket.status != PocketStatus::Active {
+        return Err(MazeError::InvalidParameters(format!("Source pocket status is {}, must be active", source_pocket.status.as_str())).into());
+    }
+
+    // Get source pocket keypair and check balance
+    let keypair_bytes = state.db.decrypt(&source_pocket.keypair_encrypted)?;
+    let source_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let balance = state.rpc.get_balance(&source_keypair.pubkey())
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+
+    let amount_lamports = sol_to_lamports(req.amount_sol);
+    let fee_lamports = (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64;
+    let total_needed = amount_lamports + fee_lamports + (TX_FEE_LAMPORTS * 50);
+
+    if balance < total_needed {
+        return Err(MazeError::InsufficientFunds {
+            required: total_needed,
+            available: balance,
+        }.into());
+    }
+
+    info!("Spawn pocket: {} SOL from {} by {}", req.amount_sol, pocket_id, &req.meta_address[..20.min(req.meta_address.len())]);
+
+    // === Step 1: Create new pocket ===
+    let new_pocket_keypair = Keypair::new();
+    let new_pocket_pubkey = new_pocket_keypair.pubkey().to_string();
+    let new_pocket_id = generate_pocket_id();
+    let new_keypair_encrypted = state.db.encrypt(&new_pocket_keypair.to_bytes())?;
+    let now = chrono::Utc::now().timestamp();
+
+    let new_pocket = MazePocket {
+        id: new_pocket_id.clone(),
+        owner_meta_hash: owner_meta_hash.clone(),
+        stealth_pubkey: new_pocket_pubkey.clone(),
+        keypair_encrypted: new_keypair_encrypted,
+        funding_maze_id: None,
+        funding_amount_lamports: amount_lamports,
+        created_at: now,
+        last_sweep_at: None,
+        status: PocketStatus::Active,
+        label: req.label.clone(),
+        archived: false,
+        evm_address: None,
+        evm_keypair_encrypted: None,
+    };
+
+    state.db.create_pocket(&new_pocket)?;
+
+    info!("Spawn pocket: new pocket {} created with address {}", new_pocket_id, new_pocket_pubkey);
+
+    // === Step 2: Generate maze and initiate P2P transfer ===
+    let maze_params = parse_maze_config(req.maze_config, state.config.pool_address.clone(), state.config.pool_private_key.clone());
+    let generator = MazeGenerator::new(maze_params);
+    let encrypt_fn = |data: &[u8]| state.db.encrypt(data);
+
+    let maze = match generator.generate(total_needed, encrypt_fn) {
+        Ok(m) => m,
+        Err(e) => {
+            // Clean up: delete the pocket we just created
+            let _ = state.db.delete_pocket(&new_pocket_id, &owner_meta_hash);
+            return Err(MazeError::MazeGenerationError(format!("Failed to generate maze: {}", e)).into());
+        }
+    };
+
+    let transfer_id = format!("p2p_{}", &generate_pocket_id()[7..]);
+    let maze_json = serde_json::to_string(&maze).unwrap_or_default();
+
+    // Create P2P transfer record (reuse existing P2P infrastructure)
+    let transfer = P2pTransfer {
+        id: transfer_id.clone(),
+        sender_pocket_id: pocket_id.clone(),
+        receiver_pocket_id: new_pocket_id.clone(),
+        sender_meta_hash: owner_meta_hash.clone(),
+        amount_lamports,
+        fee_lamports,
+        maze_graph_json: Some(maze_json.clone()),
+        status: "pending".to_string(),
+        created_at: now,
+        completed_at: None,
+        error_message: None,
+        tx_signature: None,
+    };
+
+    state.db.create_p2p_transfer(&transfer)?;
+
+    // Store maze nodes for progress tracking
+    for node in &maze.nodes {
+        state.db.store_p2p_node(&transfer_id, node)?;
+    }
+
+    // Transfer from source pocket to first maze node
+    let first_node = &maze.nodes[0];
+    let first_node_pubkey = Pubkey::from_str(&first_node.address)
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+
+    let transfer_to_maze = amount_lamports + fee_lamports + (TX_FEE_LAMPORTS * maze.total_transactions as u64);
+
+    let sig = {
+        let mut last_err = String::new();
+        let mut result_sig = None;
+        for attempt in 1..=5u8 {
+            let blockhash = match state.rpc.get_latest_blockhash() {
+                Ok(bh) => bh,
+                Err(e) => {
+                    warn!("Spawn initial attempt {}/5: Failed to get blockhash: {}", attempt, e);
+                    last_err = e.to_string();
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let ix = system_instruction::transfer(
+                &source_keypair.pubkey(),
+                &first_node_pubkey,
+                transfer_to_maze,
+            );
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&source_keypair.pubkey()),
+                &[&source_keypair],
+                blockhash,
+            );
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: None,
+                encoding: None,
+                max_retries: Some(3),
+                min_context_slot: None,
+            };
+            match state.rpc.send_transaction_with_config(&tx, config) {
+                Ok(s) => {
+                    if attempt > 1 {
+                        info!("Spawn initial TX succeeded on attempt {}/5", attempt);
+                    }
+                    result_sig = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                        warn!("Spawn initial attempt {}/5: {}", attempt, err_str);
+                        last_err = err_str;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&sanitize_error(&e.to_string())), None);
+                    return Err(AppError(MazeError::TransactionError(format!("TX failed: {}", e))));
+                }
+            }
+        }
+        match result_sig {
+            Some(s) => s,
+            None => {
+                let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&sanitize_error(&last_err)), None);
+                return Err(AppError(MazeError::TransactionError(format!("TX failed after 5 attempts: {}", last_err))));
+            }
+        }
+    };
+
+    // Wait for confirmation
+    let mut confirmed = false;
+    for _ in 0..30 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Ok(Some(result)) = state.rpc.get_signature_status(&sig) {
+            if result.is_ok() {
+                confirmed = true;
+                break;
+            } else if let Err(e) = result {
+                let _ = state.db.update_p2p_status(&transfer_id, "failed", Some(&format!("Initial transfer failed: {:?}", e)), None);
+                return Err(AppError(MazeError::TransactionError(format!("Initial transfer failed: {:?}", e))));
+            }
+        }
+    }
+
+    if !confirmed {
+        let _ = state.db.update_p2p_status(&transfer_id, "failed", Some("Initial transfer confirmation timeout"), None);
+        return Err(AppError(MazeError::TransactionError("Initial transfer confirmation timeout".into())));
+    }
+
+    info!("Spawn pocket {} transfer initiated: {} lamports via maze from {}", new_pocket_id, amount_lamports, pocket_id);
+
+    // Execute P2P maze in background (reuse existing P2P maze execution)
+    let state_clone = state.clone();
+    let transfer_id_clone = transfer_id.clone();
+    let receiver_address = new_pocket_pubkey.clone();
+    let new_pocket_id_clone = new_pocket_id.clone();
+    tokio::spawn(async move {
+        match execute_p2p_maze(state_clone.clone(), &transfer_id_clone, &receiver_address).await {
+            Ok(_) => {
+                info!("Spawn pocket maze completed: {} funded from {}", new_pocket_id_clone, transfer_id_clone);
+            }
+            Err(e) => {
+                error!("Spawn pocket maze failed for {}, starting auto-recover: {}", transfer_id_clone, sanitize_error(&e.to_string()));
+                let mut recovered = false;
+                if let Ok(maze_json) = state_clone.db.get_p2p_maze_graph(&transfer_id_clone) {
+                    if let Ok(maze) = serde_json::from_str::<MazeGraph>(&maze_json) {
+                        let amount = auto_recover_nodes_to_destination(
+                            state_clone.clone(), &maze.nodes, &receiver_address, &transfer_id_clone, 3
+                        ).await;
+                        if amount > 0 {
+                            info!("Auto-recover spawn {}: recovered {} lamports", transfer_id_clone, amount);
+                            let _ = state_clone.db.update_p2p_status(&transfer_id_clone, "completed", None, None);
+                            recovered = true;
+                        }
+                    }
+                }
+                if !recovered {
+                    error!("Auto-recover spawn {} exhausted, marking failed", transfer_id_clone);
+                    let _ = state_clone.db.update_p2p_status(&transfer_id_clone, "failed", Some(&sanitize_error(&e.to_string())), None);
+                }
+            }
+        }
+    });
+
+    // Log to transaction_log
+    let _ = state.db.insert_transaction_log(
+        &transfer_id,
+        &owner_meta_hash, "spawn_pocket", "completed",
+        Some(amount_lamports as i64),
+        Some(&format!("{} SOL", lamports_to_sol(amount_lamports))),
+        Some(&format!("Spawn pocket {} from {}", new_pocket_id, pocket_id)),
+        None,
+        None,
+    );
+
+    Ok(Json(SpawnPocketResponse {
+        success: true,
+        new_pocket_id,
+        new_pocket_address: new_pocket_pubkey,
+        source_pocket_id: pocket_id,
+        transfer_id,
+        amount_lamports,
+        fee_lamports,
+        status: "processing".to_string(),
+        maze_info: MazeInfo {
+            nodes: maze.nodes.len(),
+            levels: maze.total_levels,
+            estimated_time_seconds: (maze.nodes.len() as u32) * 2,
+        },
+    }))
 }
 
 /// Recover a failed P2P transfer
@@ -7544,6 +7833,617 @@ async fn x_oauth1_callback_handler(
     axum::response::Redirect::temporary(&r).into_response()
 }
 
+// ============ PERPS POSITION MONITOR ============
+
+async fn perps_position_monitor(state: Arc<AppState>) {
+    info!("Starting perps position monitor task");
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+        // Get all open positions from DB
+        let positions = match state.db.get_all_open_perps_positions() {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Perps monitor: failed to get positions: {}", e);
+                continue;
+            }
+        };
+
+        if positions.is_empty() {
+            continue;
+        }
+
+        // Group by pocket stealth_pubkey to minimize API calls
+        let mut pocket_wallets: std::collections::HashMap<String, Vec<(String, String, String, f64, f64)>> = std::collections::HashMap::new();
+        for (id, pocket_id, _owner, market, side, entry_price, liq_price, _pos_pubkey, _status) in &positions {
+            // Get pocket stealth_pubkey
+            if let Ok(Some(pocket)) = state.db.get_pocket(pocket_id) {
+                pocket_wallets.entry(pocket.stealth_pubkey.clone())
+                    .or_default()
+                    .push((id.clone(), market.clone(), side.clone(), *entry_price, *liq_price));
+            }
+        }
+
+        // For each unique wallet, fetch live positions from Jupiter
+        for (wallet_address, db_positions) in &pocket_wallets {
+            let live_result = match perps::get_positions(wallet_address).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Perps monitor: failed to fetch positions for {}: {}", &wallet_address[..20.min(wallet_address.len())], e);
+                    continue;
+                }
+            };
+
+            if !live_result.success {
+                continue;
+            }
+
+            let live_positions = live_result.positions.unwrap_or_default();
+
+            for (db_id, db_market, db_side, _db_entry, db_liq) in db_positions {
+                // Find matching live position by market mint and side
+                let live_match = live_positions.iter().find(|lp| {
+                    lp.side.to_lowercase() == db_side.to_lowercase()
+                });
+
+                match live_match {
+                    Some(live_pos) => {
+                        // Update entry/liq prices in DB if they were 0 (initial)
+                        if db_liq.abs() < 0.01 {
+                            let _ = state.db.update_perps_position_prices(
+                                db_id, live_pos.entry_price, live_pos.liquidation_price,
+                            );
+                        }
+
+                        // Check liquidation proximity
+                        let mark = live_pos.mark_price;
+                        let liq = live_pos.liquidation_price;
+                        if liq > 0.0 && mark > 0.0 {
+                            let distance_pct = if db_side.to_lowercase() == "long" {
+                                ((mark - liq) / mark) * 100.0
+                            } else {
+                                ((liq - mark) / mark) * 100.0
+                            };
+
+                            if distance_pct < 5.0 {
+                                error!("LIQUIDATION CRITICAL: {} {} position {}, mark=${:.2}, liq=${:.2}, distance={:.1}%",
+                                    db_side, db_market, db_id, mark, liq, distance_pct);
+                            } else if distance_pct < 10.0 {
+                                warn!("Liquidation warning: {} {} position {}, mark=${:.2}, liq=${:.2}, distance={:.1}%",
+                                    db_side, db_market, db_id, mark, liq, distance_pct);
+                            }
+                        }
+                    }
+                    None => {
+                        // Position not found on-chain — might have been liquidated or closed externally
+                        warn!("Perps monitor: DB position {} ({} {}) not found on-chain, marking closed",
+                            db_id, db_side, db_market);
+                        let _ = state.db.update_perps_position_status(db_id, "closed_external", Some("Position not found on-chain"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============ PERPS HANDLERS ============
+
+#[derive(Debug, Deserialize)]
+struct PerpsOpenPositionRequest {
+    meta_address: String,
+    asset: String,
+    side: String,
+    collateral_usdc: f64,
+    leverage: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct PerpsOpenPositionResponse {
+    success: bool,
+    position_id: Option<String>,
+    signature: Option<String>,
+    position_pubkey: Option<String>,
+    side: Option<String>,
+    asset: Option<String>,
+    collateral_usdc: Option<f64>,
+    leverage: Option<f64>,
+    size_usd: Option<f64>,
+    error: Option<String>,
+}
+
+/// Open a perpetual position from a pocket
+async fn perps_open_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<PerpsOpenPositionRequest>,
+) -> std::result::Result<Json<PerpsOpenPositionResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(PerpsOpenPositionResponse {
+            success: false, position_id: None, signature: None, position_pubkey: None,
+            side: None, asset: None, collateral_usdc: None, leverage: None, size_usd: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    // Validate inputs
+    let asset_upper = req.asset.to_uppercase();
+    if !["SOL", "ETH", "BTC"].contains(&asset_upper.as_str()) {
+        return Ok(Json(PerpsOpenPositionResponse {
+            success: false, position_id: None, signature: None, position_pubkey: None,
+            side: None, asset: None, collateral_usdc: None, leverage: None, size_usd: None,
+            error: Some("Asset must be SOL, ETH, or BTC".to_string()),
+        }));
+    }
+
+    let side = if req.side.to_lowercase() == "long" { "Long" } else { "Short" };
+
+    if req.leverage < 1.1 || req.leverage > 100.0 {
+        return Ok(Json(PerpsOpenPositionResponse {
+            success: false, position_id: None, signature: None, position_pubkey: None,
+            side: None, asset: None, collateral_usdc: None, leverage: None, size_usd: None,
+            error: Some("Leverage must be between 1.1 and 100".to_string()),
+        }));
+    }
+
+    if req.collateral_usdc < 10.0 {
+        return Ok(Json(PerpsOpenPositionResponse {
+            success: false, position_id: None, signature: None, position_pubkey: None,
+            side: None, asset: None, collateral_usdc: None, leverage: None, size_usd: None,
+            error: Some("Minimum collateral is 10 USDC".to_string()),
+        }));
+    }
+
+    // Safety: max leverage cap for MVP
+    if req.leverage > 20.0 {
+        return Ok(Json(PerpsOpenPositionResponse {
+            success: false, position_id: None, signature: None, position_pubkey: None,
+            side: None, asset: None, collateral_usdc: None, leverage: None, size_usd: None,
+            error: Some("Maximum leverage is 20x for safety. Higher leverage coming soon.".to_string()),
+        }));
+    }
+
+    // Safety: max 3 open positions per pocket
+    let existing_positions = state.db.get_perps_positions_by_pocket(&pocket_id)?;
+    if existing_positions.len() >= 3 {
+        return Ok(Json(PerpsOpenPositionResponse {
+            success: false, position_id: None, signature: None, position_pubkey: None,
+            side: None, asset: None, collateral_usdc: None, leverage: None, size_usd: None,
+            error: Some("Maximum 3 open positions per pocket. Close a position first.".to_string()),
+        }));
+    }
+
+    // Get pocket private key
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let _pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+    let private_key = bs58::encode(&keypair_bytes).into_string();
+
+    info!("Perps open: {} {} {}x, {} USDC from pocket {}", side, asset_upper, req.leverage, req.collateral_usdc, pocket_id);
+
+    // Call sidecar
+    let result = perps::open_position(
+        &private_key, &state.config.rpc_url,
+        &asset_upper, side, req.collateral_usdc, req.leverage, None,
+    ).await.map_err(|e| AppError(e))?;
+
+    if !result.success {
+        return Ok(Json(PerpsOpenPositionResponse {
+            success: false, position_id: None, signature: None, position_pubkey: None,
+            side: None, asset: None, collateral_usdc: None, leverage: None, size_usd: None,
+            error: result.error,
+        }));
+    }
+
+    // Store in DB
+    let position_id = format!("perps_{}", &generate_pocket_id()[7..]);
+    let size_usd = result.size_usd.unwrap_or(req.collateral_usdc * req.leverage);
+    let _ = state.db.create_perps_position(
+        &position_id, &pocket_id, &owner_meta_hash,
+        &asset_upper, side, req.leverage, req.collateral_usdc,
+        size_usd, 0.0, 0.0,
+        result.position_pubkey.as_deref().unwrap_or(""),
+        result.signature.as_deref(),
+    );
+
+    // Log transaction
+    let _ = state.db.insert_transaction_log(
+        &format!("perps_{}", chrono::Utc::now().timestamp_millis()),
+        &owner_meta_hash, "perps_open", "completed",
+        None,
+        Some(&format!("{} USDC", req.collateral_usdc)),
+        Some(&format!("Open {} {} {}x", side, asset_upper, req.leverage)),
+        result.signature.as_deref(),
+        None,
+    );
+
+    info!("Perps position opened: {} {} from pocket {}", side, asset_upper, pocket_id);
+
+    Ok(Json(PerpsOpenPositionResponse {
+        success: true,
+        position_id: Some(position_id),
+        signature: result.signature,
+        position_pubkey: result.position_pubkey,
+        side: Some(side.to_string()),
+        asset: Some(asset_upper),
+        collateral_usdc: Some(req.collateral_usdc),
+        leverage: Some(req.leverage),
+        size_usd: Some(size_usd),
+        error: None,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct PerpsClosePositionRequest {
+    meta_address: String,
+    asset: String,
+    side: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PerpsClosePositionResponse {
+    success: bool,
+    signature: Option<String>,
+    position_pubkey: Option<String>,
+    asset: Option<String>,
+    side: Option<String>,
+    error: Option<String>,
+}
+
+/// Close a perpetual position
+async fn perps_close_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<PerpsClosePositionRequest>,
+) -> std::result::Result<Json<PerpsClosePositionResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(PerpsClosePositionResponse {
+            success: false, signature: None, position_pubkey: None,
+            asset: None, side: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    let asset_upper = req.asset.to_uppercase();
+    let side = if req.side.to_lowercase() == "long" { "Long" } else { "Short" };
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let private_key = bs58::encode(&keypair_bytes).into_string();
+
+    info!("Perps close: {} {} from pocket {}", side, asset_upper, pocket_id);
+
+    let result = perps::close_position(
+        &private_key, &state.config.rpc_url,
+        &asset_upper, side, None,
+    ).await.map_err(|e| AppError(e))?;
+
+    if !result.success {
+        return Ok(Json(PerpsClosePositionResponse {
+            success: false, signature: None, position_pubkey: None,
+            asset: None, side: None, error: result.error,
+        }));
+    }
+
+    // Update DB - find and close position
+    if let Ok(Some(pos)) = state.db.find_perps_position(&pocket_id, &asset_upper, side) {
+        let _ = state.db.close_perps_position(&pos.0, None, result.signature.as_deref());
+    }
+
+    // Log transaction
+    let _ = state.db.insert_transaction_log(
+        &format!("perps_{}", chrono::Utc::now().timestamp_millis()),
+        &owner_meta_hash, "perps_close", "completed",
+        None, None,
+        Some(&format!("Close {} {}", side, asset_upper)),
+        result.signature.as_deref(),
+        None,
+    );
+
+    info!("Perps position closed: {} {} from pocket {}", side, asset_upper, pocket_id);
+
+    Ok(Json(PerpsClosePositionResponse {
+        success: true,
+        signature: result.signature,
+        position_pubkey: result.position_pubkey,
+        asset: Some(asset_upper),
+        side: Some(side.to_string()),
+        error: None,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct PerpsPositionsQuery {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PerpsPositionsApiResponse {
+    success: bool,
+    positions: Vec<serde_json::Value>,
+    count: usize,
+    error: Option<String>,
+}
+
+/// Get perps positions for a pocket (live from Jupiter API)
+async fn perps_positions_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Query(query): Query<PerpsPositionsQuery>,
+) -> std::result::Result<Json<PerpsPositionsApiResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let result = perps::get_positions(&pocket.stealth_pubkey).await
+        .map_err(|e| AppError(e))?;
+
+    if !result.success {
+        return Ok(Json(PerpsPositionsApiResponse {
+            success: false, positions: vec![], count: 0, error: result.error,
+        }));
+    }
+
+    let positions: Vec<serde_json::Value> = result.positions.unwrap_or_default().iter().map(|p| {
+        serde_json::json!({
+            "position_pubkey": p.position_pubkey,
+            "side": p.side,
+            "asset_mint": p.asset_mint,
+            "collateral_usd": p.collateral_usd,
+            "size_usd": p.size_usd,
+            "entry_price": p.entry_price,
+            "mark_price": p.mark_price,
+            "liquidation_price": p.liquidation_price,
+            "leverage": p.leverage,
+            "pnl_usd": p.pnl_usd,
+            "pnl_pct": p.pnl_pct,
+            "borrow_fees_usd": p.borrow_fees_usd,
+            "close_fees_usd": p.close_fees_usd,
+        })
+    }).collect();
+
+    let count = positions.len();
+
+    Ok(Json(PerpsPositionsApiResponse {
+        success: true,
+        positions,
+        count,
+        error: None,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct PerpsMarketQuery {
+    asset: String,
+}
+
+/// Get perps market data
+async fn perps_market_handler(
+    Query(query): Query<PerpsMarketQuery>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    let result = perps::get_market(&query.asset).await
+        .map_err(|e| AppError(e))?;
+
+    Ok(Json(serde_json::json!({
+        "success": result.success,
+        "data": {
+            "asset": result.asset,
+            "price": result.price,
+            "price_change_24h": result.price_change_24h,
+            "high_24h": result.high_24h,
+            "low_24h": result.low_24h,
+            "volume_24h": result.volume_24h,
+            "open_fee_pct": result.open_fee_pct,
+            "long_borrow_rate_pct": result.long_borrow_rate_pct,
+            "short_borrow_rate_pct": result.short_borrow_rate_pct,
+            "long_utilization_pct": result.long_utilization_pct,
+            "short_utilization_pct": result.short_utilization_pct,
+            "long_available_liquidity": result.long_available_liquidity,
+            "short_available_liquidity": result.short_available_liquidity,
+        },
+        "error": result.error,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct PerpsEstimateRequest {
+    meta_address: String,
+    asset: String,
+    side: String,
+    collateral_usdc: f64,
+    leverage: f64,
+}
+
+/// Estimate perps position before opening
+async fn perps_estimate_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<PerpsEstimateRequest>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let result = perps::estimate_position(
+        &pocket.stealth_pubkey, &req.asset, &req.side,
+        req.collateral_usdc, req.leverage, None,
+    ).await.map_err(|e| AppError(e))?;
+
+    Ok(Json(serde_json::json!({
+        "success": result.success,
+        "data": {
+            "entry_price": result.entry_price,
+            "leverage": result.leverage,
+            "liquidation_price": result.liquidation_price,
+            "open_fee_usd": result.open_fee_usd,
+            "price_impact_fee_usd": result.price_impact_fee_usd,
+            "borrow_fee_usd": result.borrow_fee_usd,
+            "position_size_usd": result.position_size_usd,
+            "collateral_usd": result.collateral_usd,
+        },
+        "error": result.error,
+    })))
+}
+
+// ============ PERPS EXTENDED HANDLERS ============
+
+#[derive(Debug, Deserialize)]
+struct PerpsSetTpslRequest {
+    meta_address: String,
+    position_pubkey: String,
+    tp_price: Option<f64>,
+    sl_price: Option<f64>,
+}
+
+async fn perps_set_tpsl_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<PerpsSetTpslRequest>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let private_key = bs58::encode(&keypair_bytes).into_string();
+
+    let result = perps::set_tpsl(&private_key, &state.config.rpc_url, &req.position_pubkey, req.tp_price, req.sl_price)
+        .await.map_err(|e| AppError(e))?;
+    Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+struct PerpsCancelTpslRequest {
+    meta_address: String,
+    position_request_pubkey: String,
+}
+
+async fn perps_cancel_tpsl_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<PerpsCancelTpslRequest>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let private_key = bs58::encode(&keypair_bytes).into_string();
+
+    let result = perps::cancel_tpsl(&private_key, &state.config.rpc_url, &req.position_request_pubkey)
+        .await.map_err(|e| AppError(e))?;
+    Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+struct PerpsLimitOrderRequest {
+    meta_address: String,
+    asset: String,
+    side: String,
+    collateral_usdc: f64,
+    leverage: f64,
+    trigger_price: f64,
+}
+
+async fn perps_limit_order_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<PerpsLimitOrderRequest>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let private_key = bs58::encode(&keypair_bytes).into_string();
+
+    let result = perps::limit_order(
+        &private_key, &state.config.rpc_url,
+        &req.asset.to_uppercase(), &req.side, req.collateral_usdc, req.leverage, req.trigger_price,
+    ).await.map_err(|e| AppError(e))?;
+    Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+struct PerpsPartialCloseRequest {
+    meta_address: String,
+    position_pubkey: String,
+    size_usd_delta: Option<f64>,
+    collateral_usd_delta: Option<f64>,
+}
+
+async fn perps_partial_close_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<PerpsPartialCloseRequest>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let private_key = bs58::encode(&keypair_bytes).into_string();
+
+    let result = perps::partial_close(
+        &private_key, &state.config.rpc_url,
+        &req.position_pubkey, req.size_usd_delta, req.collateral_usd_delta,
+    ).await.map_err(|e| AppError(e))?;
+    Ok(Json(result))
+}
+
+async fn perps_close_all_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    let meta_address = req.get("meta_address").and_then(|v| v.as_str()).unwrap_or("");
+    let owner_meta_hash = hash_meta_address(meta_address);
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let private_key = bs58::encode(&keypair_bytes).into_string();
+
+    let result = perps::close_all(&private_key, &state.config.rpc_url)
+        .await.map_err(|e| AppError(e))?;
+    Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+struct PerpsTradeHistoryQuery {
+    meta_address: String,
+    asset: Option<String>,
+    side: Option<String>,
+}
+
+async fn perps_trade_history_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Query(query): Query<PerpsTradeHistoryQuery>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    let owner_meta_hash = hash_meta_address(&query.meta_address);
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let result = perps::trade_history(
+        &pocket.stealth_pubkey,
+        query.asset.as_deref(),
+        query.side.as_deref(),
+    ).await.map_err(|e| AppError(e))?;
+    Ok(Json(result))
+}
+
 // ============ MAIN ============
 
 #[tokio::main]
@@ -7604,6 +8504,13 @@ async fn main() {
     });
     info!("Deposit monitor started");
 
+    // Start perps position monitor
+    let perps_monitor_state = state.clone();
+    tokio::spawn(async move {
+        perps_position_monitor(perps_monitor_state).await;
+    });
+    info!("Perps position monitor started");
+
     // Build router
     let app = Router::new()
         .route("/health", get(health_check))
@@ -7624,6 +8531,7 @@ async fn main() {
         .route("/pocket/:pocket_id/recover", post(recover_funding))
         .route("/sweep/:sweep_id/recover", post(recover_sweep))
         .route("/pocket/:pocket_id/send", post(send_to_pocket))
+        .route("/pocket/:pocket_id/spawn", post(spawn_pocket))
         .route("/p2p/:transfer_id/status", get(get_p2p_status))
         .route("/p2p/:transfer_id/recover", post(recover_p2p_transfer))
         .route("/wallet", post(add_wallet))
@@ -7680,6 +8588,20 @@ async fn main() {
         .route("/pocket/:pocket_id/cross-swap-sell", post(cross_swap_sell_handler))
         .route("/pocket/:pocket_id/cross-swap-status", get(cross_swap_status_handler))
         .route("/resolve-token/:address", get(resolve_token_handler))
+        .route("/pocket/:pocket_id/perps/open", post(perps_open_handler))
+        .route("/pocket/:pocket_id/perps/close", post(perps_close_handler))
+        .route("/pocket/:pocket_id/perps/positions", get(perps_positions_handler))
+        .route("/pocket/:pocket_id/perps/estimate", post(perps_estimate_handler))
+        .route("/perps/market", get(perps_market_handler))
+        .route("/pocket/:pocket_id/perps/tpsl", post(perps_set_tpsl_handler))
+        .route("/pocket/:pocket_id/perps/tpsl/cancel", post(perps_cancel_tpsl_handler))
+        .route("/pocket/:pocket_id/perps/limit-order", post(perps_limit_order_handler))
+        .route("/pocket/:pocket_id/perps/partial-close", post(perps_partial_close_handler))
+        .route("/pocket/:pocket_id/perps/close-all", post(perps_close_all_handler))
+        .route("/pocket/:pocket_id/perps/trades", get(perps_trade_history_handler))
+        .route("/pocket/:pocket_id/genesis/deposit", post(genesis_deposit_handler))
+        .route("/pocket/:pocket_id/genesis/claim", post(genesis_claim_handler))
+        .route("/pocket/:pocket_id/genesis/buy", post(genesis_buy_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -9429,4 +10351,226 @@ async fn resolve_token_handler(
             }))
         }
     }
+}
+
+
+// ============ GENESIS HANDLERS ============
+
+#[derive(Debug, Deserialize)]
+struct GenesisDepositApiRequest {
+    meta_address: String,
+    genesis_account: String,
+    mint_address: String,
+    amount_lamports: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct GenesisDepositApiResponse {
+    success: bool,
+    tx_signature: Option<String>,
+    depositor: Option<String>,
+    amount_deposited: Option<u64>,
+    launch_pool_bucket: Option<String>,
+    error: Option<String>,
+}
+
+async fn genesis_deposit_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<GenesisDepositApiRequest>,
+) -> std::result::Result<Json<GenesisDepositApiResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Verify pocket ownership
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(GenesisDepositApiResponse {
+            success: false,
+            tx_signature: None,
+            depositor: None,
+            amount_deposited: None,
+            launch_pool_bucket: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    // Decrypt keypair
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    // Check balance
+    let balance = state.rpc.get_balance(&pocket_keypair.pubkey())
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+
+    let deposit_amount = req.amount_lamports.unwrap_or(balance.saturating_sub(5_000_000));
+
+    if balance < deposit_amount + 5_000_000 {
+        return Ok(Json(GenesisDepositApiResponse {
+            success: false,
+            tx_signature: None,
+            depositor: None,
+            amount_deposited: None,
+            launch_pool_bucket: None,
+            error: Some(format!(
+                "Insufficient balance. Need {} + fees, have {} SOL",
+                lamports_to_sol(deposit_amount),
+                lamports_to_sol(balance)
+            )),
+        }));
+    }
+
+    let genesis_req = genesis::GenesisDepositRequest {
+        genesis_account: req.genesis_account,
+        mint_address: req.mint_address,
+        amount_lamports: deposit_amount,
+    };
+
+    let rpc_url = state.config.rpc_url.clone();
+    let result = genesis::execute_genesis_deposit(&pocket_keypair, &rpc_url, &genesis_req).await?;
+
+    Ok(Json(GenesisDepositApiResponse {
+        success: result.success,
+        tx_signature: result.tx_signature,
+        depositor: result.depositor,
+        amount_deposited: result.amount_deposited,
+        launch_pool_bucket: result.launch_pool_bucket,
+        error: result.error,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct GenesisClaimApiRequest {
+    meta_address: String,
+    genesis_account: String,
+    mint_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GenesisClaimApiResponse {
+    success: bool,
+    tx_signature: Option<String>,
+    claimed_by: Option<String>,
+    token_mint: Option<String>,
+    error: Option<String>,
+}
+
+async fn genesis_claim_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<GenesisClaimApiRequest>,
+) -> std::result::Result<Json<GenesisClaimApiResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let genesis_req = genesis::GenesisClaimRequest {
+        genesis_account: req.genesis_account,
+        mint_address: req.mint_address,
+    };
+
+    let rpc_url = state.config.rpc_url.clone();
+    let result = genesis::execute_genesis_claim(&pocket_keypair, &rpc_url, &genesis_req).await?;
+
+    Ok(Json(GenesisClaimApiResponse {
+        success: result.success,
+        tx_signature: result.tx_signature,
+        claimed_by: result.claimed_by,
+        token_mint: result.token_mint,
+        error: result.error,
+    }))
+}
+
+
+// ============ GENESIS BONDING CURVE HANDLER ============
+
+#[derive(Debug, Deserialize)]
+struct GenesisBuyApiRequest {
+    meta_address: String,
+    genesis_account: String,
+    mint_address: String,
+    amount_lamports: Option<u64>,
+    min_amount_out: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct GenesisBuyApiResponse {
+    success: bool,
+    tx_signature: Option<String>,
+    buyer: Option<String>,
+    amount_spent: Option<u64>,
+    bonding_curve_bucket: Option<String>,
+    error: Option<String>,
+}
+
+async fn genesis_buy_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<GenesisBuyApiRequest>,
+) -> std::result::Result<Json<GenesisBuyApiResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(GenesisBuyApiResponse {
+            success: false,
+            tx_signature: None,
+            buyer: None,
+            amount_spent: None,
+            bonding_curve_bucket: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let balance = state.rpc.get_balance(&pocket_keypair.pubkey())
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+
+    let buy_amount = req.amount_lamports.unwrap_or(balance.saturating_sub(5_000_000));
+
+    if balance < buy_amount + 5_000_000 {
+        return Ok(Json(GenesisBuyApiResponse {
+            success: false,
+            tx_signature: None,
+            buyer: None,
+            amount_spent: None,
+            bonding_curve_bucket: None,
+            error: Some(format!(
+                "Insufficient balance. Need {} + fees, have {} SOL",
+                lamports_to_sol(buy_amount),
+                lamports_to_sol(balance)
+            )),
+        }));
+    }
+
+    let genesis_req = genesis::GenesisBuyRequest {
+        genesis_account: req.genesis_account,
+        mint_address: req.mint_address,
+        amount_lamports: buy_amount,
+        min_amount_out: req.min_amount_out,
+    };
+
+    let rpc_url = state.config.rpc_url.clone();
+    let result = genesis::execute_genesis_buy(&pocket_keypair, &rpc_url, &genesis_req).await?;
+
+    Ok(Json(GenesisBuyApiResponse {
+        success: result.success,
+        tx_signature: result.tx_signature,
+        buyer: result.buyer,
+        amount_spent: result.amount_spent,
+        bonding_curve_bucket: result.bonding_curve_bucket,
+        error: result.error,
+    }))
 }

@@ -15,6 +15,8 @@ pub mod tokens;
 pub mod swap;
 pub mod printr;
 pub mod evm;
+pub mod perps;
+pub mod genesis;
 
 // Re-export commonly used types
 pub use config::Config;
