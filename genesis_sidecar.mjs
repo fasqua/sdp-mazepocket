@@ -35,6 +35,14 @@ async function cmdWrapAndDeposit(payload) {
     const baseMint = publicKey(mint_address);
     const [launchPoolBucket] = findLaunchPoolBucketV2Pda(umi, { genesisAccount: genesisAcc, bucketIndex: 0 });
 
+    // Auto-detect token program (Token classic vs Token-2022)
+    const TOKEN_2022 = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+    const TOKEN_CLASSIC = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+    const mintAcc = await umi.rpc.getAccount(baseMint);
+    const baseTokenProgram = (mintAcc.exists && mintAcc.owner.toString() === TOKEN_2022)
+        ? publicKey(TOKEN_2022)
+        : publicKey(TOKEN_CLASSIC);
+
     // Reserve SOL for tx fees
     const reserveForFees = 5_000_000; // 0.005 SOL
     const depositAmount = amount_lamports - reserveForFees;
@@ -63,11 +71,20 @@ async function cmdWrapAndDeposit(payload) {
         .add(syncNative(umi, { account: userWsolAccount }))
         .sendAndConfirm(umi, { confirm: { commitment: 'confirmed' } });
 
-    // Step 2: Deposit to Launch Pool
+    // Step 2: Derive ATAs with correct token program
+    const [recipientBaseAta] = findAssociatedTokenPda(umi, {
+        owner: umi.identity.publicKey,
+        mint: baseMint,
+        tokenProgramId: baseTokenProgram,
+    });
+
+    // Step 3: Deposit to Launch Pool
     const depositResult = await depositLaunchPoolV2(umi, {
         genesisAccount: genesisAcc,
         bucket: launchPoolBucket,
         baseMint,
+        baseTokenProgram,
+        recipientBaseTokenAccount: recipientBaseAta,
         amountQuoteToken: BigInt(depositAmount),
     }).sendAndConfirm(umi);
 
