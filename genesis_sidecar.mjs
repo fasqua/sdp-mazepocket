@@ -191,12 +191,26 @@ async function cmdBuyBondingCurve(payload) {
         .add(syncNative(umi, { account: userWsolAccount }))
         .sendAndConfirm(umi, { confirm: { commitment: "confirmed" } });
 
-    // Step 2: Swap on Bonding Curve (Buy)
+    // Step 2: Derive ATAs with correct token program for Token-2022 support
+    const [buyerBaseAta] = findAssociatedTokenPda(umi, {
+        owner: umi.identity.publicKey,
+        mint: baseMint,
+        tokenProgramId: baseTokenProgram,
+    });
+    const [genesisBaseAta] = findAssociatedTokenPda(umi, {
+        owner: genesisAcc,
+        mint: baseMint,
+        tokenProgramId: baseTokenProgram,
+    });
+
+    // Step 3: Swap on Bonding Curve (Buy)
     const swapResult = await swapBondingCurveV2(umi, {
         genesisAccount: genesisAcc,
         bucket: bondingCurveBucket,
         baseMint,
         baseTokenProgram,
+        baseTokenAccount: buyerBaseAta,
+        genesisBaseTokenAccount: genesisBaseAta,
         swapDirection: SwapDirection.Buy,
         amount: BigInt(buyAmount),
         minAmountOutScaled: BigInt(min_amount_out || 0),
