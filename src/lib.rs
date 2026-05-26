@@ -17,6 +17,7 @@ pub mod printr;
 pub mod evm;
 pub mod perps;
 pub mod genesis;
+pub mod conduit;
 
 // Re-export commonly used types
 pub use config::Config;

@@ -43,6 +43,7 @@ use sdp_mazepocket::{
     evm,
     perps,
     genesis,
+    conduit,
 };
 
 
@@ -5845,6 +5846,96 @@ async fn printr_token_info_handler(
         "token": info,
     })))
 }
+
+// ============ CONDUIT PROTOCOL HANDLERS ============
+
+#[derive(Debug, Deserialize)]
+struct ConduitDiscoverPayload {
+    category: Option<String>,
+}
+
+async fn conduit_discover_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(payload): Json<ConduitDiscoverPayload>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    // Verify pocket exists and caller owns it
+    let pocket = state.db.get_pocket(&pocket_id)
+        .map_err(|e| AppError(e))?
+        .ok_or_else(|| AppError(MazeError::PocketNotFound(pocket_id.clone())))?;
+
+    let _ = pocket; // ownership verified by pocket existence
+
+    let req = conduit::ConduitDiscoverRequest {
+        category: payload.category,
+    };
+
+    let result = conduit::discover(&req).await
+        .map_err(|e| AppError(e))?;
+
+    Ok(Json(serde_json::json!({
+        "success": result.success,
+        "network": result.network,
+        "asset": result.asset,
+        "endpoints": result.endpoints,
+        "api_listings": result.api_listings,
+        "endpoint_count": result.endpoint_count,
+        "api_listing_count": result.api_listing_count,
+        "error": result.error,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ConduitCallPayload {
+    resource_id: serde_json::Value,
+    payload: serde_json::Value,
+    password: String,
+}
+
+async fn conduit_call_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(body): Json<ConduitCallPayload>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    // Verify pocket exists
+    let pocket = state.db.get_pocket(&pocket_id)
+        .map_err(|e| AppError(e))?
+        .ok_or_else(|| AppError(MazeError::PocketNotFound(pocket_id.clone())))?;
+
+    // Decrypt keypair
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)
+        .map_err(|e| AppError(MazeError::CryptoError(format!("Keypair decrypt failed: {}", e))))?;
+    let pocket_keypair = solana_sdk::signature::Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| AppError(MazeError::CryptoError(format!("Invalid keypair: {}", e))))?;
+
+    let req = conduit::ConduitCallRequest {
+        resource_id: body.resource_id,
+        payload: body.payload,
+    };
+
+    let result = conduit::call_capability(&pocket_keypair, &req).await
+        .map_err(|e| AppError(e))?;
+
+    // Log transaction
+    let owner_meta_hash = pocket.owner_meta_hash.clone();
+    let _ = state.db.insert_transaction_log(
+        &format!("conduit_{}", chrono::Utc::now().timestamp_millis()),
+        &owner_meta_hash, "conduit_call", "completed",
+        None, None,
+        Some(&format!("Conduit call from pocket {}", pocket_id)),
+        result.signature.as_deref(),
+        None,
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": result.success,
+        "status": result.status,
+        "body": result.body,
+        "signature": result.signature,
+        "error": result.error,
+    })))
+}
+
 // ============ MAZE PREFERENCES HANDLERS ============
 
 #[derive(Debug, Deserialize)]
@@ -8557,6 +8648,8 @@ async fn main() {
         .route("/pocket/:pocket_id/printr/create", post(printr_create_handler))
         .route("/printr/deployment", get(printr_deployment_handler))
         .route("/printr/token", get(printr_token_info_handler))
+        .route("/pocket/:pocket_id/conduit/discover", post(conduit_discover_handler))
+        .route("/pocket/:pocket_id/conduit/call", post(conduit_call_handler))
         .route("/preferences/maze", post(get_maze_preferences_handler))
         .route("/preferences/maze/save", post(save_maze_preferences_handler))
         .route("/pocket/:pocket_id/pay", post(kausa_pay_handler))
@@ -8602,6 +8695,7 @@ async fn main() {
         .route("/pocket/:pocket_id/genesis/deposit", post(genesis_deposit_handler))
         .route("/pocket/:pocket_id/genesis/claim", post(genesis_claim_handler))
         .route("/pocket/:pocket_id/genesis/buy", post(genesis_buy_handler))
+        .route("/pocket/:pocket_id/genesis/activate", post(genesis_activate_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -10571,6 +10665,54 @@ async fn genesis_buy_handler(
         buyer: result.buyer,
         amount_spent: result.amount_spent,
         bonding_curve_bucket: result.bonding_curve_bucket,
+        error: result.error,
+    }))
+}
+
+
+#[derive(Debug, Deserialize)]
+struct GenesisActivateApiRequest {
+    meta_address: String,
+    genesis_account: String,
+    mint_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GenesisActivateApiResponse {
+    success: bool,
+    wallet: Option<String>,
+    wsol_ata: Option<String>,
+    base_token_ata: Option<String>,
+    error: Option<String>,
+}
+
+async fn genesis_activate_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<GenesisActivateApiRequest>,
+) -> std::result::Result<Json<GenesisActivateApiResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let activate_req = genesis::GenesisActivateRequest {
+        genesis_account: req.genesis_account,
+        mint_address: req.mint_address,
+    };
+
+    let result = genesis::execute_genesis_activate(&pocket_keypair, &state.config.rpc_url, &activate_req).await
+        .map_err(|e| MazeError::RpcError(format!("{}", e)))?;
+
+    Ok(Json(GenesisActivateApiResponse {
+        success: result.success,
+        wallet: result.wallet,
+        wsol_ata: result.wsol_ata,
+        base_token_ata: result.base_token_ata,
         error: result.error,
     }))
 }
