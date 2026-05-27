@@ -10,8 +10,8 @@
  */
 
 import { createUmi } from "@metaplex-foundation/umi-bundle-defaults";
-import { mplToolbox, findAssociatedTokenPda, createTokenIfMissing, transferSol, syncNative } from "@metaplex-foundation/mpl-toolbox";
-import { genesis, depositLaunchPoolV2, claimLaunchPoolV2, triggerBehaviorsV2, findLaunchPoolBucketV2Pda, findUnlockedBucketV2Pda, swapBondingCurveV2, findBondingCurveBucketV2Pda, SwapDirection, WRAPPED_SOL_MINT } from "@metaplex-foundation/genesis";
+import { mplToolbox, findAssociatedTokenPda, createTokenIfMissing, transferSol, syncNative, closeToken } from "@metaplex-foundation/mpl-toolbox";
+import { genesis, depositLaunchPoolV2, claimLaunchPoolV2, triggerBehaviorsV2, findLaunchPoolBucketV2Pda, findUnlockedBucketV2Pda, swapBondingCurveV2, findBondingCurveBucketV2Pda, fetchBondingCurveBucketV2, getSwapResult, applySlippage, SwapDirection, WRAPPED_SOL_MINT } from "@metaplex-foundation/genesis";
 import { keypairIdentity, publicKey, sol } from "@metaplex-foundation/umi";
 
 const command = process.argv[2];
@@ -43,14 +43,8 @@ async function cmdWrapAndDeposit(payload) {
         ? publicKey(TOKEN_2022)
         : publicKey(TOKEN_CLASSIC);
 
-    // Reserve SOL for tx fees
-    const reserveForFees = 5_000_000; // 0.005 SOL
-    const depositAmount = amount_lamports - reserveForFees;
-    if (depositAmount <= 0) {
-        return { success: false, error: "Insufficient balance after reserving for fees" };
-    }
+    const depositAmount = amount_lamports;
 
-    // Step 1: Wrap SOL -> wSOL
     const [userWsolAccount] = findAssociatedTokenPda(umi, {
         owner: umi.identity.publicKey,
         mint: WRAPPED_SOL_MINT,
@@ -58,8 +52,8 @@ async function cmdWrapAndDeposit(payload) {
 
     const wrapSolAmount = Number(depositAmount) / 1_000_000_000;
 
-    // Step 1: Create wSOL ATA + transfer SOL + sync (single tx)
-    await createTokenIfMissing(umi, {
+    // Single atomic TX: wrap SOL + deposit (no race condition)
+    const depositResult = await createTokenIfMissing(umi, {
         mint: WRAPPED_SOL_MINT,
         owner: umi.identity.publicKey,
         token: userWsolAccount,
@@ -69,24 +63,14 @@ async function cmdWrapAndDeposit(payload) {
             amount: sol(wrapSolAmount),
         }))
         .add(syncNative(umi, { account: userWsolAccount }))
-        .sendAndConfirm(umi, { confirm: { commitment: 'confirmed' } });
-
-    // Step 2: Derive ATAs with correct token program
-    const [recipientBaseAta] = findAssociatedTokenPda(umi, {
-        owner: umi.identity.publicKey,
-        mint: baseMint,
-        tokenProgramId: baseTokenProgram,
-    });
-
-    // Step 3: Deposit to Launch Pool
-    const depositResult = await depositLaunchPoolV2(umi, {
-        genesisAccount: genesisAcc,
-        bucket: launchPoolBucket,
-        baseMint,
-        baseTokenProgram,
-        recipientBaseTokenAccount: recipientBaseAta,
-        amountQuoteToken: BigInt(depositAmount),
-    }).sendAndConfirm(umi);
+        .add(depositLaunchPoolV2(umi, {
+            genesisAccount: genesisAcc,
+            bucket: launchPoolBucket,
+            baseMint,
+            baseTokenProgram,
+            amountQuoteToken: BigInt(depositAmount),
+        }))
+        .sendAndConfirm(umi);
 
     const sig = depositResult.signature
         ? Buffer.from(depositResult.signature).toString("base64")
@@ -181,22 +165,21 @@ async function cmdBuyBondingCurve(payload) {
         ? publicKey(TOKEN_2022_PROGRAM)
         : publicKey(TOKEN_CLASSIC_PROGRAM);
 
-    // Reserve SOL for tx fees
-    const reserveForFees = 5_000_000; // 0.005 SOL
-    const buyAmount = amount_lamports - reserveForFees;
-    if (buyAmount <= 0) {
-        return { success: false, error: "Insufficient balance after reserving for fees" };
-    }
+    // Fetch bucket state and compute swap quote
+    const bucket = await fetchBondingCurveBucketV2(umi, bondingCurveBucket);
+    const quote = getSwapResult(bucket, BigInt(amount_lamports), SwapDirection.Buy);
+    const minAmountOutScaled = applySlippage(quote.amountOut, 100); // 1% slippage
 
-    // Step 1: Create wSOL ATA + transfer SOL + sync (single tx)
+    // Build wSOL ATA reference
     const [userWsolAccount] = findAssociatedTokenPda(umi, {
         owner: umi.identity.publicKey,
         mint: WRAPPED_SOL_MINT,
     });
 
-    const wrapSolAmount = Number(buyAmount) / 1_000_000_000;
+    const wrapSolAmount = Number(amount_lamports) / 1_000_000_000;
 
-    await createTokenIfMissing(umi, {
+    // Single atomic TX: wrap SOL + swap (no race condition)
+    const swapResult = await createTokenIfMissing(umi, {
         mint: WRAPPED_SOL_MINT,
         owner: umi.identity.publicKey,
         token: userWsolAccount,
@@ -206,32 +189,16 @@ async function cmdBuyBondingCurve(payload) {
             amount: sol(wrapSolAmount),
         }))
         .add(syncNative(umi, { account: userWsolAccount }))
-        .sendAndConfirm(umi, { confirm: { commitment: "confirmed" } });
-
-    // Step 2: Derive ATAs with correct token program for Token-2022 support
-    const [buyerBaseAta] = findAssociatedTokenPda(umi, {
-        owner: umi.identity.publicKey,
-        mint: baseMint,
-        tokenProgramId: baseTokenProgram,
-    });
-    const [genesisBaseAta] = findAssociatedTokenPda(umi, {
-        owner: genesisAcc,
-        mint: baseMint,
-        tokenProgramId: baseTokenProgram,
-    });
-
-    // Step 3: Swap on Bonding Curve (Buy)
-    const swapResult = await swapBondingCurveV2(umi, {
-        genesisAccount: genesisAcc,
-        bucket: bondingCurveBucket,
-        baseMint,
-        baseTokenProgram,
-        baseTokenAccount: buyerBaseAta,
-        genesisBaseTokenAccount: genesisBaseAta,
-        swapDirection: SwapDirection.Buy,
-        amount: BigInt(buyAmount),
-        minAmountOutScaled: BigInt(min_amount_out || 0),
-    }).sendAndConfirm(umi);
+        .add(swapBondingCurveV2(umi, {
+            genesisAccount: genesisAcc,
+            bucket: bondingCurveBucket,
+            baseMint,
+            baseTokenProgram,
+            swapDirection: SwapDirection.Buy,
+            amount: quote.amountIn,
+            minAmountOutScaled,
+        }))
+        .sendAndConfirm(umi);
 
     const sig = swapResult.signature
         ? Buffer.from(swapResult.signature).toString("base64")
@@ -241,7 +208,135 @@ async function cmdBuyBondingCurve(payload) {
         success: true,
         tx_signature: sig,
         buyer: umi.identity.publicKey.toString(),
-        amount_spent: buyAmount,
+        amount_spent: Number(quote.amountIn),
+        tokens_received: Number(quote.amountOut),
+        fee: Number(quote.fee),
+        bonding_curve_bucket: bondingCurveBucket.toString(),
+    };
+}
+
+
+async function cmdActivate(payload) {
+    const { private_key_bytes, rpc_url, genesis_account, mint_address } = payload;
+
+    const umi = createUmi(rpc_url)
+        .use(mplToolbox())
+        .use(genesis());
+
+    const keypairBytes = new Uint8Array(private_key_bytes);
+    const kp = umi.eddsa.createKeypairFromSecretKey(keypairBytes);
+    umi.use(keypairIdentity(kp));
+
+    const baseMint = publicKey(mint_address);
+
+    // Auto-detect token program
+    const TOKEN_2022 = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+    const TOKEN_CLASSIC = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+    const mintAcc = await umi.rpc.getAccount(baseMint);
+    const baseTokenProgram = (mintAcc.exists && mintAcc.owner.toString() === TOKEN_2022)
+        ? publicKey(TOKEN_2022)
+        : publicKey(TOKEN_CLASSIC);
+
+    // Create wSOL ATA + base token ATA in single tx
+    const [userWsolAccount] = findAssociatedTokenPda(umi, {
+        owner: umi.identity.publicKey,
+        mint: WRAPPED_SOL_MINT,
+    });
+
+    const [baseAta] = findAssociatedTokenPda(umi, {
+        owner: umi.identity.publicKey,
+        mint: baseMint,
+        tokenProgramId: baseTokenProgram,
+    });
+
+    await createTokenIfMissing(umi, {
+        mint: WRAPPED_SOL_MINT,
+        owner: umi.identity.publicKey,
+        token: userWsolAccount,
+    })
+    .add(createTokenIfMissing(umi, {
+        mint: baseMint,
+        owner: umi.identity.publicKey,
+        token: baseAta,
+        tokenProgram: baseTokenProgram,
+    }))
+    .sendAndConfirm(umi, { confirm: { commitment: 'confirmed' } });
+
+    return {
+        success: true,
+        wallet: umi.identity.publicKey.toString(),
+        wsol_ata: userWsolAccount.toString(),
+        base_token_ata: baseAta.toString(),
+    };
+}
+
+async function cmdSellBondingCurve(payload) {
+    const { private_key_bytes, rpc_url, genesis_account, mint_address, amount_tokens, min_amount_out } = payload;
+
+    const umi = createUmi(rpc_url)
+        .use(mplToolbox())
+        .use(genesis());
+
+    const keypairBytes = new Uint8Array(private_key_bytes);
+    const kp = umi.eddsa.createKeypairFromSecretKey(keypairBytes);
+    umi.use(keypairIdentity(kp));
+
+    const genesisAcc = publicKey(genesis_account);
+    const baseMint = publicKey(mint_address);
+    const [bondingCurveBucket] = findBondingCurveBucketV2Pda(umi, { genesisAccount: genesisAcc, bucketIndex: 0 });
+
+    // Auto-detect token program (Token classic vs Token-2022)
+    const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+    const TOKEN_CLASSIC_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+    const mintAccount = await umi.rpc.getAccount(baseMint);
+    const baseTokenProgram = (mintAccount.exists && mintAccount.owner.toString() === TOKEN_2022_PROGRAM)
+        ? publicKey(TOKEN_2022_PROGRAM)
+        : publicKey(TOKEN_CLASSIC_PROGRAM);
+
+    // Fetch bucket state and compute sell quote
+    const bucket = await fetchBondingCurveBucketV2(umi, bondingCurveBucket);
+    const quote = getSwapResult(bucket, BigInt(amount_tokens), SwapDirection.Sell);
+    const minAmountOutScaled = applySlippage(quote.amountOut, 100); // 1% slippage
+
+    // Build wSOL ATA reference for receiving SOL output
+    const [userWsolAccount] = findAssociatedTokenPda(umi, {
+        owner: umi.identity.publicKey,
+        mint: WRAPPED_SOL_MINT,
+    });
+
+    // Single atomic TX: create wSOL ATA if missing + swap tokens to wSOL + close wSOL ATA (unwrap to native SOL)
+    const swapResult = await createTokenIfMissing(umi, {
+        mint: WRAPPED_SOL_MINT,
+        owner: umi.identity.publicKey,
+        token: userWsolAccount,
+    })
+        .add(swapBondingCurveV2(umi, {
+            genesisAccount: genesisAcc,
+            bucket: bondingCurveBucket,
+            baseMint,
+            baseTokenProgram,
+            swapDirection: SwapDirection.Sell,
+            amount: quote.amountIn,
+            minAmountOutScaled,
+        }))
+        .add(closeToken(umi, {
+            account: userWsolAccount,
+            destination: umi.identity.publicKey,
+            owner: umi.identity,
+        }))
+        .sendAndConfirm(umi);
+
+    const sig = swapResult.signature
+        ? Buffer.from(swapResult.signature).toString("base64")
+        : "";
+
+    return {
+        success: true,
+        tx_signature: sig,
+        seller: umi.identity.publicKey.toString(),
+        amount_sold: Number(quote.amountIn),
+        sol_received: Number(quote.amountOut),
+        fee: Number(quote.fee),
         bonding_curve_bucket: bondingCurveBucket.toString(),
     };
 }
@@ -253,6 +348,8 @@ async function main() {
             case "wrap-and-deposit": result = await cmdWrapAndDeposit(payload); break;
             case "claim": result = await cmdClaim(payload); break;
             case "buy-bonding-curve": result = await cmdBuyBondingCurve(payload); break;
+            case "activate": result = await cmdActivate(payload); break;
+            case "sell-bonding-curve": result = await cmdSellBondingCurve(payload); break;
             default:
                 console.log(JSON.stringify({ success: false, error: "Unknown command: " + command }));
                 process.exit(1);

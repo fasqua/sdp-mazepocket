@@ -8696,6 +8696,7 @@ async fn main() {
         .route("/pocket/:pocket_id/genesis/claim", post(genesis_claim_handler))
         .route("/pocket/:pocket_id/genesis/buy", post(genesis_buy_handler))
         .route("/pocket/:pocket_id/genesis/activate", post(genesis_activate_handler))
+        .route("/pocket/:pocket_id/genesis/sell", post(genesis_sell_handler))
         .layer(CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -10664,6 +10665,74 @@ async fn genesis_buy_handler(
         tx_signature: result.tx_signature,
         buyer: result.buyer,
         amount_spent: result.amount_spent,
+        bonding_curve_bucket: result.bonding_curve_bucket,
+        error: result.error,
+    }))
+}
+
+
+#[derive(Debug, Deserialize)]
+struct GenesisSellApiRequest {
+    meta_address: String,
+    genesis_account: String,
+    mint_address: String,
+    amount_tokens: u64,
+    min_amount_out: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct GenesisSellApiResponse {
+    success: bool,
+    tx_signature: Option<String>,
+    seller: Option<String>,
+    amount_sold: Option<u64>,
+    sol_received: Option<u64>,
+    bonding_curve_bucket: Option<String>,
+    error: Option<String>,
+}
+
+async fn genesis_sell_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<GenesisSellApiRequest>,
+) -> std::result::Result<Json<GenesisSellApiResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(GenesisSellApiResponse {
+            success: false,
+            tx_signature: None,
+            seller: None,
+            amount_sold: None,
+            sol_received: None,
+            bonding_curve_bucket: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let genesis_req = genesis::GenesisSellRequest {
+        genesis_account: req.genesis_account,
+        mint_address: req.mint_address,
+        amount_tokens: req.amount_tokens,
+        min_amount_out: req.min_amount_out,
+    };
+
+    let rpc_url = state.config.rpc_url.clone();
+    let result = genesis::execute_genesis_sell(&pocket_keypair, &rpc_url, &genesis_req).await?;
+
+    Ok(Json(GenesisSellApiResponse {
+        success: result.success,
+        tx_signature: result.tx_signature,
+        seller: result.seller,
+        amount_sold: result.amount_sold,
+        sol_received: result.sol_received,
         bonding_curve_bucket: result.bonding_curve_bucket,
         error: result.error,
     }))
