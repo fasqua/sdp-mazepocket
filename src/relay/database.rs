@@ -62,6 +62,8 @@ pub struct MazePocket {
     pub archived: bool,
     pub evm_address: Option<String>,
     pub evm_keypair_encrypted: Option<Vec<u8>>,
+    pub usepod_token: Option<String>,
+    pub usepod_deposit_address: Option<String>,
 }
 
 /// Funding request for creating a pocket
@@ -90,6 +92,7 @@ pub struct ProtocolStats {
     pub total_nodes_alltime: i64,
     pub total_hops_alltime: i64,
     pub nodes_24h: i64,
+    pub total_volume_lamports: u64,
 }
 /// Route history entry for Phase 2
 #[derive(Debug, Clone)]
@@ -313,6 +316,10 @@ impl PocketDatabase {
         // Migration: add EVM wallet columns if not exist
         let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN evm_address TEXT", []);
         let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN evm_keypair_encrypted BLOB", []);
+
+        // Migration: add UsePod token columns if not exist
+        let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN usepod_token TEXT", []);
+        let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN usepod_deposit_address TEXT", []);
 
         // Funding requests table (for tracking maze routing to pocket)
         conn.execute(
@@ -785,7 +792,8 @@ impl PocketDatabase {
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
                       last_sweep_at, status, label, archived,
-                      evm_address, evm_keypair_encrypted
+                      evm_address, evm_keypair_encrypted,
+                       usepod_token, usepod_deposit_address
                FROM maze_pockets WHERE id = ?1"#
         )?;
 
@@ -804,6 +812,8 @@ impl PocketDatabase {
                 archived: row.get::<_, i32>(10)? != 0,
                 evm_address: row.get(11)?,
                 evm_keypair_encrypted: row.get(12)?,
+                usepod_token: row.get(13)?,
+                usepod_deposit_address: row.get(14)?,
             })
         });
 
@@ -821,7 +831,8 @@ impl PocketDatabase {
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
                       last_sweep_at, status, label, archived,
-                      evm_address, evm_keypair_encrypted
+                      evm_address, evm_keypair_encrypted,
+                       usepod_token, usepod_deposit_address
                FROM maze_pockets
                WHERE id = ?1 AND owner_meta_hash = ?2"#
         )?;
@@ -841,6 +852,8 @@ impl PocketDatabase {
                 archived: row.get::<_, i32>(10)? != 0,
                 evm_address: row.get(11)?,
                 evm_keypair_encrypted: row.get(12)?,
+                usepod_token: row.get(13)?,
+                usepod_deposit_address: row.get(14)?,
             })
         });
 
@@ -858,7 +871,8 @@ impl PocketDatabase {
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
                       last_sweep_at, status, label, archived,
-                      evm_address, evm_keypair_encrypted
+                      evm_address, evm_keypair_encrypted,
+                       usepod_token, usepod_deposit_address
                FROM maze_pockets
                WHERE owner_meta_hash = ?1 AND status != 'deleted' AND id NOT LIKE 'route_%' AND (archived = 0 OR archived IS NULL)
                ORDER BY created_at DESC"#
@@ -879,6 +893,8 @@ impl PocketDatabase {
                 archived: row.get::<_, Option<i32>>(10)?.unwrap_or(0) != 0,
                 evm_address: row.get(11)?,
                 evm_keypair_encrypted: row.get(12)?,
+                usepod_token: row.get(13)?,
+                usepod_deposit_address: row.get(14)?,
             })
         })?;
 
@@ -950,6 +966,16 @@ impl PocketDatabase {
         Ok(rows > 0)
     }
 
+    /// Update pocket with UsePod token info
+    pub fn update_pocket_usepod(&self, pocket_id: &str, owner_meta_hash: &str, usepod_token: &str, usepod_deposit_address: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE maze_pockets SET usepod_token = ?1, usepod_deposit_address = ?2 WHERE id = ?3 AND owner_meta_hash = ?4",
+            params![usepod_token, usepod_deposit_address, pocket_id, owner_meta_hash],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// List archived pockets for an owner
     pub fn list_archived_pockets(&self, owner_meta_hash: &str) -> Result<Vec<MazePocket>> {
         let conn = self.conn.lock().unwrap();
@@ -957,7 +983,8 @@ impl PocketDatabase {
             r#"SELECT id, owner_meta_hash, stealth_pubkey, keypair_encrypted,
                       funding_maze_id, funding_amount_lamports, created_at,
                       last_sweep_at, status, label, archived,
-                      evm_address, evm_keypair_encrypted
+                      evm_address, evm_keypair_encrypted,
+                       usepod_token, usepod_deposit_address
                FROM maze_pockets
                WHERE owner_meta_hash = ?1 AND status != 'deleted' AND id NOT LIKE 'route_%' AND archived = 1
                ORDER BY created_at DESC"#
@@ -978,6 +1005,8 @@ impl PocketDatabase {
                 archived: row.get::<_, Option<i32>>(10)?.unwrap_or(0) != 0,
                 evm_address: row.get(11)?,
                 evm_keypair_encrypted: row.get(12)?,
+                usepod_token: row.get(13)?,
+                usepod_deposit_address: row.get(14)?,
             })
         })?;
 
@@ -1562,10 +1591,50 @@ impl PocketDatabase {
 
         let nodes_24h = nodes_24h_maze + nodes_24h_sweep + nodes_24h_p2p;
 
+        // Total volume (lamports) across all features
+        let funding_vol: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_lamports), 0) FROM funding_requests WHERE status = 'completed'",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let sweep_vol: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_lamports), 0) FROM sweep_requests WHERE status = 'completed'",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let p2p_vol: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_lamports), 0) FROM p2p_transfers WHERE status = 'completed'",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let sendlink_vol: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_lamports), 0) FROM send_links WHERE status IN ('active', 'claimed')",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let swap_vol: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_lamports), 0) FROM transaction_log WHERE tx_type = 'swap' AND status = 'completed' AND amount_lamports < 100000000000",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let txlog_other_vol: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_lamports), 0) FROM transaction_log WHERE status = 'completed' AND tx_type IN ('spawn_pocket', 'cross_swap') AND amount_lamports IS NOT NULL",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+
+        let total_volume = (funding_vol + sweep_vol + p2p_vol + sendlink_vol + swap_vol + txlog_other_vol) as u64;
+
         Ok(ProtocolStats {
             total_nodes_alltime: total_nodes,
             total_hops_alltime: total_hops,
             nodes_24h,
+            total_volume_lamports: total_volume,
         })
     }
 
@@ -3179,6 +3248,8 @@ mod tests {
             archived: false,
             evm_address: None,
             evm_keypair_encrypted: None,
+            usepod_token: None,
+            usepod_deposit_address: None,
         };
 
         db.create_pocket(&pocket).unwrap();

@@ -269,6 +269,7 @@ struct StatsResponse {
     total_nodes_alltime: i64,
     total_hops_alltime: i64,
     nodes_24h: i64,
+    total_volume_lamports: u64,
 }
 
 // ============ SWEEP ALL POCKETS (Phase 3) ============
@@ -571,6 +572,7 @@ async fn stats_handler(
         total_nodes_alltime: stats.total_nodes_alltime,
         total_hops_alltime: stats.total_hops_alltime,
         nodes_24h: stats.nodes_24h,
+        total_volume_lamports: stats.total_volume_lamports,
     }))
 }
 /// Create a new Maze Pocket
@@ -630,6 +632,8 @@ async fn create_pocket(
         archived: false,
         evm_address: None,
         evm_keypair_encrypted: None,
+        usepod_token: None,
+        usepod_deposit_address: None,
     };
 
     state.db.create_pocket(&pocket)
@@ -761,6 +765,8 @@ async fn create_route(
         archived: false,
         evm_address: None,
         evm_keypair_encrypted: None,
+        usepod_token: None,
+        usepod_deposit_address: None,
     };
     state.db.create_pocket(&pocket)?;
     // Create funding request with destination (direct route)
@@ -3280,6 +3286,8 @@ async fn spawn_pocket(
         archived: false,
         evm_address: None,
         evm_keypair_encrypted: None,
+        usepod_token: None,
+        usepod_deposit_address: None,
     };
 
     state.db.create_pocket(&new_pocket)?;
@@ -4317,6 +4325,8 @@ async fn claim_send_link(
         archived: false,
         evm_address: None,
         evm_keypair_encrypted: None,
+        usepod_token: None,
+        usepod_deposit_address: None,
     };
 
     state.db.create_pocket(&pocket)?;
@@ -5935,6 +5945,405 @@ async fn conduit_call_handler(
         "error": result.error,
     })))
 }
+
+
+// ============ USEPOD INTEGRATION HANDLERS ============
+
+#[derive(Debug, Deserialize)]
+struct UsePodRegisterRequest {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UsePodRegisterResponse {
+    success: bool,
+    pocket_id: String,
+    usepod_token: Option<String>,
+    usepod_deposit_address: Option<String>,
+    error: Option<String>,
+}
+
+/// Register a UsePod token for a pocket
+/// Calls UsePod POST /v1/register (no auth required)
+/// Stores token + deposit address in pocket metadata
+async fn usepod_register_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<UsePodRegisterRequest>,
+) -> std::result::Result<Json<UsePodRegisterResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Verify pocket ownership
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(UsePodRegisterResponse {
+            success: false,
+            pocket_id,
+            usepod_token: None,
+            usepod_deposit_address: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    // Check if already registered
+    if pocket.usepod_token.is_some() {
+        return Ok(Json(UsePodRegisterResponse {
+            success: true,
+            pocket_id,
+            usepod_token: pocket.usepod_token,
+            usepod_deposit_address: pocket.usepod_deposit_address,
+            error: None,
+        }));
+    }
+
+    // Call UsePod POST /v1/register (no auth required)
+    let register_resp = match state.http_client
+        .post("https://api.usepod.ai/v1/register")
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("UsePod register failed: {}", e);
+            return Ok(Json(UsePodRegisterResponse {
+                success: false,
+                pocket_id,
+                usepod_token: None,
+                usepod_deposit_address: None,
+                error: Some(format!("Failed to reach UsePod API: {}", e)),
+            }));
+        }
+    };
+
+    let status = register_resp.status();
+    let body: serde_json::Value = match register_resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("UsePod register parse failed: {}", e);
+            return Ok(Json(UsePodRegisterResponse {
+                success: false,
+                pocket_id,
+                usepod_token: None,
+                usepod_deposit_address: None,
+                error: Some("Failed to parse UsePod response".to_string()),
+            }));
+        }
+    };
+
+    if !status.is_success() {
+        let err_msg = body["error"].as_str().unwrap_or("Unknown error");
+        return Ok(Json(UsePodRegisterResponse {
+            success: false,
+            pocket_id,
+            usepod_token: None,
+            usepod_deposit_address: None,
+            error: Some(format!("UsePod register error: {}", err_msg)),
+        }));
+    }
+
+    // Extract token and deposit address from response
+    let token = body["token"].as_str().map(|s| s.to_string());
+    let deposit_address = body["deposit_address"].as_str().map(|s| s.to_string());
+
+    if token.is_none() || deposit_address.is_none() {
+        return Ok(Json(UsePodRegisterResponse {
+            success: false,
+            pocket_id,
+            usepod_token: None,
+            usepod_deposit_address: None,
+            error: Some("UsePod response missing token or deposit_address".to_string()),
+        }));
+    }
+
+    let token_str = token.as_ref().unwrap();
+    let deposit_str = deposit_address.as_ref().unwrap();
+
+    // Store in pocket metadata
+    state.db.update_pocket_usepod(&pocket_id, &owner_meta_hash, token_str, deposit_str)?;
+
+    info!("UsePod token registered for pocket {}: deposit {}", pocket_id, &deposit_str[..20.min(deposit_str.len())]);
+
+    // Log to transaction_log
+    let _ = state.db.insert_transaction_log(
+        &format!("usepod_{}", chrono::Utc::now().timestamp_millis()),
+        &owner_meta_hash, "usepod_register", "completed",
+        None, None,
+        Some(&format!("UsePod token registered for pocket {}", pocket_id)),
+        None, None,
+    );
+
+    Ok(Json(UsePodRegisterResponse {
+        success: true,
+        pocket_id,
+        usepod_token: token,
+        usepod_deposit_address: deposit_address,
+        error: None,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct UsePodFundRequest {
+    meta_address: String,
+    amount_sol: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct UsePodFundResponse {
+    success: bool,
+    pocket_id: String,
+    usdc_amount: Option<f64>,
+    deposit_address: Option<String>,
+    tx_signature: Option<String>,
+    error: Option<String>,
+}
+
+/// Fund a UsePod token balance from a pocket
+/// Step 1: Swap SOL to USDC via Jupiter (existing swap infrastructure)
+/// Step 2: Transfer USDC (SPL token) to UsePod deposit address
+async fn usepod_fund_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<UsePodFundRequest>,
+) -> std::result::Result<Json<UsePodFundResponse>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Verify pocket ownership
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.status != PocketStatus::Active {
+        return Ok(Json(UsePodFundResponse {
+            success: false, pocket_id, usdc_amount: None,
+            deposit_address: None, tx_signature: None,
+            error: Some(format!("Pocket status is {}, must be active", pocket.status.as_str())),
+        }));
+    }
+
+    // Check UsePod token is registered
+    let deposit_address = match &pocket.usepod_deposit_address {
+        Some(addr) => addr.clone(),
+        None => {
+            return Ok(Json(UsePodFundResponse {
+                success: false, pocket_id, usdc_amount: None,
+                deposit_address: None, tx_signature: None,
+                error: Some("No UsePod token registered for this pocket. Call /usepod/register first.".to_string()),
+            }));
+        }
+    };
+
+    // Validate amount
+    if req.amount_sol < 0.01 {
+        return Ok(Json(UsePodFundResponse {
+            success: false, pocket_id, usdc_amount: None,
+            deposit_address: None, tx_signature: None,
+            error: Some("Minimum 0.01 SOL".to_string()),
+        }));
+    }
+
+    // Get pocket keypair and check balance
+    let keypair_bytes = state.db.decrypt(&pocket.keypair_encrypted)?;
+    let pocket_keypair = Keypair::from_bytes(&keypair_bytes)
+        .map_err(|e| MazeError::KeypairError(e.to_string()))?;
+
+    let balance = state.rpc.get_balance(&pocket_keypair.pubkey())
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+
+    let amount_lamports = sol_to_lamports(req.amount_sol);
+    let buffer = 5_000_000; // 0.005 SOL for tx fees
+    if balance < amount_lamports + buffer {
+        return Ok(Json(UsePodFundResponse {
+            success: false, pocket_id, usdc_amount: None,
+            deposit_address: None, tx_signature: None,
+            error: Some(format!("Insufficient balance. Have {} SOL, need {} SOL + fees",
+                lamports_to_sol(balance), req.amount_sol)),
+        }));
+    }
+
+    info!("UsePod fund: {} SOL from pocket {} to deposit {}", req.amount_sol, pocket_id, &deposit_address[..20.min(deposit_address.len())]);
+
+    // Step 1: Swap SOL to USDC via Jupiter
+    let usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    let swap_result = swap::execute_swap(
+        &state.http_client,
+        &state.rpc,
+        &pocket_keypair,
+        &tokens::SOL_MINT.to_string(),
+        usdc_mint,
+        amount_lamports,
+        Some(100), // 1% slippage
+    ).await.map_err(|e| AppError(e))?;
+
+    if !swap_result.success {
+        return Ok(Json(UsePodFundResponse {
+            success: false, pocket_id, usdc_amount: None,
+            deposit_address: None, tx_signature: None,
+            error: Some(format!("Jupiter swap SOL->USDC failed: {}", swap_result.error.unwrap_or_default())),
+        }));
+    }
+
+    let usdc_raw = swap_result.out_amount.parse::<u64>().unwrap_or(0);
+    let usdc_amount = usdc_raw as f64 / 1_000_000.0; // USDC has 6 decimals
+    info!("UsePod fund step 1: swapped to {} USDC", usdc_amount);
+
+    // Step 2: Transfer USDC to UsePod deposit address
+    let usdc_pubkey = Pubkey::from_str(usdc_mint)
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+    let deposit_pubkey = Pubkey::from_str(&deposit_address)
+        .map_err(|e| MazeError::InvalidParameters(format!("Invalid UsePod deposit address: {}", e)))?;
+
+    // Get pocket's USDC ATA
+    let pocket_usdc_ata = spl_associated_token_account::get_associated_token_address(
+        &pocket_keypair.pubkey(),
+        &usdc_pubkey,
+    );
+
+    // Get actual USDC balance in ATA
+    let actual_usdc = match state.rpc.get_token_account_balance(&pocket_usdc_ata) {
+        Ok(bal) => bal.amount.parse::<u64>().unwrap_or(usdc_raw),
+        Err(_) => usdc_raw,
+    };
+
+    if actual_usdc == 0 {
+        return Ok(Json(UsePodFundResponse {
+            success: false, pocket_id, usdc_amount: None,
+            deposit_address: None, tx_signature: None,
+            error: Some("No USDC balance after swap".to_string()),
+        }));
+    }
+
+    // Get or create deposit address ATA
+    let deposit_usdc_ata = spl_associated_token_account::get_associated_token_address(
+        &deposit_pubkey,
+        &usdc_pubkey,
+    );
+
+    // Build transfer instruction
+    let mut instructions = vec![];
+
+    // Create ATA for deposit address if needed
+    instructions.push(
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            &pocket_keypair.pubkey(),
+            &deposit_pubkey,
+            &usdc_pubkey,
+            &spl_token::id(),
+        )
+    );
+
+    // Transfer USDC
+    instructions.push(
+        spl_token::instruction::transfer(
+            &spl_token::id(),
+            &pocket_usdc_ata,
+            &deposit_usdc_ata,
+            &pocket_keypair.pubkey(),
+            &[],
+            actual_usdc,
+        ).map_err(|e| MazeError::TransactionError(format!("SPL transfer instruction failed: {}", e)))?
+    );
+
+    // Send transaction
+    let tx_sig = {
+        let mut last_err = String::new();
+        let mut result_sig = None;
+        for attempt in 1..=5u8 {
+            let blockhash = match state.rpc.get_latest_blockhash() {
+                Ok(bh) => bh,
+                Err(e) => {
+                    warn!("UsePod fund TX attempt {}/5: blockhash failed: {}", attempt, e);
+                    last_err = e.to_string();
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let tx = Transaction::new_signed_with_payer(
+                &instructions,
+                Some(&pocket_keypair.pubkey()),
+                &[&pocket_keypair],
+                blockhash,
+            );
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: None,
+                encoding: None,
+                max_retries: Some(3),
+                min_context_slot: None,
+            };
+            match state.rpc.send_transaction_with_config(&tx, config) {
+                Ok(s) => {
+                    result_sig = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("connection") || err_str.contains("timeout") || err_str.contains("closed") {
+                        warn!("UsePod fund TX attempt {}/5: {}", attempt, err_str);
+                        last_err = err_str;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    return Ok(Json(UsePodFundResponse {
+                        success: false, pocket_id, usdc_amount: Some(usdc_amount),
+                        deposit_address: Some(deposit_address), tx_signature: None,
+                        error: Some(format!("USDC transfer failed: {}", e)),
+                    }));
+                }
+            }
+        }
+        match result_sig {
+            Some(s) => s,
+            None => {
+                return Ok(Json(UsePodFundResponse {
+                    success: false, pocket_id, usdc_amount: Some(usdc_amount),
+                    deposit_address: Some(deposit_address), tx_signature: None,
+                    error: Some(format!("USDC transfer failed after 5 attempts: {}", last_err)),
+                }));
+            }
+        }
+    };
+
+    // Wait for confirmation
+    let mut confirmed = false;
+    for _ in 0..30 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Ok(Some(result)) = state.rpc.get_signature_status(&tx_sig) {
+            if result.is_ok() {
+                confirmed = true;
+                break;
+            }
+        }
+    }
+
+    if !confirmed {
+        warn!("UsePod fund: USDC transfer confirmation timeout for pocket {}", pocket_id);
+    }
+
+    info!("UsePod funded: {} USDC from pocket {} to {} ({})", usdc_amount, pocket_id, deposit_address, tx_sig);
+
+    // Log to transaction_log
+    let _ = state.db.insert_transaction_log(
+        &format!("usepod_{}", chrono::Utc::now().timestamp_millis()),
+        &owner_meta_hash, "usepod_fund", "completed",
+        Some(amount_lamports as i64),
+        Some(&format!("{:.2} USDC", usdc_amount)),
+        Some(&format!("UsePod funded from pocket {}", pocket_id)),
+        Some(&tx_sig.to_string()),
+        None,
+    );
+
+    Ok(Json(UsePodFundResponse {
+        success: true,
+        pocket_id,
+        usdc_amount: Some(usdc_amount),
+        deposit_address: Some(deposit_address),
+        tx_signature: Some(tx_sig.to_string()),
+        error: None,
+    }))
+}
+
 
 // ============ MAZE PREFERENCES HANDLERS ============
 
@@ -8650,6 +9059,8 @@ async fn main() {
         .route("/printr/token", get(printr_token_info_handler))
         .route("/pocket/:pocket_id/conduit/discover", post(conduit_discover_handler))
         .route("/pocket/:pocket_id/conduit/call", post(conduit_call_handler))
+        .route("/pocket/:pocket_id/usepod/register", post(usepod_register_handler))
+        .route("/pocket/:pocket_id/usepod/fund", post(usepod_fund_handler))
         .route("/preferences/maze", post(get_maze_preferences_handler))
         .route("/preferences/maze/save", post(save_maze_preferences_handler))
         .route("/pocket/:pocket_id/pay", post(kausa_pay_handler))
