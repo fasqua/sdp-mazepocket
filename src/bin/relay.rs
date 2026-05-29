@@ -18,6 +18,7 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_instruction,
+    instruction::{Instruction, AccountMeta},
     transaction::Transaction,
 };
 use std::str::FromStr;
@@ -176,6 +177,8 @@ struct PocketInfo {
     created_at: i64,
     funding_amount_lamports: u64,
     label: Option<String>,
+    usepod_token: Option<String>,
+    usepod_deposit_address: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,6 +211,8 @@ struct PocketDetailInfo {
     created_at: i64,
     funding_amount_lamports: u64,
     last_sweep_at: Option<i64>,
+    usepod_token: Option<String>,
+    usepod_deposit_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -847,6 +852,8 @@ async fn list_pockets(
             created_at: pocket.created_at,
             funding_amount_lamports: pocket.funding_amount_lamports,
             label: pocket.label.clone(),
+            usepod_token: pocket.usepod_token.clone(),
+            usepod_deposit_address: pocket.usepod_deposit_address.clone(),
         });
     }
 
@@ -899,6 +906,8 @@ async fn get_pocket(
                     created_at: p.created_at,
                     funding_amount_lamports: p.funding_amount_lamports,
                     last_sweep_at: p.last_sweep_at,
+                    usepod_token: p.usepod_token.clone(),
+                    usepod_deposit_address: p.usepod_deposit_address.clone(),
                 }),
                 message: None,
             }))
@@ -6045,8 +6054,8 @@ async fn usepod_register_handler(
     }
 
     // Extract token and deposit address from response
-    let token = body["token"].as_str().map(|s| s.to_string());
-    let deposit_address = body["deposit_address"].as_str().map(|s| s.to_string());
+    let token = body["api_token"].as_str().map(|s| s.to_string());
+    let deposit_address = body["deposit_code"].as_str().map(|s| s.to_string());
 
     if token.is_none() || deposit_address.is_none() {
         return Ok(Json(UsePodRegisterResponse {
@@ -6188,11 +6197,20 @@ async fn usepod_fund_handler(
     let usdc_amount = usdc_raw as f64 / 1_000_000.0; // USDC has 6 decimals
     info!("UsePod fund step 1: swapped to {} USDC", usdc_amount);
 
-    // Step 2: Transfer USDC to UsePod deposit address
-    let usdc_pubkey = Pubkey::from_str(usdc_mint)
+    // Step 2: Deposit USDC to UsePod via on-chain program instruction
+    // Program: BBAdcqUkg68JXNiPQ1HR1wujfZuayyK3eQTQSYAh6FSW
+    // Instruction: [discriminator 8B][deposit_code 8B][amount u64 LE 8B]
+    let usdc_mint_str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    let usdc_pubkey = Pubkey::from_str(usdc_mint_str)
         .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
-    let deposit_pubkey = Pubkey::from_str(&deposit_address)
-        .map_err(|e| MazeError::InvalidParameters(format!("Invalid UsePod deposit address: {}", e)))?;
+
+    // UsePod program constants
+    let usepod_program = Pubkey::from_str("BBAdcqUkg68JXNiPQ1HR1wujfZuayyK3eQTQSYAh6FSW")
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+    let usepod_state_pda = Pubkey::from_str("G9ko998ReQinG5Cc6YT7NS7hZJucXyuxLxTXTwKEpNPH")
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+    let usepod_vault_ata = Pubkey::from_str("HKihxxfESzLMTw2G3wUVGTqaJmdmiikMmUBhseU3bKfE")
+        .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
 
     // Get pocket's USDC ATA
     let pocket_usdc_ata = spl_associated_token_account::get_associated_token_address(
@@ -6209,41 +6227,46 @@ async fn usepod_fund_handler(
     if actual_usdc == 0 {
         return Ok(Json(UsePodFundResponse {
             success: false, pocket_id, usdc_amount: None,
-            deposit_address: None, tx_signature: None,
+            deposit_address: Some(deposit_address), tx_signature: None,
             error: Some("No USDC balance after swap".to_string()),
         }));
     }
 
-    // Get or create deposit address ATA
-    let deposit_usdc_ata = spl_associated_token_account::get_associated_token_address(
-        &deposit_pubkey,
-        &usdc_pubkey,
-    );
+    // Parse deposit_code from hex string to 8 bytes
+    let deposit_code_bytes = match hex::decode(&deposit_address) {
+        Ok(bytes) if bytes.len() == 8 => bytes,
+        _ => {
+            return Ok(Json(UsePodFundResponse {
+                success: false, pocket_id, usdc_amount: Some(usdc_amount),
+                deposit_address: Some(deposit_address), tx_signature: None,
+                error: Some("Invalid deposit_code format. Re-register UsePod token.".to_string()),
+            }));
+        }
+    };
 
-    // Build transfer instruction
-    let mut instructions = vec![];
+    // Build UsePod deposit instruction data: [discriminator 8B][deposit_code 8B][amount u64 LE 8B]
+    let usdc_discriminator: [u8; 8] = [0xb8, 0x94, 0xfa, 0xa9, 0xe0, 0xd5, 0x22, 0x7e];
+    let mut instruction_data = Vec::with_capacity(24);
+    instruction_data.extend_from_slice(&usdc_discriminator);
+    instruction_data.extend_from_slice(&deposit_code_bytes);
+    instruction_data.extend_from_slice(&actual_usdc.to_le_bytes());
 
-    // Create ATA for deposit address if needed
-    instructions.push(
-        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-            &pocket_keypair.pubkey(),
-            &deposit_pubkey,
-            &usdc_pubkey,
-            &spl_token::id(),
-        )
-    );
+    // Build instruction with 7 accounts
+    let deposit_instruction = Instruction {
+        program_id: usepod_program,
+        accounts: vec![
+            AccountMeta::new(pocket_usdc_ata, false),       // 0: user USDC ATA (source)
+            AccountMeta::new(usepod_vault_ata, false),       // 1: vault USDC ATA (destination)
+            AccountMeta::new(usepod_state_pda, false),       // 2: state PDA
+            AccountMeta::new_readonly(pocket_keypair.pubkey(), true), // 3: user wallet (signer)
+            AccountMeta::new_readonly(usdc_pubkey, false),   // 4: USDC mint
+            AccountMeta::new_readonly(spl_token::id(), false), // 5: Token program
+            AccountMeta::new_readonly(spl_associated_token_account::id(), false), // 6: ATA program
+        ],
+        data: instruction_data,
+    };
 
-    // Transfer USDC
-    instructions.push(
-        spl_token::instruction::transfer(
-            &spl_token::id(),
-            &pocket_usdc_ata,
-            &deposit_usdc_ata,
-            &pocket_keypair.pubkey(),
-            &[],
-            actual_usdc,
-        ).map_err(|e| MazeError::TransactionError(format!("SPL transfer instruction failed: {}", e)))?
-    );
+    info!("UsePod fund step 2: depositing {} USDC via program instruction", usdc_amount);
 
     // Send transaction
     let tx_sig = {
@@ -6260,7 +6283,7 @@ async fn usepod_fund_handler(
                 }
             };
             let tx = Transaction::new_signed_with_payer(
-                &instructions,
+                &[deposit_instruction.clone()],
                 Some(&pocket_keypair.pubkey()),
                 &[&pocket_keypair],
                 blockhash,
@@ -6288,7 +6311,7 @@ async fn usepod_fund_handler(
                     return Ok(Json(UsePodFundResponse {
                         success: false, pocket_id, usdc_amount: Some(usdc_amount),
                         deposit_address: Some(deposit_address), tx_signature: None,
-                        error: Some(format!("USDC transfer failed: {}", e)),
+                        error: Some(format!("UsePod deposit failed: {}", e)),
                     }));
                 }
             }
@@ -6299,7 +6322,7 @@ async fn usepod_fund_handler(
                 return Ok(Json(UsePodFundResponse {
                     success: false, pocket_id, usdc_amount: Some(usdc_amount),
                     deposit_address: Some(deposit_address), tx_signature: None,
-                    error: Some(format!("USDC transfer failed after 5 attempts: {}", last_err)),
+                    error: Some(format!("UsePod deposit failed after 5 attempts: {}", last_err)),
                 }));
             }
         }
@@ -6318,10 +6341,10 @@ async fn usepod_fund_handler(
     }
 
     if !confirmed {
-        warn!("UsePod fund: USDC transfer confirmation timeout for pocket {}", pocket_id);
+        warn!("UsePod fund: deposit confirmation timeout for pocket {}", pocket_id);
     }
 
-    info!("UsePod funded: {} USDC from pocket {} to {} ({})", usdc_amount, pocket_id, deposit_address, tx_sig);
+    info!("UsePod funded: {} USDC from pocket {} ({})", usdc_amount, pocket_id, tx_sig);
 
     // Log to transaction_log
     let _ = state.db.insert_transaction_log(
@@ -6343,6 +6366,8 @@ async fn usepod_fund_handler(
         error: None,
     }))
 }
+
+
 
 
 // ============ MAZE PREFERENCES HANDLERS ============
