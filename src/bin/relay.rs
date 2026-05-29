@@ -179,6 +179,7 @@ struct PocketInfo {
     label: Option<String>,
     usepod_token: Option<String>,
     usepod_deposit_address: Option<String>,
+    usepod_last_balance: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +214,7 @@ struct PocketDetailInfo {
     last_sweep_at: Option<i64>,
     usepod_token: Option<String>,
     usepod_deposit_address: Option<String>,
+    usepod_last_balance: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -639,6 +641,7 @@ async fn create_pocket(
         evm_keypair_encrypted: None,
         usepod_token: None,
         usepod_deposit_address: None,
+        usepod_last_balance: None,
     };
 
     state.db.create_pocket(&pocket)
@@ -772,6 +775,7 @@ async fn create_route(
         evm_keypair_encrypted: None,
         usepod_token: None,
         usepod_deposit_address: None,
+        usepod_last_balance: None,
     };
     state.db.create_pocket(&pocket)?;
     // Create funding request with destination (direct route)
@@ -854,6 +858,7 @@ async fn list_pockets(
             label: pocket.label.clone(),
             usepod_token: pocket.usepod_token.clone(),
             usepod_deposit_address: pocket.usepod_deposit_address.clone(),
+            usepod_last_balance: pocket.usepod_last_balance,
         });
     }
 
@@ -908,6 +913,7 @@ async fn get_pocket(
                     last_sweep_at: p.last_sweep_at,
                     usepod_token: p.usepod_token.clone(),
                     usepod_deposit_address: p.usepod_deposit_address.clone(),
+                    usepod_last_balance: p.usepod_last_balance,
                 }),
                 message: None,
             }))
@@ -3297,6 +3303,7 @@ async fn spawn_pocket(
         evm_keypair_encrypted: None,
         usepod_token: None,
         usepod_deposit_address: None,
+        usepod_last_balance: None,
     };
 
     state.db.create_pocket(&new_pocket)?;
@@ -4336,6 +4343,7 @@ async fn claim_send_link(
         evm_keypair_encrypted: None,
         usepod_token: None,
         usepod_deposit_address: None,
+        usepod_last_balance: None,
     };
 
     state.db.create_pocket(&pocket)?;
@@ -6368,6 +6376,42 @@ async fn usepod_fund_handler(
 }
 
 
+
+
+
+#[derive(Debug, Deserialize)]
+struct UsePodUpdateBalanceRequest {
+    meta_address: String,
+    balance: f64,
+}
+
+/// Update UsePod last known balance for a pocket
+async fn usepod_update_balance_handler(
+    State(state): State<Arc<AppState>>,
+    Path(pocket_id): Path<String>,
+    Json(req): Json<UsePodUpdateBalanceRequest>,
+) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    let owner_meta_hash = hash_meta_address(&req.meta_address);
+
+    // Verify pocket ownership
+    let pocket = state.db.get_pocket_for_owner(&pocket_id, &owner_meta_hash)?
+        .ok_or(MazeError::PocketNotFound(pocket_id.clone()))?;
+
+    if pocket.usepod_token.is_none() {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "No UsePod token registered for this pocket"
+        })));
+    }
+
+    state.db.update_pocket_usepod_balance(&pocket_id, req.balance)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "pocket_id": pocket_id,
+        "usepod_last_balance": req.balance
+    })))
+}
 
 
 // ============ MAZE PREFERENCES HANDLERS ============
@@ -9086,6 +9130,7 @@ async fn main() {
         .route("/pocket/:pocket_id/conduit/call", post(conduit_call_handler))
         .route("/pocket/:pocket_id/usepod/register", post(usepod_register_handler))
         .route("/pocket/:pocket_id/usepod/fund", post(usepod_fund_handler))
+        .route("/pocket/:pocket_id/usepod/balance", post(usepod_update_balance_handler))
         .route("/preferences/maze", post(get_maze_preferences_handler))
         .route("/preferences/maze/save", post(save_maze_preferences_handler))
         .route("/pocket/:pocket_id/pay", post(kausa_pay_handler))

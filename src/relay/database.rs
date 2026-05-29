@@ -64,6 +64,7 @@ pub struct MazePocket {
     pub evm_keypair_encrypted: Option<Vec<u8>>,
     pub usepod_token: Option<String>,
     pub usepod_deposit_address: Option<String>,
+    pub usepod_last_balance: Option<f64>,
 }
 
 /// Funding request for creating a pocket
@@ -320,6 +321,7 @@ impl PocketDatabase {
         // Migration: add UsePod token columns if not exist
         let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN usepod_token TEXT", []);
         let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN usepod_deposit_address TEXT", []);
+        let _ = conn.execute("ALTER TABLE maze_pockets ADD COLUMN usepod_last_balance REAL", []);
 
         // Funding requests table (for tracking maze routing to pocket)
         conn.execute(
@@ -793,7 +795,8 @@ impl PocketDatabase {
                       funding_maze_id, funding_amount_lamports, created_at,
                       last_sweep_at, status, label, archived,
                       evm_address, evm_keypair_encrypted,
-                       usepod_token, usepod_deposit_address
+                       usepod_token, usepod_deposit_address,
+                       usepod_last_balance
                FROM maze_pockets WHERE id = ?1"#
         )?;
 
@@ -814,6 +817,7 @@ impl PocketDatabase {
                 evm_keypair_encrypted: row.get(12)?,
                 usepod_token: row.get(13)?,
                 usepod_deposit_address: row.get(14)?,
+                usepod_last_balance: row.get(15)?,
             })
         });
 
@@ -832,7 +836,8 @@ impl PocketDatabase {
                       funding_maze_id, funding_amount_lamports, created_at,
                       last_sweep_at, status, label, archived,
                       evm_address, evm_keypair_encrypted,
-                       usepod_token, usepod_deposit_address
+                       usepod_token, usepod_deposit_address,
+                       usepod_last_balance
                FROM maze_pockets
                WHERE id = ?1 AND owner_meta_hash = ?2"#
         )?;
@@ -854,6 +859,7 @@ impl PocketDatabase {
                 evm_keypair_encrypted: row.get(12)?,
                 usepod_token: row.get(13)?,
                 usepod_deposit_address: row.get(14)?,
+                usepod_last_balance: row.get(15)?,
             })
         });
 
@@ -872,7 +878,8 @@ impl PocketDatabase {
                       funding_maze_id, funding_amount_lamports, created_at,
                       last_sweep_at, status, label, archived,
                       evm_address, evm_keypair_encrypted,
-                       usepod_token, usepod_deposit_address
+                       usepod_token, usepod_deposit_address,
+                       usepod_last_balance
                FROM maze_pockets
                WHERE owner_meta_hash = ?1 AND status != 'deleted' AND id NOT LIKE 'route_%' AND (archived = 0 OR archived IS NULL)
                ORDER BY created_at DESC"#
@@ -895,6 +902,7 @@ impl PocketDatabase {
                 evm_keypair_encrypted: row.get(12)?,
                 usepod_token: row.get(13)?,
                 usepod_deposit_address: row.get(14)?,
+                usepod_last_balance: row.get(15)?,
             })
         })?;
 
@@ -976,6 +984,16 @@ impl PocketDatabase {
         Ok(rows > 0)
     }
 
+    /// Update pocket UsePod last known balance
+    pub fn update_pocket_usepod_balance(&self, pocket_id: &str, balance: f64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE maze_pockets SET usepod_last_balance = ?1 WHERE id = ?2",
+            params![balance, pocket_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// List archived pockets for an owner
     pub fn list_archived_pockets(&self, owner_meta_hash: &str) -> Result<Vec<MazePocket>> {
         let conn = self.conn.lock().unwrap();
@@ -984,7 +1002,8 @@ impl PocketDatabase {
                       funding_maze_id, funding_amount_lamports, created_at,
                       last_sweep_at, status, label, archived,
                       evm_address, evm_keypair_encrypted,
-                       usepod_token, usepod_deposit_address
+                       usepod_token, usepod_deposit_address,
+                       usepod_last_balance
                FROM maze_pockets
                WHERE owner_meta_hash = ?1 AND status != 'deleted' AND id NOT LIKE 'route_%' AND archived = 1
                ORDER BY created_at DESC"#
@@ -1007,6 +1026,7 @@ impl PocketDatabase {
                 evm_keypair_encrypted: row.get(12)?,
                 usepod_token: row.get(13)?,
                 usepod_deposit_address: row.get(14)?,
+                usepod_last_balance: row.get(15)?,
             })
         })?;
 
@@ -3250,6 +3270,7 @@ mod tests {
             evm_keypair_encrypted: None,
             usepod_token: None,
             usepod_deposit_address: None,
+            usepod_last_balance: None,
         };
 
         db.create_pocket(&pocket).unwrap();
