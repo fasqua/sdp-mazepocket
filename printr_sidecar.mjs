@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { createPrintrClient, unwrapResult } from '@printr/sdk';
 
-const API_KEY = process.env.PRINTR_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhaS1pbnRlZ3JhdGlvbiJ9.PZsqfleSmSiAra8jiN3JZvDSonoawQLnvYRyPHDbtRg';
+const API_KEY = process.env.PRINTR_API_KEY;
+if (!API_KEY) { console.error('PRINTR_API_KEY env var not set'); process.exit(1); }
 const BASE_URL = process.env.PRINTR_API_BASE_URL || 'https://api-preview.printr.money';
 
 const client = createPrintrClient({ apiKey: API_KEY, baseUrl: BASE_URL });

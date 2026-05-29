@@ -6414,6 +6414,36 @@ async fn usepod_update_balance_handler(
 }
 
 
+
+/// RPC Proxy - forwards JSON-RPC requests to Solana RPC without exposing API key
+async fn rpc_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> std::result::Result<axum::response::Response, AppError> {
+    let rpc_url = std::env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+
+    let response = state.http_client
+        .post(&rpc_url)
+        .header("Content-Type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|e| AppError(MazeError::RpcError(e.to_string())))?;
+
+    let status = response.status();
+    let body_bytes = response.bytes().await
+        .map_err(|e| AppError(MazeError::RpcError(e.to_string())))?;
+
+    Ok(axum::response::Response::builder()
+        .status(status.as_u16())
+        .header("Content-Type", "application/json")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(axum::body::Body::from(body_bytes))
+        .unwrap())
+}
+
+
 // ============ MAZE PREFERENCES HANDLERS ============
 
 #[derive(Debug, Deserialize)]
@@ -9131,6 +9161,7 @@ async fn main() {
         .route("/pocket/:pocket_id/usepod/register", post(usepod_register_handler))
         .route("/pocket/:pocket_id/usepod/fund", post(usepod_fund_handler))
         .route("/pocket/:pocket_id/usepod/balance", post(usepod_update_balance_handler))
+        .route("/rpc", post(rpc_proxy_handler))
         .route("/preferences/maze", post(get_maze_preferences_handler))
         .route("/preferences/maze/save", post(save_maze_preferences_handler))
         .route("/pocket/:pocket_id/pay", post(kausa_pay_handler))
